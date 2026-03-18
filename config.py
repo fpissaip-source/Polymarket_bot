@@ -5,6 +5,8 @@ load_dotenv()
 
 # Polymarket API
 POLYMARKET_HOST = os.getenv("POLYMARKET_HOST", "https://clob.polymarket.com")
+GAMMA_API_HOST = os.getenv("GAMMA_API_HOST", "https://gamma-api.polymarket.com")
+DATA_API_HOST = os.getenv("DATA_API_HOST", "https://data-api.polymarket.com")
 POLYMARKET_PRIVATE_KEY = os.getenv("POLYMARKET_PRIVATE_KEY", "")
 POLYMARKET_API_KEY = os.getenv("POLYMARKET_API_KEY", "")
 POLYMARKET_API_SECRET = os.getenv("POLYMARKET_API_SECRET", "")

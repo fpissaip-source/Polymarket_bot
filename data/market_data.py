@@ -5,9 +5,10 @@ Fetches market prices, order books, and related market info
 from the Polymarket CLOB API.
 """
 
+import time
 import logging
 import requests
-from config import POLYMARKET_HOST
+from config import POLYMARKET_HOST, GAMMA_API_HOST, DATA_API_HOST
 
 logger = logging.getLogger(__name__)
 
@@ -123,3 +124,114 @@ class PolymarketDataClient:
             if not cursor or cursor == "LTE=":
                 break
         return results
+
+
+def _get_with_retry(session: requests.Session, url: str, params: dict = None, timeout: int = 10) -> dict:
+    """GET with automatic 429 backoff."""
+    for attempt in range(4):
+        try:
+            r = session.get(url, params=params, timeout=timeout)
+            if r.status_code == 429:
+                wait = 2 ** attempt
+                logger.warning(f"Rate limited (429), retrying in {wait}s...")
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            return r.json()
+        except requests.exceptions.HTTPError:
+            raise
+        except Exception as e:
+            logger.error(f"Request failed ({url}): {e}")
+            return {}
+    return {}
+
+
+class GammaClient:
+    """
+    Client for the Gamma API (Market Discovery & Metadata).
+    Level 0 – no authentication required.
+    """
+
+    def __init__(self, host: str = GAMMA_API_HOST):
+        self.host = host.rstrip("/")
+        self._session = requests.Session()
+        self._session.headers.update({"Content-Type": "application/json"})
+
+    def get_markets(
+        self,
+        active: bool = True,
+        category: str = "crypto",
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        """Fetch markets from Gamma API with optional category filter."""
+        params = {"active": str(active).lower(), "limit": limit, "offset": offset}
+        if category:
+            params["category"] = category
+        data = _get_with_retry(self._session, f"{self.host}/markets", params=params)
+        if isinstance(data, list):
+            return data
+        return data.get("data", data.get("markets", []))
+
+    def find_crypto_markets(self, asset: str, keywords: list[str] | None = None) -> list[dict]:
+        """
+        Search active crypto markets matching an asset and optional keywords.
+        Falls back to broad search if category filter returns nothing.
+        """
+        keywords = keywords or []
+        results = []
+        for offset in range(0, 500, 100):
+            markets = self.get_markets(active=True, category="crypto", limit=100, offset=offset)
+            if not markets:
+                break
+            for m in markets:
+                question = m.get("question", "").upper()
+                if asset.upper() not in question:
+                    continue
+                if keywords and not any(kw.upper() in question for kw in keywords):
+                    continue
+                results.append(m)
+            if len(markets) < 100:
+                break
+        return results
+
+    def get_events(self, limit: int = 50) -> list[dict]:
+        """Fetch event groups (e.g. 'US Election')."""
+        data = _get_with_retry(self._session, f"{self.host}/events", params={"limit": limit})
+        if isinstance(data, list):
+            return data
+        return data.get("data", [])
+
+
+class DataApiClient:
+    """
+    Client for the Data API (Portfolio, Positions, Activity).
+    Level 0 for public endpoints; user address required for positions.
+    """
+
+    def __init__(self, host: str = DATA_API_HOST):
+        self.host = host.rstrip("/")
+        self._session = requests.Session()
+        self._session.headers.update({"Content-Type": "application/json"})
+
+    def get_positions(self, user_address: str) -> list[dict]:
+        """Fetch open positions for a wallet address."""
+        data = _get_with_retry(
+            self._session,
+            f"{self.host}/positions",
+            params={"user": user_address},
+        )
+        if isinstance(data, list):
+            return data
+        return data.get("data", [])
+
+    def get_activity(self, user_address: str, limit: int = 100) -> list[dict]:
+        """Fetch trade history / PnL for a wallet address."""
+        data = _get_with_retry(
+            self._session,
+            f"{self.host}/activity",
+            params={"user": user_address, "limit": limit},
+        )
+        if isinstance(data, list):
+            return data
+        return data.get("data", [])

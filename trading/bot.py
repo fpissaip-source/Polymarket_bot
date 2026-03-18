@@ -23,7 +23,7 @@ from models.kelly import KellyModel, KellyResult
 from models.monte_carlo import MonteCarloSimulator
 
 from data.price_feed import PriceFeed
-from data.market_data import PolymarketDataClient
+from data.market_data import PolymarketDataClient, GammaClient
 from trading.order_executor import OrderExecutor
 
 from config import (
@@ -115,18 +115,35 @@ class ArbitrageBot:
         logger.info(f"Registered market: {market_id} ({asset} {timeframe})")
 
     def auto_discover_markets(self):
-        """Fetch active crypto markets from Polymarket and register them."""
+        """
+        Fetch active crypto markets via Gamma API (preferred) and register them.
+        Falls back to CLOB-based discovery if Gamma returns nothing.
+        """
+        gamma = GammaClient()
         assets = [s.replace("USDT", "") for s in CRYPTO_SYMBOLS]  # BTC, ETH, SOL, XRP
         registered = 0
+
         for asset in assets:
-            logger.info(f"Discovering {asset} markets...")
-            markets = self.data_client.find_crypto_5min_markets(asset)
-            for m in markets[:3]:  # max 3 per asset to limit API load
+            logger.info(f"Discovering {asset} markets via Gamma API...")
+            markets = gamma.find_crypto_markets(asset, keywords=["5-minute", "5 minute", "5min"])
+            if not markets:
+                # Fallback: broader keyword search
+                markets = gamma.find_crypto_markets(asset)
+            if not markets:
+                # Last resort: CLOB-based search
+                logger.info(f"Gamma empty, falling back to CLOB for {asset}...")
+                markets = self.data_client.find_crypto_5min_markets(asset)
+
+            for m in markets[:3]:  # max 3 per asset
                 tokens = m.get("tokens", [])
                 if len(tokens) < 2:
                     continue
-                yes_token = next((t["token_id"] for t in tokens if t.get("outcome", "").upper() == "YES"), None)
-                no_token = next((t["token_id"] for t in tokens if t.get("outcome", "").upper() == "NO"), None)
+                yes_token = next(
+                    (t["token_id"] for t in tokens if t.get("outcome", "").upper() == "YES"), None
+                )
+                no_token = next(
+                    (t["token_id"] for t in tokens if t.get("outcome", "").upper() == "NO"), None
+                )
                 if not yes_token or not no_token:
                     continue
                 condition_id = m.get("condition_id", "")
@@ -139,6 +156,7 @@ class ArbitrageBot:
                     timeframe="5m",
                 )
                 registered += 1
+
         logger.info(f"Auto-discovery complete: {registered} markets registered")
         return registered
 
