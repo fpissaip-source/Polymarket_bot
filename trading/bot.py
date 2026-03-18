@@ -24,6 +24,7 @@ from models.monte_carlo import MonteCarloSimulator
 
 from data.price_feed import PriceFeed
 from data.market_data import PolymarketDataClient
+from trading.order_executor import OrderExecutor
 
 from config import (
     POLL_INTERVAL_SECONDS,
@@ -31,6 +32,7 @@ from config import (
     BANKROLL,
     MIN_EDGE,
     TOTAL_COST,
+    CRYPTO_SYMBOLS,
 )
 
 logger = logging.getLogger("polymarket_bot.bot")
@@ -60,13 +62,15 @@ class TradeOpportunity:
 
 
 class ArbitrageBot:
-    def __init__(self):
+    def __init__(self, dry_run: bool = False):
+        self.dry_run = dry_run
         self.data_client = PolymarketDataClient()
         self.price_feed = PriceFeed()
         self.edge_model = EdgeModel()
         self.spread_map = SpreadMap()
         self.kelly = KellyModel(bankroll=BANKROLL)
         self.mc = MonteCarloSimulator()
+        self.executor = None if dry_run else OrderExecutor()
 
         self._markets: dict[str, MarketState] = {}
         self._running = False
@@ -77,7 +81,6 @@ class ArbitrageBot:
         for m1, m2 in RELATED_MARKETS:
             self.spread_map.register_pair(m1, m2)
 
-        # Validate strategy with Monte Carlo before starting
         self._mc_validated = False
 
     def validate_with_monte_carlo(self) -> bool:
@@ -111,11 +114,39 @@ class ArbitrageBot:
         self._markets[market_id] = state
         logger.info(f"Registered market: {market_id} ({asset} {timeframe})")
 
+    def auto_discover_markets(self):
+        """Fetch active crypto markets from Polymarket and register them."""
+        assets = [s.replace("USDT", "") for s in CRYPTO_SYMBOLS]  # BTC, ETH, SOL, XRP
+        registered = 0
+        for asset in assets:
+            logger.info(f"Discovering {asset} markets...")
+            markets = self.data_client.find_crypto_5min_markets(asset)
+            for m in markets[:3]:  # max 3 per asset to limit API load
+                tokens = m.get("tokens", [])
+                if len(tokens) < 2:
+                    continue
+                yes_token = next((t["token_id"] for t in tokens if t.get("outcome", "").upper() == "YES"), None)
+                no_token = next((t["token_id"] for t in tokens if t.get("outcome", "").upper() == "NO"), None)
+                if not yes_token or not no_token:
+                    continue
+                condition_id = m.get("condition_id", "")
+                market_id = f"{asset}_5m_{condition_id[:8]}"
+                self.register_market(
+                    market_id=market_id,
+                    token_id_yes=yes_token,
+                    token_id_no=no_token,
+                    asset=asset,
+                    timeframe="5m",
+                )
+                registered += 1
+        logger.info(f"Auto-discovery complete: {registered} markets registered")
+        return registered
+
     def run(self):
         if not self.validate_with_monte_carlo():
             logger.warning("Monte Carlo validation failed. Strategy may not be viable. Continuing anyway.")
 
-        logger.info("Starting arbitrage bot main loop...")
+        logger.info(f"Starting arbitrage bot main loop (mode: {'DRY RUN' if self.dry_run else 'LIVE'})...")
         self._running = True
 
         while self._running:
@@ -228,23 +259,34 @@ class ArbitrageBot:
             self._execute_opportunities(opportunities)
 
     def _execute_opportunities(self, opportunities: list[TradeOpportunity]):
-        """
-        Execute the best opportunities found this tick.
-        In dry-run mode, just log. In live mode, place orders.
-        """
-        # Sort by EV_net descending
+        """Execute the best opportunities. Dry-run logs only; live mode places orders."""
         opportunities.sort(key=lambda o: o.edge_result.ev_net, reverse=True)
 
         for opp in opportunities:
-            logger.info(
-                f"[DRY RUN] Would trade {opp.market_id}: "
-                f"{opp.edge_result.side} @ {opp.stoikov_quote.reservation_price:.4f}, "
-                f"size=${opp.kelly_result.position_size:.2f}, "
-                f"EV={opp.edge_result.ev_net:.4f}, "
-                f"Kelly f={opp.kelly_result.f_kelly:.4f}"
-            )
-            # TODO: integrate py-clob-client to place actual limit/market orders
-            # self._place_order(opp)
+            side = opp.edge_result.side          # "BUY" or "SELL"
+            price = opp.stoikov_quote.reservation_price
+            size = opp.kelly_result.position_size
+            token_id = self._markets[opp.market_id].token_id_yes
+
+            if self.dry_run:
+                logger.info(
+                    f"[DRY RUN] {opp.market_id}: {side} ${size:.2f} @ {price:.4f} "
+                    f"| EV={opp.edge_result.ev_net:.4f} | Kelly f={opp.kelly_result.f_kelly:.4f}"
+                )
+            else:
+                logger.info(
+                    f"[LIVE] Placing order: {opp.market_id} {side} ${size:.2f} @ {price:.4f}"
+                )
+                order_id = self.executor.place_limit_order(
+                    token_id=token_id,
+                    side=side,
+                    price=price,
+                    size=size,
+                )
+                if order_id:
+                    logger.info(f"Order accepted: {order_id}")
+                else:
+                    logger.warning(f"Order rejected for {opp.market_id}")
 
     def _estimate_remaining_time(self, state: MarketState) -> float:
         """

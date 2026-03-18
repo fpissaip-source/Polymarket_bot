@@ -12,10 +12,13 @@ Architecture (6 models from the Twitter thread):
   6. Monte Carlo- strategy validation: W(t+1) = W(t) * (1 + r(t))
 
 Usage:
-  python main.py [--dry-run] [--validate]
+  python main.py              # live mode (auto-discovers markets)
+  python main.py --dry-run   # simulate only, no real orders
+  python main.py --validate  # run Monte Carlo validation and exit
 
-Environment variables (see .env.example):
+Environment variables (.env):
   POLYMARKET_PRIVATE_KEY
+  POLYMARKET_PROXY_ADDRESS
   POLYMARKET_API_KEY / SECRET / PASSPHRASE
   BANKROLL
   LOG_LEVEL
@@ -47,10 +50,14 @@ def run_validation_only():
 
 def main():
     parser = argparse.ArgumentParser(description="Polymarket Arbitrage Bot")
-    parser.add_argument("--dry-run", action="store_true", default=True,
-                        help="Log opportunities without placing real orders (default: True)")
-    parser.add_argument("--validate", action="store_true",
-                        help="Run Monte Carlo validation only and exit")
+    parser.add_argument(
+        "--dry-run", action="store_true", default=False,
+        help="Log opportunities without placing real orders",
+    )
+    parser.add_argument(
+        "--validate", action="store_true",
+        help="Run Monte Carlo validation only and exit",
+    )
     args = parser.parse_args()
 
     if args.validate:
@@ -60,26 +67,20 @@ def main():
     logger.info("Initializing Polymarket Arbitrage Bot...")
     logger.info(f"Mode: {'DRY RUN' if args.dry_run else 'LIVE'}")
 
-    bot = ArbitrageBot()
+    bot = ArbitrageBot(dry_run=args.dry_run)
 
-    # Example: register markets manually or auto-discover
-    # bot.register_market(
-    #     market_id="BTC_5m_example",
-    #     token_id_yes="<YES_TOKEN_ID>",
-    #     token_id_no="<NO_TOKEN_ID>",
-    #     asset="BTC",
-    #     timeframe="5m",
-    # )
+    # Auto-discover active crypto markets on Polymarket
+    logger.info("Auto-discovering active markets...")
+    count = bot.auto_discover_markets()
 
-    logger.info(
-        "No markets registered yet. Add market IDs via bot.register_market() "
-        "or implement auto-discovery in trading/bot.py."
-    )
-    logger.info("Running Monte Carlo validation...")
-    bot.validate_with_monte_carlo()
-
-    # Uncomment to start live loop:
-    # bot.run()
+    if count == 0:
+        logger.warning(
+            "No markets found via auto-discovery. "
+            "Markets may have different naming - check Polymarket manually."
+        )
+    else:
+        logger.info(f"Starting bot with {count} markets...")
+        bot.run()
 
 
 if __name__ == "__main__":
