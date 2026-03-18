@@ -15,7 +15,9 @@ CHAIN_ID = int(os.getenv("CHAIN_ID", "137"))  # Polygon
 
 # Crypto price feed
 PRICE_FEED_URL = os.getenv("PRICE_FEED_URL", "https://api.binance.com/api/v3/ticker/price")
-CRYPTO_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
+CRYPTO_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "BNBUSDT"]
+# HYPE is not on Binance – excluded from price feed, still discovered on Polymarket
+POLYMARKET_ASSETS = ["BTC", "ETH", "SOL", "XRP", "DOGE", "BNB", "HYPE"]
 
 # Bayesian model
 BAYESIAN_PRIOR = 0.5          # Initial prior probability

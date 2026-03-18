@@ -64,7 +64,7 @@ class PriceFeed:
 
     def build_bayesian_data(
         self,
-        symbol: str,
+        symbol: str | None,
         new_prices: dict[str, float],
         elapsed_seconds: float,
         volatility: float = 0.0,
@@ -72,13 +72,15 @@ class PriceFeed:
         ob_imbalance: float = 0.0,
         reprice_speed: float = 0.0,
     ) -> dict:
-        """Build the data dict expected by BayesianModel.update()."""
+        """Build the data dict expected by BayesianModel.update().
+        symbol=None for assets without a Binance price feed (e.g. HYPE).
+        """
         returns = self.get_returns(new_prices)
         speeds = self.get_speed(new_prices, elapsed_seconds)
 
         return {
-            "spot_return": returns.get(symbol, 0.0),
-            "speed": speeds.get(symbol, 0.0),
+            "spot_return": returns.get(symbol, 0.0) if symbol else 0.0,
+            "speed": speeds.get(symbol, 0.0) if symbol else 0.0,
             "volatility": volatility,
             "volume": volume,
             "ob_imbalance": ob_imbalance,

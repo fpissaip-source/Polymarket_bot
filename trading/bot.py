@@ -33,6 +33,7 @@ from config import (
     MIN_EDGE,
     TOTAL_COST,
     CRYPTO_SYMBOLS,
+    POLYMARKET_ASSETS,
 )
 
 logger = logging.getLogger("polymarket_bot.bot")
@@ -120,7 +121,7 @@ class ArbitrageBot:
         Falls back to CLOB-based discovery if Gamma returns nothing.
         """
         gamma = GammaClient()
-        assets = [s.replace("USDT", "") for s in CRYPTO_SYMBOLS]  # BTC, ETH, SOL, XRP
+        assets = POLYMARKET_ASSETS  # BTC, ETH, SOL, XRP, DOGE, BNB, HYPE
         registered = 0
 
         for asset in assets:
@@ -196,12 +197,13 @@ class ArbitrageBot:
             ob_imbalance = self.data_client.get_order_book_imbalance(state.token_id_yes)
             ob_depth = self.data_client.get_order_book_depth(state.token_id_yes)
 
-            # Determine crypto symbol from asset
+            # Determine crypto symbol from asset (HYPE not on Binance)
             crypto_symbol = f"{state.asset}USDT"
+            has_spot_price = crypto_symbol in new_prices
 
             # --- 3. Bayesian update ---
             bayesian_data = self.price_feed.build_bayesian_data(
-                symbol=crypto_symbol,
+                symbol=crypto_symbol if has_spot_price else None,
                 new_prices=new_prices,
                 elapsed_seconds=elapsed,
                 ob_imbalance=ob_imbalance,
