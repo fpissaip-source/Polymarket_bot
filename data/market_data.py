@@ -117,7 +117,9 @@ class PolymarketDataClient:
                 break
             for m in markets:
                 question = m.get("question", "").upper()
-                if asset.upper() in question and ("5-MINUTE" in question or "5 MINUTE" in question):
+                if asset.upper() not in question:
+                    continue
+                if any(kw in question for kw in ("5-MINUTE", "5 MINUTE", "5 MINUTES", "5-MINUTES", "UP OR DOWN")):
                     results.append(m)
             cursor = data.get("next_cursor", "")
             seen += len(markets)
@@ -178,7 +180,8 @@ class GammaClient:
         Search active crypto markets matching an asset and optional keywords.
         Falls back to broad search if category filter returns nothing.
         """
-        keywords = keywords or []
+        # All known variants of 5-minute market naming on Polymarket
+        keywords = keywords or ["5 minutes", "5-minutes", "5 minute", "5-minute", "up or down"]
         results = []
         for offset in range(0, 500, 100):
             markets = self.get_markets(active=True, category="crypto", limit=100, offset=offset)

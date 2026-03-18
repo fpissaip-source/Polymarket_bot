@@ -125,7 +125,7 @@ class ArbitrageBot:
 
         for asset in assets:
             logger.info(f"Discovering {asset} markets via Gamma API...")
-            markets = gamma.find_crypto_markets(asset, keywords=["5-minute", "5 minute", "5min"])
+            markets = gamma.find_crypto_markets(asset)  # uses default 5-min keyword variants
             if not markets:
                 # Fallback: broader keyword search
                 markets = gamma.find_crypto_markets(asset)
