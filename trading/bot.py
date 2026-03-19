@@ -294,9 +294,9 @@ class ArbitrageBot:
 
     def auto_discover_markets(self):
         """
-        Fetch active crypto markets via Gamma API (preferred) and register them.
-        Falls back to CLOB-based discovery if Gamma returns nothing.
-        Handles multiple Gamma/CLOB API response formats robustly.
+        Fetch active crypto markets via CLOB API (primary) with Gamma as fallback.
+        CLOB indexes live 5-minute markets directly; Gamma often misses them.
+        Handles multiple CLOB/Gamma API response formats robustly.
         """
         import datetime
         gamma = GammaClient()
@@ -304,11 +304,11 @@ class ArbitrageBot:
         registered = 0
 
         for asset in assets:
-            logger.info(f"Discovering {asset} markets via Gamma API...")
-            markets = gamma.find_crypto_markets(asset)
+            logger.info(f"Discovering {asset} markets via CLOB API (primary)...")
+            markets = self.data_client.find_crypto_5min_markets(asset)
             if not markets:
-                logger.info(f"Gamma empty, falling back to CLOB for {asset}...")
-                markets = self.data_client.find_crypto_5min_markets(asset)
+                logger.info(f"CLOB empty, falling back to Gamma for {asset}...")
+                markets = gamma.find_crypto_markets(asset)
             if not markets:
                 logger.warning(f"No 5-min markets found for {asset} — skipping")
                 continue
@@ -507,11 +507,14 @@ class ArbitrageBot:
             self._last_stats_log = now
             self.dry_run_tracker.log_stats()
 
-        # Discover new crypto markets
+        # Discover new crypto markets — CLOB first (indexes live 5-min markets),
+        # Gamma as fallback (often misses live 5-min markets).
         gamma = GammaClient()
         new_count = 0
         for asset in POLYMARKET_ASSETS:
-            markets = gamma.find_crypto_markets(asset)
+            markets = self.data_client.find_crypto_5min_markets(asset)
+            if not markets:
+                markets = gamma.find_crypto_markets(asset)
             for m in markets:
                 import datetime, json as _json
                 condition_id = m.get("conditionId") or m.get("id", "")
@@ -810,7 +813,7 @@ class ArbitrageBot:
 
             # Within-market arb: buy both YES and NO simultaneously
             if side == "BOTH":
-                self._place_arb_both_sides(market, size, is_aggressive)
+                self._place_arb_both_sides(market, size, not is_passive)
                 continue
 
             # Directional: BUY YES or BUY NO
