@@ -116,6 +116,8 @@ class ArbitrageBot:
         self._running = False
         self._last_price_fetch = 0.0
         self._last_prices: dict[str, float] = {}
+        self._last_heartbeat = 0.0
+        self._tick_count = 0
 
         # Register known related pairs
         for m1, m2 in RELATED_MARKETS:
@@ -390,6 +392,7 @@ class ArbitrageBot:
     def _tick(self):
         now = time.time()
         elapsed = now - self._last_price_fetch if self._last_price_fetch else 1.0
+        self._tick_count += 1
 
         # Apply growth tier (adjusts Kelly λ and MIN_EDGE based on bankroll)
         self._apply_growth_tier()
@@ -404,6 +407,7 @@ class ArbitrageBot:
             self._last_wallet_update = now
 
         opportunities: list[TradeOpportunity] = []
+        market_stats = []  # collect for heartbeat
 
         for market_id, state in self._markets.items():
             # --- 2. Fetch market prices from Polymarket ---
@@ -414,12 +418,10 @@ class ArbitrageBot:
             # Fallback: use Gamma API prices if CLOB has no data
             if p_yes is None and state.gamma_price_yes is not None:
                 p_yes = state.gamma_price_yes
-                logger.debug(f"[{market_id}] Using Gamma fallback price YES={p_yes:.3f}")
             if p_no is None and state.gamma_price_no is not None:
                 p_no = state.gamma_price_no
-                logger.debug(f"[{market_id}] Using Gamma fallback price NO={p_no:.3f}")
             if p_yes is None or p_no is None:
-                logger.info(f"[SKIP] {market_id}: no price data (yes={p_yes}, no={p_no})")
+                market_stats.append(f"{state.asset}({state.timeframe}):NO_DATA")
                 continue
 
             ob_imbalance = yes_data["imbalance"]
@@ -471,6 +473,10 @@ class ArbitrageBot:
             within_result = self.edge_model.evaluate_within_market(p_yes, p_no)
             if within_result.has_edge and within_result.ev_net > edge_result.ev_net:
                 edge_result = within_result
+
+            market_stats.append(
+                f"{state.asset}({state.timeframe}):q={q:.3f},p={p_yes:.3f},EV={edge_result.ev_net:+.3f}"
+            )
 
             if not edge_result.has_edge:
                 state.last_price = p_yes
@@ -529,6 +535,19 @@ class ArbitrageBot:
 
         self._last_price_fetch = now
         self._last_prices = new_prices
+
+        # --- Heartbeat: log status every 60 seconds ---
+        if now - self._last_heartbeat >= 60:
+            self._last_heartbeat = now
+            no_data = sum(1 for s in market_stats if "NO_DATA" in s)
+            active = [s for s in market_stats if "NO_DATA" not in s]
+            logger.info(
+                f"[HEARTBEAT] tick={self._tick_count} | markets={len(self._markets)} "
+                f"({no_data} no data, {len(active)} active) | "
+                f"bankroll=${self.kelly.bankroll:.2f} | {self.sentiment.summary()}"
+            )
+            if active:
+                logger.info(f"[HEARTBEAT] Market status: {' | '.join(active)}")
 
         if opportunities:
             self._execute_opportunities(opportunities)
