@@ -119,7 +119,11 @@ class ArbitrageBot:
         self._last_price_fetch = 0.0
         self._last_prices: dict[str, float] = {}
         self._last_heartbeat = 0.0
+        self._last_market_refresh = 0.0
         self._tick_count = 0
+        self._MARKET_REFRESH_INTERVAL = 30  # re-discover markets every 30s
+        self._MARKET_WINDOW_MIN = 90        # skip if <90s remaining
+        self._MARKET_WINDOW_MAX = 360       # skip if >6min remaining (not open yet)
 
         # Register known related pairs
         for m1, m2 in RELATED_MARKETS:
@@ -466,6 +470,88 @@ class ArbitrageBot:
             logger.warning(f"Event market discovery failed: {e}")
         return registered
 
+    def _refresh_markets(self, now: float):
+        """
+        Re-discover active 5-minute markets and remove expired ones.
+        Called every 30 seconds. New market windows open every 5 minutes,
+        so we need to pick them up quickly.
+        """
+        # Remove expired markets
+        expired = [mid for mid, s in self._markets.items()
+                   if s.end_time > 0 and (s.end_time - now) < 0 and not s.is_event]
+        for mid in expired:
+            logger.debug(f"Removing expired market: {mid}")
+            del self._markets[mid]
+
+        # Discover new crypto markets
+        gamma = GammaClient()
+        new_count = 0
+        for asset in POLYMARKET_ASSETS:
+            markets = gamma.find_crypto_markets(asset)
+            if not markets:
+                markets = gamma.find_crypto_markets(asset, keywords=None)
+            for m in markets:
+                import datetime, json as _json
+                condition_id = m.get("conditionId") or m.get("id", "")
+                if not condition_id:
+                    continue
+                market_id = f"{asset}_5m_{str(condition_id)[:8]}"
+                if market_id in self._markets:
+                    continue  # already known
+
+                # Check end time — only register markets in their active window
+                end_time = 0.0
+                end_date = (m.get("endDate") or m.get("end_date_iso") or
+                            m.get("closeTime") or m.get("expirationTime"))
+                if end_date:
+                    try:
+                        dt = datetime.datetime.fromisoformat(str(end_date).replace("Z", "+00:00"))
+                        end_time = dt.timestamp()
+                    except Exception:
+                        pass
+
+                if end_time > 0:
+                    remaining = end_time - now
+                    if remaining < self._MARKET_WINDOW_MIN or remaining > self._MARKET_WINDOW_MAX:
+                        continue  # outside active window
+
+                yes_token, no_token = self._extract_tokens(m)
+                if not yes_token or not no_token:
+                    continue
+
+                # Gamma prices
+                gamma_price_yes, gamma_price_no = None, None
+                raw_prices = m.get("outcomePrices", [])
+                if isinstance(raw_prices, str):
+                    try:
+                        raw_prices = _json.loads(raw_prices)
+                    except Exception:
+                        raw_prices = []
+                if isinstance(raw_prices, list) and len(raw_prices) >= 2:
+                    try:
+                        gamma_price_yes = float(raw_prices[0])
+                        gamma_price_no = float(raw_prices[1])
+                    except Exception:
+                        pass
+
+                if gamma_price_yes is not None and not (0.05 <= gamma_price_yes <= 0.95):
+                    continue
+
+                self.register_market(
+                    market_id=market_id,
+                    token_id_yes=yes_token,
+                    token_id_no=no_token,
+                    asset=asset,
+                    timeframe="5m",
+                    end_time=end_time,
+                    gamma_price_yes=gamma_price_yes,
+                    gamma_price_no=gamma_price_no,
+                )
+                new_count += 1
+
+        if new_count:
+            logger.info(f"[REFRESH] +{new_count} new markets | total={len(self._markets)}")
+
     def run(self):
         if not self.validate_with_monte_carlo():
             logger.warning("Monte Carlo validation failed. Strategy may not be viable. Continuing anyway.")
@@ -495,6 +581,11 @@ class ArbitrageBot:
         # --- 1. Fetch crypto spot prices ---
         new_prices = self.price_feed.fetch()
 
+        # --- Periodic market refresh (every 30s) ---
+        if now - self._last_market_refresh >= self._MARKET_REFRESH_INTERVAL:
+            self._last_market_refresh = now
+            self._refresh_markets(now)
+
         # --- Wallet tracker update (every 60s) ---
         if now - self._last_wallet_update >= 60:
             self.wallet_tracker.update()
@@ -505,10 +596,15 @@ class ArbitrageBot:
         market_stats = []  # collect for heartbeat
 
         for market_id, state in list(self._markets.items()):
-            # Skip markets that expire within 90 seconds — too risky to trade
-            if state.end_time > 0 and (state.end_time - now) < 90:
-                market_stats.append(f"{state.asset}({state.timeframe}):EXPIRING")
-                continue
+            # Only trade within the active window: 90s to 6min remaining
+            if state.end_time > 0:
+                remaining = state.end_time - now
+                if remaining < self._MARKET_WINDOW_MIN:
+                    market_stats.append(f"{state.asset}:EXPIRING({remaining:.0f}s)")
+                    continue
+                if not state.is_event and remaining > self._MARKET_WINDOW_MAX:
+                    market_stats.append(f"{state.asset}:NOT_OPEN_YET({remaining:.0f}s)")
+                    continue
 
             # --- 2. Fetch market prices from Polymarket ---
             yes_data = self.data_client.get_book_data(state.token_id_yes)
