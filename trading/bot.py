@@ -429,8 +429,9 @@ class ArbitrageBot:
                 market_stats.append(f"{state.asset}({state.timeframe}):NO_DATA")
                 continue
 
-            ob_imbalance = yes_data["imbalance"]
-            ob_depth = yes_data["depth"]
+            ob_imbalance = yes_data["imbalance"] or 0.0
+            # Use CLOB depth if available; fall back to 0.5 for Gamma-only markets
+            ob_depth = yes_data["depth"] if yes_data["depth"] else 0.5
 
             crypto_symbol = f"{state.asset}USDT"
             has_spot_price = crypto_symbol in new_prices

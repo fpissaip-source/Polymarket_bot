@@ -28,7 +28,7 @@ REFRESH_INTERVAL = 300  # 5 minutes
 # How much Gemini can move the Bayesian prior (max boost/penalty)
 MAX_BOOST = 0.08  # ±8%
 
-MODEL = "gemini-2.5-flash-preview-04-17"
+MODEL = "gemini-1.5-flash"
 
 
 @dataclass
