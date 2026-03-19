@@ -18,7 +18,7 @@ import logging
 import threading
 from dataclasses import dataclass, field
 
-import requests
+from google import genai
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +27,8 @@ REFRESH_INTERVAL = 300  # 5 minutes
 
 # How much Gemini can move the Bayesian prior (max boost/penalty)
 MAX_BOOST = 0.08  # ±8%
+
+MODEL = "gemini-2.0-flash"
 
 
 @dataclass
@@ -54,34 +56,22 @@ class GeminiSentimentAnalyzer:
     """
 
     def __init__(self):
-        self._api_key = os.getenv("GEMINI_API_KEY", "")
-        if not self._api_key:
+        api_key = os.getenv("GEMINI_API_KEY", "")
+        if not api_key:
             logger.warning("GEMINI_API_KEY not set — sentiment analyzer disabled")
             self._enabled = False
             return
 
-        # Try multiple model names in order — auto-detects which one works
-        self._models_to_try = [
-            "gemini-2.0-flash",
-            "gemini-2.0-flash-lite",
-            "gemini-1.5-flash",
-            "gemini-1.5-flash-001",
-        ]
-        self._model: str | None = None  # set after first successful call
+        self._client = genai.Client(api_key=api_key)
         self._enabled = True
         self._consecutive_failures = 0
         self._max_failures = 3  # Disable after 3 failures to avoid log spam
-
-        # Use proxy if set (override no_proxy for googleapis.com)
-        http_proxy = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy") or \
-                     os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
-        self._proxies = {"https": http_proxy, "http": http_proxy} if http_proxy else None
 
         self._cache: dict[str, SentimentResult] = {}
         self._lock = threading.Lock()
         self._running_assets: set[str] = set()
 
-        logger.info("GeminiSentimentAnalyzer initialized")
+        logger.info(f"GeminiSentimentAnalyzer initialized (model: {MODEL})")
 
     def _analyze(self, asset: str, current_price: float, price_change_pct: float, volatility: float):
         """Call Gemini and update cache. Runs in background thread."""
@@ -102,30 +92,11 @@ class GeminiSentimentAnalyzer:
                 f"- 0.5 means uncertain, >0.5 means likely up, <0.5 means likely down"
             )
 
-            payload = {"contents": [{"parts": [{"text": prompt}]}]}
-
-            # If we already found a working model, use it; otherwise probe the list
-            models = [self._model] if self._model else self._models_to_try
-            r = None
-            for model in models:
-                url = (
-                    f"https://generativelanguage.googleapis.com/v1beta/models/"
-                    f"{model}:generateContent?key={self._api_key}"
-                )
-                resp = requests.post(url, json=payload, timeout=15, proxies=self._proxies)
-                if resp.status_code == 200:
-                    if self._model != model:
-                        logger.info(f"Gemini: using model '{model}'")
-                        self._model = model
-                    r = resp
-                    break
-                logger.debug(f"Gemini model '{model}' returned {resp.status_code}, trying next")
-
-            if r is None:
-                raise RuntimeError(f"No working Gemini model found (tried: {models})")
-
-            r.raise_for_status()
-            raw = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip().replace(",", ".")
+            response = self._client.models.generate_content(
+                model=MODEL,
+                contents=prompt,
+            )
+            raw = response.text.strip().replace(",", ".")
 
             match = re.search(r"0?\.\d+|[01]\.0*", raw)
             if not match:
