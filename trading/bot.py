@@ -33,6 +33,7 @@ from models.monte_carlo import MonteCarloSimulator
 from data.price_feed import PriceFeed
 from data.market_data import PolymarketDataClient, GammaClient
 from data.wallet_tracker import WalletTracker
+from data.sentiment_analyzer import GeminiSentimentAnalyzer
 from trading.order_executor import OrderExecutor
 
 from config import (
@@ -107,6 +108,7 @@ class ArbitrageBot:
 
         self.wallet_tracker = WalletTracker()
         self._last_wallet_update = 0.0
+        self.sentiment = GeminiSentimentAnalyzer()
 
         self._markets: dict[str, MarketState] = {}
         self._running = False
@@ -412,6 +414,24 @@ class ArbitrageBot:
             )
             if wallet_signal.has_signal:
                 q = max(0.01, min(0.99, q + wallet_signal.confidence_boost))
+
+            # --- 3c. Gemini sentiment boost (cached, no delay) ---
+            price_change_pct = 0.0
+            if crypto_symbol in self._last_prices and crypto_symbol in new_prices:
+                old_p = self._last_prices[crypto_symbol]
+                if old_p > 0:
+                    price_change_pct = (new_prices[crypto_symbol] - old_p) / old_p * 100
+            # Trigger async refresh (returns immediately, updates cache in background)
+            self.sentiment.update_async(
+                asset=state.asset,
+                current_price=new_prices.get(crypto_symbol, 0.0),
+                price_change_pct=price_change_pct,
+                volatility=volatility,
+            )
+            sentiment_boost = self.sentiment.get_boost(state.asset)
+            if sentiment_boost != 0.0:
+                q = max(0.01, min(0.99, q + sentiment_boost))
+                logger.debug(f"[{market_id}] Gemini boost={sentiment_boost:+.3f} → q={q:.3f}")
 
             # --- 4. Edge check (uses dynamic MIN_EDGE from current tier) ---
             edge_result = self.edge_model.evaluate_directional(q=q, p=p_yes)
