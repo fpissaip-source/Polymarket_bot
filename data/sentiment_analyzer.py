@@ -60,7 +60,7 @@ class GeminiSentimentAnalyzer:
             return
 
         genai.configure(api_key=api_key)
-        self._model = genai.GenerativeModel("gemini-2.0-flash")
+        self._model = genai.GenerativeModel("gemini-1.5-flash")
         self._enabled = True
 
         self._cache: dict[str, SentimentResult] = {}
