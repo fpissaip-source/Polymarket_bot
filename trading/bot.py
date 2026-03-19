@@ -381,6 +381,7 @@ class ArbitrageBot:
             p_yes = yes_data["mid_price"]
             p_no = no_data["mid_price"]
             if p_yes is None or p_no is None:
+                logger.info(f"[SKIP] {market_id}: no order book (yes={p_yes}, no={p_no})")
                 continue
 
             ob_imbalance = yes_data["imbalance"]
