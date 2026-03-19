@@ -51,8 +51,12 @@ def run_validation_only():
 def main():
     parser = argparse.ArgumentParser(description="Polymarket Arbitrage Bot")
     parser.add_argument(
-        "--dry-run", action="store_true", default=False,
-        help="Log opportunities without placing real orders",
+        "--dry-run", action="store_true", default=True,
+        help="Log opportunities without placing real orders (default: True)",
+    )
+    parser.add_argument(
+        "--live", action="store_true", default=False,
+        help="Enable live trading (real orders)",
     )
     parser.add_argument(
         "--validate", action="store_true",
@@ -64,10 +68,11 @@ def main():
         run_validation_only()
         return
 
+    dry_run = not args.live  # dry-run is default, --live enables real orders
     logger.info("Initializing Polymarket Arbitrage Bot...")
-    logger.info(f"Mode: {'DRY RUN' if args.dry_run else 'LIVE'}")
+    logger.info(f"Mode: {'DRY RUN' if dry_run else '*** LIVE TRADING ***'}")
 
-    bot = ArbitrageBot(dry_run=args.dry_run)
+    bot = ArbitrageBot(dry_run=dry_run)
 
     # Auto-discover active crypto markets on Polymarket
     logger.info("Auto-discovering active markets...")
