@@ -55,52 +55,43 @@ class PolymarketDataClient:
             logger.error(f"Failed to fetch order book for {token_id}: {e}")
             return {}
 
-    def get_mid_price(self, token_id: str) -> float | None:
-        """Compute mid price from order book."""
+    def get_book_data(self, token_id: str, levels: int = 5) -> dict:
+        """
+        Fetch the order book once and return mid_price, imbalance, and depth.
+        Replaces the previous pattern of 3-4 separate get_order_book() calls.
+        Returns: {"mid_price": float|None, "imbalance": float, "depth": float}
+        """
         book = self.get_order_book(token_id)
         if not book:
-            return None
+            return {"mid_price": None, "imbalance": 0.0, "depth": 0.0}
+
         bids = book.get("bids", [])
         asks = book.get("asks", [])
-        if not bids or not asks:
-            return None
+
         best_bid = float(bids[0]["price"]) if bids else None
         best_ask = float(asks[0]["price"]) if asks else None
         if best_bid and best_ask:
-            return (best_bid + best_ask) / 2.0
-        return best_bid or best_ask
+            mid_price = (best_bid + best_ask) / 2.0
+        else:
+            mid_price = best_bid or best_ask
+
+        bid_vol = sum(float(b.get("size", 0)) for b in bids[:levels])
+        ask_vol = sum(float(a.get("size", 0)) for a in asks[:levels])
+        total = bid_vol + ask_vol
+        imbalance = (bid_vol - ask_vol) / total if total > 1e-8 else 0.0
+        depth = min(1.0, total / 1000.0)
+
+        return {"mid_price": mid_price, "imbalance": imbalance, "depth": depth}
+
+    def get_mid_price(self, token_id: str) -> float | None:
+        """Compute mid price from order book."""
+        return self.get_book_data(token_id)["mid_price"]
 
     def get_order_book_imbalance(self, token_id: str) -> float:
-        """
-        Compute order book imbalance in [-1, 1].
-        Positive = more buy pressure, Negative = more sell pressure.
-        """
-        book = self.get_order_book(token_id)
-        if not book:
-            return 0.0
-        bids = book.get("bids", [])
-        asks = book.get("asks", [])
-        bid_vol = sum(float(b.get("size", 0)) for b in bids[:5])
-        ask_vol = sum(float(a.get("size", 0)) for a in asks[:5])
-        total = bid_vol + ask_vol
-        if total < 1e-8:
-            return 0.0
-        return (bid_vol - ask_vol) / total
+        return self.get_book_data(token_id)["imbalance"]
 
     def get_order_book_depth(self, token_id: str, levels: int = 5) -> float:
-        """
-        Estimate order book depth as a normalized score [0, 1].
-        Higher = deeper book = more liquidity.
-        """
-        book = self.get_order_book(token_id)
-        if not book:
-            return 0.0
-        bids = book.get("bids", [])
-        asks = book.get("asks", [])
-        depth = sum(float(b.get("size", 0)) for b in bids[:levels])
-        depth += sum(float(a.get("size", 0)) for a in asks[:levels])
-        # Normalize: assume 1000 USDC depth = 1.0
-        return min(1.0, depth / 1000.0)
+        return self.get_book_data(token_id)["depth"]
 
     def find_crypto_5min_markets(self, asset: str = "BTC") -> list[dict]:
         """

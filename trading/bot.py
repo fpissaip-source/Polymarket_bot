@@ -50,6 +50,7 @@ class MarketState:
     stoikov: StoikovModel = field(default_factory=StoikovModel)
     last_price: float = 0.5
     last_price_no: float = 0.5
+    end_time: float = 0.0   # Unix timestamp when market closes (0 = unknown)
 
 
 @dataclass
@@ -102,6 +103,7 @@ class ArbitrageBot:
         token_id_no: str,
         asset: str,
         timeframe: str,
+        end_time: float = 0.0,
     ):
         state = MarketState(
             market_id=market_id,
@@ -111,7 +113,13 @@ class ArbitrageBot:
             timeframe=timeframe,
             bayesian=BayesianModel(market_id),
             stoikov=StoikovModel(),
+            end_time=end_time,
         )
+        # Auto-register spread pairs: any two markets with the same asset
+        for existing_id, existing in self._markets.items():
+            if existing.asset == asset:
+                self.spread_map.register_pair(existing_id, market_id)
+                logger.info(f"Spread pair registered: {existing_id} <-> {market_id}")
         self._markets[market_id] = state
         logger.info(f"Registered market: {market_id} ({asset} {timeframe})")
 
@@ -128,8 +136,8 @@ class ArbitrageBot:
             logger.info(f"Discovering {asset} markets via Gamma API...")
             markets = gamma.find_crypto_markets(asset)  # uses default 5-min keyword variants
             if not markets:
-                # Fallback: broader keyword search
-                markets = gamma.find_crypto_markets(asset)
+                # Fallback: broader keyword search (no 5-min filter)
+                markets = gamma.find_crypto_markets(asset, keywords=[])
             if not markets:
                 # Last resort: CLOB-based search
                 logger.info(f"Gamma empty, falling back to CLOB for {asset}...")
@@ -149,12 +157,25 @@ class ArbitrageBot:
                     continue
                 condition_id = m.get("condition_id", "")
                 market_id = f"{asset}_5m_{condition_id[:8]}"
+
+                # Parse end time for remaining_time calculation
+                end_time = 0.0
+                end_date = m.get("end_date_iso") or m.get("endDate") or m.get("close_time")
+                if end_date:
+                    try:
+                        import datetime
+                        dt = datetime.datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+                        end_time = dt.timestamp()
+                    except Exception:
+                        pass
+
                 self.register_market(
                     market_id=market_id,
                     token_id_yes=yes_token,
                     token_id_no=no_token,
                     asset=asset,
                     timeframe="5m",
+                    end_time=end_time,
                 )
                 registered += 1
 
@@ -188,24 +209,28 @@ class ArbitrageBot:
         opportunities: list[TradeOpportunity] = []
 
         for market_id, state in self._markets.items():
-            # --- 2. Fetch market prices from Polymarket ---
-            p_yes = self.data_client.get_mid_price(state.token_id_yes)
-            p_no = self.data_client.get_mid_price(state.token_id_no)
+            # --- 2. Fetch market prices from Polymarket (single HTTP call per token) ---
+            yes_data = self.data_client.get_book_data(state.token_id_yes)
+            no_data = self.data_client.get_book_data(state.token_id_no)
+            p_yes = yes_data["mid_price"]
+            p_no = no_data["mid_price"]
             if p_yes is None or p_no is None:
                 continue
 
-            ob_imbalance = self.data_client.get_order_book_imbalance(state.token_id_yes)
-            ob_depth = self.data_client.get_order_book_depth(state.token_id_yes)
+            ob_imbalance = yes_data["imbalance"]
+            ob_depth = yes_data["depth"]
 
             # Determine crypto symbol from asset (HYPE not on Binance)
             crypto_symbol = f"{state.asset}USDT"
             has_spot_price = crypto_symbol in new_prices
 
             # --- 3. Bayesian update ---
+            volatility = self.price_feed.get_volatility(crypto_symbol) if has_spot_price else 0.0
             bayesian_data = self.price_feed.build_bayesian_data(
                 symbol=crypto_symbol if has_spot_price else None,
                 new_prices=new_prices,
                 elapsed_seconds=elapsed,
+                volatility=volatility,
                 ob_imbalance=ob_imbalance,
             )
             q = state.bayesian.update(bayesian_data)
@@ -283,38 +308,85 @@ class ArbitrageBot:
         opportunities.sort(key=lambda o: o.edge_result.ev_net, reverse=True)
 
         for opp in opportunities:
-            side = opp.edge_result.side          # "BUY" or "SELL"
+            market = self._markets[opp.market_id]
             price = opp.stoikov_quote.reservation_price
             size = opp.kelly_result.position_size
-            token_id = self._markets[opp.market_id].token_id_yes
+            side = opp.edge_result.side          # "YES", "NO", or "BOTH"
+            is_aggressive = opp.stoikov_quote.is_aggressive
 
             if self.dry_run:
                 logger.info(
                     f"[DRY RUN] {opp.market_id}: {side} ${size:.2f} @ {price:.4f} "
-                    f"| EV={opp.edge_result.ev_net:.4f} | Kelly f={opp.kelly_result.f_kelly:.4f}"
+                    f"| EV={opp.edge_result.ev_net:.4f} | Kelly f={opp.kelly_result.f_kelly:.4f} "
+                    f"| exec={'FOK' if is_aggressive else 'GTC'}"
                 )
+                continue
+
+            # Within-market arb: buy both YES and NO simultaneously
+            if side == "BOTH":
+                self._place_arb_both_sides(market, size, is_aggressive)
+                continue
+
+            # Directional: BUY YES or BUY NO
+            token_id = market.token_id_yes if side == "YES" else market.token_id_no
+            logger.info(
+                f"[LIVE] Placing order: {opp.market_id} BUY {side} ${size:.2f} @ {price:.4f} "
+                f"({'FOK' if is_aggressive else 'GTC'})"
+            )
+            if is_aggressive:
+                order_id = self.executor.place_fok_order(token_id, "BUY", price, size)
             else:
-                logger.info(
-                    f"[LIVE] Placing order: {opp.market_id} {side} ${size:.2f} @ {price:.4f}"
-                )
-                order_id = self.executor.place_limit_order(
-                    token_id=token_id,
-                    side=side,
-                    price=price,
-                    size=size,
-                )
-                if order_id:
-                    logger.info(f"Order accepted: {order_id}")
-                else:
-                    logger.warning(f"Order rejected for {opp.market_id}")
+                order_id = self.executor.place_limit_order(token_id, "BUY", price, size)
+
+            if order_id:
+                logger.info(f"Order accepted: {order_id}")
+                self.kelly.allocate(size)
+            else:
+                logger.warning(f"Order rejected for {opp.market_id}")
+
+    def _place_arb_both_sides(self, market: "MarketState", size: float, aggressive: bool):
+        """Place both YES and NO legs of a within-market arbitrage."""
+        half = size / 2.0
+        yes_price = market.last_price
+        no_price = market.last_price_no
+
+        logger.info(
+            f"[LIVE] Within-market arb {market.market_id}: "
+            f"BUY YES ${half:.2f} @ {yes_price:.4f} + BUY NO ${half:.2f} @ {no_price:.4f}"
+        )
+        if aggressive:
+            yes_id = self.executor.place_fok_order(market.token_id_yes, "BUY", yes_price, half)
+            no_id = self.executor.place_fok_order(market.token_id_no, "BUY", no_price, half)
+        else:
+            yes_id = self.executor.place_limit_order(market.token_id_yes, "BUY", yes_price, half)
+            no_id = self.executor.place_limit_order(market.token_id_no, "BUY", no_price, half)
+
+        if yes_id and no_id:
+            logger.info(f"Both legs accepted: YES={yes_id}, NO={no_id}")
+            self.kelly.allocate(size)
+        elif yes_id or no_id:
+            # Only one leg filled – partial arb, cancel the one that filled by logging the risk
+            logger.warning(
+                f"Partial arb fill for {market.market_id}: "
+                f"YES={yes_id}, NO={no_id} — directional exposure!"
+            )
+            self.kelly.allocate(half)
+        else:
+            logger.warning(f"Both legs rejected for {market.market_id}")
 
     def _estimate_remaining_time(self, state: MarketState) -> float:
         """
         Estimate (T-t) as a normalized value [0, 1].
-        For 5-minute markets, if we're at minute 4, remaining = 0.2.
-        Without actual market close data, default to 0.5.
+        Uses the market's end_time if available; falls back to 0.5.
         """
-        return 0.5  # placeholder; integrate with Polymarket end_date_iso
+        if state.end_time <= 0:
+            return 0.5
+        now = time.time()
+        window = 5 * 60  # 5-minute markets assumed
+        remaining = state.end_time - now
+        if remaining <= 0:
+            return 0.0
+        return min(1.0, remaining / window)
 
     def stop(self):
         self._running = False

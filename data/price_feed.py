@@ -5,19 +5,25 @@ Fetches real-time spot prices for BTC, ETH, SOL, XRP from Binance.
 Used as external data (D) for the Bayesian model.
 """
 
+import math
 import time
 import logging
 import requests
+from collections import deque
 from config import PRICE_FEED_URL, CRYPTO_SYMBOLS
 
 logger = logging.getLogger(__name__)
 
 
 class PriceFeed:
-    def __init__(self, symbols: list[str] = CRYPTO_SYMBOLS):
+    def __init__(self, symbols: list[str] = CRYPTO_SYMBOLS, volatility_window: int = 20):
         self.symbols = symbols
         self._last_prices: dict[str, float] = {}
         self._last_update: float = 0.0
+        # Rolling return history for volatility calculation
+        self._return_history: dict[str, deque] = {
+            s: deque(maxlen=volatility_window) for s in symbols
+        }
 
     def fetch(self) -> dict[str, float]:
         """Fetch current prices for all configured symbols."""
@@ -35,6 +41,15 @@ class PriceFeed:
         except Exception as e:
             logger.warning(f"Price feed error: {e}, using last known prices")
             return dict(self._last_prices)
+
+        # Update return history for volatility
+        for symbol, price in prices.items():
+            last = self._last_prices.get(symbol)
+            if last and last > 0:
+                ret = (price - last) / last
+                if symbol not in self._return_history:
+                    self._return_history[symbol] = deque(maxlen=20)
+                self._return_history[symbol].append(ret)
 
         self._last_prices = dict(prices)
         self._last_update = time.time()
@@ -61,6 +76,20 @@ class PriceFeed:
             else:
                 speed[symbol] = 0.0
         return speed
+
+    def get_volatility(self, symbol: str) -> float:
+        """
+        Compute realized volatility as std of recent returns, normalized to [0, 1].
+        Returns 0.0 if insufficient history.
+        """
+        history = self._return_history.get(symbol)
+        if not history or len(history) < 3:
+            return 0.0
+        mean = sum(history) / len(history)
+        variance = sum((r - mean) ** 2 for r in history) / len(history)
+        std = math.sqrt(variance)
+        # Normalize: 1% std per tick ≈ 1.0 volatility score
+        return min(1.0, std * 100)
 
     def build_bayesian_data(
         self,
