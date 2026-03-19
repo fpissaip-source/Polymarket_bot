@@ -41,10 +41,13 @@ class PolymarketDataClient:
         """Fetch a single market by condition ID."""
         try:
             r = self._session.get(f"{self.host}/markets/{condition_id}", timeout=10)
+            if r.status_code == 404:
+                logger.debug(f"Market {condition_id[:16]}... not on CLOB (404)")
+                return {}
             r.raise_for_status()
             return r.json()
         except Exception as e:
-            logger.error(f"Failed to fetch market {condition_id}: {e}")
+            logger.debug(f"Failed to fetch market {condition_id[:16]}...: {e}")
             return {}
 
     def get_order_book(self, token_id: str) -> dict:
