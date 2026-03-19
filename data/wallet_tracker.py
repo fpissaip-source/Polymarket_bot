@@ -91,37 +91,31 @@ class WalletTracker:
     # ------------------------------------------------------------------
     def _fetch_leaderboard(self) -> list[str]:
         """Fetch top wallet addresses from Polymarket leaderboard."""
-        try:
-            r = self._session.get(
-                f"{self.host}/leaderboard",
-                params={"limit": self.top_n, "window": "all"},
-                timeout=10,
-            )
-            if r.status_code == 404:
-                # Try alternate endpoint
-                r = self._session.get(
-                    f"{self.host}/leaderboard",
-                    params={"limit": self.top_n},
-                    timeout=10,
-                )
-            r.raise_for_status()
-            data = r.json()
-            if isinstance(data, list):
-                entries = data
-            else:
-                entries = data.get("data", data.get("leaderboard", []))
-
-            addresses = []
-            for entry in entries:
-                addr = (entry.get("proxyWallet") or entry.get("proxy_wallet") or
-                        entry.get("address") or entry.get("user"))
-                if addr:
-                    addresses.append(addr)
-            logger.info(f"WalletTracker: fetched {len(addresses)} wallets from leaderboard")
-            return addresses
-        except Exception as e:
-            logger.warning(f"WalletTracker: leaderboard fetch failed: {e}")
-            return []
+        endpoints = [
+            ("https://data-api.polymarket.com/leaderboard", {"limit": self.top_n}),
+            ("https://data-api.polymarket.com/leaderboard", {"limit": self.top_n, "window": "1m"}),
+            ("https://gamma-api.polymarket.com/leaderboard", {"limit": self.top_n}),
+        ]
+        for url, params in endpoints:
+            try:
+                r = self._session.get(url, params=params, timeout=10)
+                if r.status_code != 200:
+                    continue
+                data = r.json()
+                entries = data if isinstance(data, list) else data.get("data", data.get("leaderboard", []))
+                addresses = []
+                for entry in entries:
+                    addr = (entry.get("proxyWallet") or entry.get("proxy_wallet") or
+                            entry.get("address") or entry.get("user"))
+                    if addr:
+                        addresses.append(addr)
+                if addresses:
+                    logger.info(f"WalletTracker: fetched {len(addresses)} wallets from {url}")
+                    return addresses
+            except Exception:
+                continue
+        logger.debug("WalletTracker: leaderboard not available, skipping smart wallet signals")
+        return []
 
     def _refresh_leaderboard(self):
         """Refresh leaderboard cache if stale."""
