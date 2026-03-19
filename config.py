@@ -47,7 +47,21 @@ STOIKOV_SIGMA_DEFAULT = 0.02  # Default variance estimate
 # Kelly model
 KELLY_FRACTION = 0.25         # Fractional Kelly (lambda), conservative
 KELLY_MAX_FRACTION = 0.5      # Maximum fraction of bankroll per trade
-BANKROLL = float(os.getenv("BANKROLL", "1000.0"))  # Total capital in USD
+BANKROLL = float(os.getenv("BANKROLL", "5.27"))  # Total capital in USD
+
+# Growth tiers: (min_balance, max_balance, kelly_lambda, min_edge)
+# Bot starts aggressive at $5 and scales down as bankroll grows.
+# Goal: $5.27 → $100 → $1,000 → $10,000
+GROWTH_TIERS = [
+    (0.0,    50.0,   0.50,  0.020),         # Tier 1:   $0–$50     aggressive, 2% edge
+    (50.0,   100.0,  0.45,  0.025),         # Tier 2:  $50–$100    still aggressive
+    (100.0,  500.0,  0.35,  0.025),         # Tier 3: $100–$500    moderate
+    (500.0,  1000.0, 0.30,  0.030),         # Tier 4: $500–$1000   standard
+    (1000.0, float("inf"), 0.25, 0.030),    # Tier 5: $1000+       conservative
+]
+
+# State file for bankroll persistence across restarts
+BANKROLL_STATE_FILE = "bankroll_state.json"
 
 # Monte Carlo
 MC_SIMULATIONS = 600          # Number of simulation paths

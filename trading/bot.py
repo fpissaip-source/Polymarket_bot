@@ -9,8 +9,15 @@ Ties all 6 models together in a single trading loop:
 4. Stoikov   → computes optimal execution price and passive/aggressive mode
 5. Kelly     → sizes the position based on edge and execution probability
 6. MonteCarlo→ (runs offline / periodically) validates the strategy
+
+Growth strategy: $5.27 → $100 → $1,000 → $10,000
+  - Start aggressive (Kelly λ=0.50, MIN_EDGE=2%) to compound fast
+  - Automatically reduce aggressiveness as bankroll grows
+  - Bankroll is persisted to disk between restarts
 """
 
+import json
+import os
 import time
 import logging
 from dataclasses import dataclass, field
@@ -34,6 +41,8 @@ from config import (
     TOTAL_COST,
     CRYPTO_SYMBOLS,
     POLYMARKET_ASSETS,
+    GROWTH_TIERS,
+    BANKROLL_STATE_FILE,
 )
 
 logger = logging.getLogger("polymarket_bot.bot")
@@ -63,6 +72,14 @@ class TradeOpportunity:
     timestamp: float = field(default_factory=time.time)
 
 
+def _get_tier(bankroll: float) -> tuple:
+    """Return (kelly_lambda, min_edge) for the current bankroll tier."""
+    for min_bal, max_bal, kelly_lambda, min_edge in GROWTH_TIERS:
+        if min_bal <= bankroll < max_bal:
+            return kelly_lambda, min_edge
+    return GROWTH_TIERS[-1][2], GROWTH_TIERS[-1][3]
+
+
 class ArbitrageBot:
     def __init__(self, dry_run: bool = False):
         self.dry_run = dry_run
@@ -70,7 +87,16 @@ class ArbitrageBot:
         self.price_feed = PriceFeed()
         self.edge_model = EdgeModel()
         self.spread_map = SpreadMap()
-        self.kelly = KellyModel(bankroll=BANKROLL)
+
+        # Load persisted bankroll or use config default
+        starting_bankroll = self._load_bankroll()
+        kelly_lambda, self._current_min_edge = _get_tier(starting_bankroll)
+        logger.info(
+            f"Starting bankroll: ${starting_bankroll:.2f} | "
+            f"Tier: Kelly λ={kelly_lambda:.2f}, MIN_EDGE={self._current_min_edge:.1%}"
+        )
+
+        self.kelly = KellyModel(bankroll=starting_bankroll, lambda_fraction=kelly_lambda)
         self.mc = MonteCarloSimulator()
         self.executor = None if dry_run else OrderExecutor()
 
@@ -85,12 +111,57 @@ class ArbitrageBot:
 
         self._mc_validated = False
 
+    # ------------------------------------------------------------------
+    # Bankroll persistence
+    # ------------------------------------------------------------------
+    def _load_bankroll(self) -> float:
+        if os.path.exists(BANKROLL_STATE_FILE):
+            try:
+                with open(BANKROLL_STATE_FILE) as f:
+                    data = json.load(f)
+                    br = float(data.get("bankroll", BANKROLL))
+                    logger.info(f"Loaded bankroll from state file: ${br:.2f}")
+                    return br
+            except Exception as e:
+                logger.warning(f"Could not load bankroll state: {e}")
+        return BANKROLL
+
+    def _save_bankroll(self):
+        try:
+            with open(BANKROLL_STATE_FILE, "w") as f:
+                json.dump({"bankroll": round(self.kelly.bankroll, 4)}, f)
+        except Exception as e:
+            logger.warning(f"Could not save bankroll state: {e}")
+
+    # ------------------------------------------------------------------
+    # Dynamic tier adjustment
+    # ------------------------------------------------------------------
+    def _apply_growth_tier(self):
+        """Adjust Kelly lambda and MIN_EDGE based on current bankroll."""
+        kelly_lambda, min_edge = _get_tier(self.kelly.bankroll)
+        changed = False
+        if abs(kelly_lambda - self.kelly.lambda_fraction) > 0.001:
+            self.kelly.lambda_fraction = kelly_lambda
+            changed = True
+        if abs(min_edge - self._current_min_edge) > 0.0001:
+            self._current_min_edge = min_edge
+            self.edge_model.min_edge = min_edge
+            changed = True
+        if changed:
+            logger.info(
+                f"TIER CHANGE | Bankroll=${self.kelly.bankroll:.2f} | "
+                f"Kelly λ={kelly_lambda:.2f} | MIN_EDGE={min_edge:.1%}"
+            )
+
+    # ------------------------------------------------------------------
+    # Monte Carlo validation
+    # ------------------------------------------------------------------
     def validate_with_monte_carlo(self) -> bool:
         logger.info("Running Monte Carlo validation...")
         result = self.mc.run(
-            base_ev=MIN_EDGE,
+            base_ev=self._current_min_edge,
             base_win_rate=0.55,
-            avg_position_fraction=0.25,
+            avg_position_fraction=self.kelly.lambda_fraction,
         )
         logger.info(f"Monte Carlo result: {result.description}")
         self._mc_validated = result.is_viable
@@ -134,12 +205,10 @@ class ArbitrageBot:
 
         for asset in assets:
             logger.info(f"Discovering {asset} markets via Gamma API...")
-            markets = gamma.find_crypto_markets(asset)  # uses default 5-min keyword variants
+            markets = gamma.find_crypto_markets(asset)
             if not markets:
-                # Fallback: broader keyword search (no 5-min filter)
                 markets = gamma.find_crypto_markets(asset, keywords=[])
             if not markets:
-                # Last resort: CLOB-based search
                 logger.info(f"Gamma empty, falling back to CLOB for {asset}...")
                 markets = self.data_client.find_crypto_5min_markets(asset)
 
@@ -158,7 +227,6 @@ class ArbitrageBot:
                 condition_id = m.get("condition_id", "")
                 market_id = f"{asset}_5m_{condition_id[:8]}"
 
-                # Parse end time for remaining_time calculation
                 end_time = 0.0
                 end_date = m.get("end_date_iso") or m.get("endDate") or m.get("close_time")
                 if end_date:
@@ -186,7 +254,8 @@ class ArbitrageBot:
         if not self.validate_with_monte_carlo():
             logger.warning("Monte Carlo validation failed. Strategy may not be viable. Continuing anyway.")
 
-        logger.info(f"Starting arbitrage bot main loop (mode: {'DRY RUN' if self.dry_run else 'LIVE'})...")
+        logger.info(f"Starting bot main loop (mode: {'DRY RUN' if self.dry_run else 'LIVE'})...")
+        logger.info(f"GROWTH GOAL: ${self.kelly.bankroll:.2f} → $100 → $1,000 → $10,000")
         self._running = True
 
         while self._running:
@@ -203,13 +272,16 @@ class ArbitrageBot:
         now = time.time()
         elapsed = now - self._last_price_fetch if self._last_price_fetch else 1.0
 
+        # Apply growth tier (adjusts Kelly λ and MIN_EDGE based on bankroll)
+        self._apply_growth_tier()
+
         # --- 1. Fetch crypto spot prices ---
         new_prices = self.price_feed.fetch()
 
         opportunities: list[TradeOpportunity] = []
 
         for market_id, state in self._markets.items():
-            # --- 2. Fetch market prices from Polymarket (single HTTP call per token) ---
+            # --- 2. Fetch market prices from Polymarket ---
             yes_data = self.data_client.get_book_data(state.token_id_yes)
             no_data = self.data_client.get_book_data(state.token_id_no)
             p_yes = yes_data["mid_price"]
@@ -220,7 +292,6 @@ class ArbitrageBot:
             ob_imbalance = yes_data["imbalance"]
             ob_depth = yes_data["depth"]
 
-            # Determine crypto symbol from asset (HYPE not on Binance)
             crypto_symbol = f"{state.asset}USDT"
             has_spot_price = crypto_symbol in new_prices
 
@@ -235,7 +306,7 @@ class ArbitrageBot:
             )
             q = state.bayesian.update(bayesian_data)
 
-            # --- 4. Edge check ---
+            # --- 4. Edge check (uses dynamic MIN_EDGE from current tier) ---
             edge_result = self.edge_model.evaluate_directional(q=q, p=p_yes)
 
             # Also check within-market arbitrage
@@ -291,6 +362,7 @@ class ArbitrageBot:
                     f"edge={edge_result.ev_net:.4f}, "
                     f"q={q:.3f}, p={p_yes:.3f}, "
                     f"size=${kelly_result.position_size:.2f}, "
+                    f"bankroll=${self.kelly.bankroll:.2f}, "
                     f"exec={'AGGRESSIVE' if stoikov_quote.is_aggressive else 'PASSIVE'}"
                 )
 
@@ -341,10 +413,11 @@ class ArbitrageBot:
             if order_id:
                 logger.info(f"Order accepted: {order_id}")
                 self.kelly.allocate(size)
+                self._save_bankroll()
             else:
                 logger.warning(f"Order rejected for {opp.market_id}")
 
-    def _place_arb_both_sides(self, market: "MarketState", size: float, aggressive: bool):
+    def _place_arb_both_sides(self, market: MarketState, size: float, aggressive: bool):
         """Place both YES and NO legs of a within-market arbitrage."""
         half = size / 2.0
         yes_price = market.last_price
@@ -364,13 +437,14 @@ class ArbitrageBot:
         if yes_id and no_id:
             logger.info(f"Both legs accepted: YES={yes_id}, NO={no_id}")
             self.kelly.allocate(size)
+            self._save_bankroll()
         elif yes_id or no_id:
-            # Only one leg filled – partial arb, cancel the one that filled by logging the risk
             logger.warning(
                 f"Partial arb fill for {market.market_id}: "
                 f"YES={yes_id}, NO={no_id} — directional exposure!"
             )
             self.kelly.allocate(half)
+            self._save_bankroll()
         else:
             logger.warning(f"Both legs rejected for {market.market_id}")
 
@@ -390,4 +464,5 @@ class ArbitrageBot:
 
     def stop(self):
         self._running = False
+        self._save_bankroll()
         logger.info("Bot stopped.")
