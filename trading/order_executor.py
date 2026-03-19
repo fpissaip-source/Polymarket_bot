@@ -47,7 +47,7 @@ _ORDER_TYPE_MAP = {
     "GTD": OrderType.GTD,
     "FOK": OrderType.FOK,
     "FAK": OrderType.FAK,
-}
+} if _PY_CLOB_AVAILABLE else {}
 
 
 def _post_with_retry(fn, *args, retries: int = 4):
