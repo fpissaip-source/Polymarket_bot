@@ -334,17 +334,24 @@ class ArbitrageBot:
                     continue
                 market_id = f"{asset}_5m_{str(condition_id)[:8]}"
 
-                # End time
+                # End time — ignore clearly invalid dates (more than a day in the past)
                 end_time = 0.0
+                now_ts = time.time()
                 end_date = (m.get("endDate") or m.get("end_date_iso") or
                             m.get("closeTime") or m.get("close_time") or
                             m.get("expirationTime") or m.get("expiration"))
                 if end_date:
                     try:
                         dt = datetime.datetime.fromisoformat(str(end_date).replace("Z", "+00:00"))
-                        end_time = dt.timestamp()
+                        ts = dt.timestamp()
+                        if ts > now_ts - 86400:  # only accept if not more than 1 day in the past
+                            end_time = ts
                     except Exception:
                         pass
+
+                # Skip already-expired markets
+                if end_time > 0 and end_time < now_ts:
+                    continue
 
                 # Extract Gamma prices as CLOB fallback
                 gamma_price_yes, gamma_price_no = None, None
@@ -504,21 +511,22 @@ class ArbitrageBot:
                 if market_id in self._markets:
                     continue  # already known
 
-                # Check end time — only register markets in their active window
+                # Parse end time; ignore clearly invalid dates (more than a day in the past)
                 end_time = 0.0
                 end_date = (m.get("endDate") or m.get("end_date_iso") or
                             m.get("closeTime") or m.get("expirationTime"))
                 if end_date:
                     try:
                         dt = datetime.datetime.fromisoformat(str(end_date).replace("Z", "+00:00"))
-                        end_time = dt.timestamp()
+                        ts = dt.timestamp()
+                        if ts > now - 86400:  # only accept if not more than 1 day in the past
+                            end_time = ts
                     except Exception:
                         pass
 
-                if end_time > 0:
-                    remaining = end_time - now
-                    if remaining < self._MARKET_WINDOW_MIN or remaining > self._MARKET_WINDOW_MAX:
-                        continue  # outside active window
+                # Skip markets that are already expired (end_time known and in the past)
+                if end_time > 0 and end_time < now:
+                    continue
 
                 yes_token, no_token = self._extract_tokens(m)
                 if not yes_token or not no_token:
@@ -601,7 +609,7 @@ class ArbitrageBot:
         market_stats = []  # collect for heartbeat
 
         for market_id, state in list(self._markets.items()):
-            # Only trade within the active window: 90s to 6min remaining
+            # Skip markets outside active window — but trade freely if end_time unknown (=0)
             if state.end_time > 0:
                 remaining = state.end_time - now
                 if remaining < self._MARKET_WINDOW_MIN:
