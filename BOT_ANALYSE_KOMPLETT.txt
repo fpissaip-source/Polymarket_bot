@@ -1,0 +1,391 @@
+================================================================================
+   POLYMARKET ARBITRAGE BOT - VOLLSTÄNDIGE ANALYSE
+   Datum: 2026-03-19
+================================================================================
+
+
+1. ARCHITEKTUR-ÜBERSICHT
+================================================================================
+
+Der Bot ist ein synchroner, single-threaded Arbitrage-Bot für Polymarket
+5-Minuten Krypto-Märkte. Er kombiniert 6 Modelle in einer Pipeline:
+
+  main.py → ArbitrageBot → _tick() Loop (jede Sekunde)
+    ├── 1. PriceFeed        (Binance REST API)
+    ├── 2. BayesianModel    (Wahrscheinlichkeitsschätzung)
+    ├── 3. EdgeModel        (Edge-Erkennung)
+    ├── 4. SpreadModel      (Cross-Market Arbitrage)
+    ├── 5. StoikovModel     (Execution-Preis)
+    ├── 6. KellyModel       (Positionsgröße)
+    └── OrderExecutor       (Order-Platzierung via py-clob-client)
+
+Dateien:
+  config.py                    - Alle Konfigurationsparameter
+  main.py                      - Entry Point, CLI args
+  trading/bot.py               - Hauptlogik, Tick-Loop, Orchestrierung
+  trading/order_executor.py    - Order-Platzierung auf Polymarket CLOB
+  data/price_feed.py           - Binance Preisdaten
+  data/market_data.py          - Polymarket Order Books + Market Discovery
+  models/bayesian.py           - Bayesian Probability Model
+  models/edge.py               - Edge Detection (EV-Berechnung)
+  models/spread.py             - Cross-Market Spread/Z-Score
+  models/stoikov.py            - Stoikov Market-Making Execution
+  models/kelly.py              - Kelly Criterion Position Sizing
+  models/monte_carlo.py        - Monte Carlo Strategie-Validierung
+  utils/logger.py              - Logging Setup
+  setup_api_keys.py            - Einmaliges API-Key Setup
+
+
+2. ABLAUF PRO TICK (DETAILLIERT)
+================================================================================
+
+Jeder Tick durchläuft folgende Schritte:
+
+SCHRITT 1: Binance Preise holen
+  - 6 sequentielle HTTP GET Requests (BTCUSDT, ETHUSDT, SOLUSDT, etc.)
+  - Jeder Request: ~50-150ms
+  - Gesamt: ~300-900ms
+  - Problem: SEQUENTIELL, nicht parallel!
+
+SCHRITT 2: Für JEDEN registrierten Markt (bis zu 21 Märkte = 7 Assets × 3):
+  a) get_mid_price(token_yes)    → GET /book?token_id=... (~100ms)
+  b) get_mid_price(token_no)     → GET /book?token_id=... (~100ms)
+  c) get_order_book_imbalance()  → GET /book?token_id=... (~100ms)  ← REDUNDANT!
+  d) get_order_book_depth()      → GET /book?token_id=... (~100ms)  ← REDUNDANT!
+
+  KRITISCHER BUG: Für EINEN Markt werden 4 separate HTTP-Calls gemacht,
+  obwohl get_mid_price, get_order_book_imbalance und get_order_book_depth
+  ALLE dasselbe Order Book fetchen! Das sind 3 überflüssige Calls pro Markt.
+
+SCHRITT 3: Bayesian Update (lokal, ~0.1ms)
+  - Berechnet Likelihood aus spot_return, speed, volatility, volume, ob_imbalance
+  - Aktualisiert Posterior via Bayes' Theorem mit Exponential Smoothing
+
+SCHRITT 4: Edge Check (lokal, ~0.1ms)
+  - Directional: EV_net = q - p - c > MIN_EDGE (3%)
+  - Within-Market: 1 - (p_yes + p_no) - c > MIN_EDGE
+  - Kosten: 1% Fee + 0.5% Slippage + 0.5% Incomplete = 2% total
+
+SCHRITT 5: Spread Check (optional, 1+ HTTP Call pro Related Market)
+  - z-score basiert: z = (S - μ) / σ
+  - Threshold: |z| > 2.0
+
+SCHRITT 6: Stoikov Quote (lokal, ~0.1ms)
+  - Reservation Price: r = s - q × γ × σ² × (T-t)
+  - Entscheidet passiv (Limit) vs aggressiv (Market)
+
+SCHRITT 7: Kelly Sizing (lokal, ~0.1ms)
+  - f* = (b×p - q) / b
+  - Fractional Kelly: f = 0.25 × f*
+  - Max 50% des Bankrolls pro Trade
+
+SCHRITT 8: Order Execution
+  - create_order() → lokale EIP-712 Signatur (~5ms)
+  - post_order() → POST an CLOB API (~100-300ms)
+  - GTC Order (Good Till Cancelled)
+
+SCHRITT 9: sleep(1)
+
+
+3. TIMING-ANALYSE
+================================================================================
+
+Best Case (1 Markt):
+  Binance:           300ms  (6 Calls)
+  Polymarket Books:  400ms  (4 Calls, 3 davon redundant)
+  Modell-Berechnung:   1ms
+  Order Placement:   200ms
+  Sleep:            1000ms
+  ─────────────────────────
+  TOTAL:           ~1.9 Sekunden
+
+Worst Case (21 Märkte):
+  Binance:           900ms  (6 Calls)
+  Polymarket Books: 8400ms  (84 Calls! = 21 × 4, davon 63 redundant)
+  Spread Checks:    600ms   (6 extra Calls)
+  Modell-Berechnung:   5ms
+  Order Placement:   300ms
+  Sleep:            1000ms
+  ─────────────────────────
+  TOTAL:          ~11.2 Sekunden pro Tick!
+
+  Bei 5-Minuten-Märkten hat man ~300 Sekunden. Der Bot schafft
+  im Worst Case nur ~27 Ticks. Im Best Case ~150 Ticks.
+
+
+4. MODELL-ANALYSE
+================================================================================
+
+4.1 BAYESIAN MODEL
+─────────────────
+  Stärken:
+    ✓ Guter Ansatz: eigene Wahrscheinlichkeit statt blindes Marktvertrauen
+    ✓ Exponential Smoothing verhindert Overreaction
+    ✓ Clamp auf [0.01, 0.99]
+
+  Schwächen:
+    ✗ Gewichte sind HARDCODED (0.20, 0.10, 0.05, 0.10, 0.15, 0.10)
+    ✗ Keine Kalibrierung an echten Daten
+    ✗ "volatility" und "reprice_speed" werden IMMER als 0.0 übergeben!
+      → 2 von 6 Signalen sind funktionslos
+    ✗ "volume" wird immer als 0.5 (default) übergeben
+      → macht: score += 0.10 * (0.5 - 0.5) * 2 = 0.0
+      → Auch dieses Signal ist wirkungslos!
+    ✗ Effektiv nutzt das Modell nur 3 von 6 Signalen:
+      spot_return, speed, ob_imbalance
+
+  KRITISCH: Das Bayesian Model ist halb funktionslos.
+
+4.2 EDGE MODEL
+──────────────
+  Stärken:
+    ✓ Klare Formel: EV_net = q - p - c
+    ✓ Berücksichtigt Fees, Slippage, Execution Risk
+    ✓ 3 Typen: directional, within-market, cross-market
+
+  Schwächen:
+    ✗ MIN_EDGE = 3% ist hoch für 5-Min-Märkte wo Spreads eng sind
+    ✗ Kosten von 2% (TOTAL_COST) sind möglicherweise zu konservativ
+    ✗ Cross-market evaluate wird im _tick() NICHT aufgerufen!
+      → evaluate_cross_market() existiert aber wird nie benutzt
+    ✗ Within-market Arb: kauft "BOTH" Seiten, aber _execute_opportunities
+      verwendet nur token_id_yes → NO-Seite wird nie gekauft!
+
+  BUG: Within-market Arbitrage ist broken. Side="BOTH" wird gesetzt,
+  aber der Executor kauft nur YES.
+
+4.3 STOIKOV MODEL
+─────────────────
+  Stärken:
+    ✓ Korrekte Reservation-Price-Formel
+    ✓ Unterscheidung passiv/aggressiv
+
+  Schwächen:
+    ✗ inventory ist IMMER 0.0 → r = s (keine Inventory-Anpassung!)
+      update_inventory() wird nie aufgerufen nach Trade-Fills
+    ✗ remaining_time ist IMMER 0.5 (Placeholder, Zeile 317 in bot.py)
+      → _estimate_remaining_time() gibt immer 0.5 zurück
+    ✗ sigma ist immer 0.02 (Default), nie aktualisiert
+    ✗ Aggressive Mode: setzt is_aggressive=True, aber der Executor
+      platziert trotzdem eine GTC Limit Order (nicht FOK/Market!)
+
+  KRITISCH: Das Stoikov-Modell hat effektiv keine Wirkung.
+  Es gibt immer r ≈ mid_price zurück, weil inventory=0 und
+  remaining_time=0.5 konstant sind.
+
+4.4 KELLY MODEL
+───────────────
+  Stärken:
+    ✓ Korrekte Kelly-Formel
+    ✓ Fractional Kelly (0.25x) ist konservativ und richtig
+    ✓ Caps bei 50% Bankroll
+
+  Schwächen:
+    ✗ committed_capital wird nie aktualisiert (allocate() nie aufgerufen)
+      → Bot denkt immer, 100% Kapital ist verfügbar
+    ✗ Bankroll wird nie aktualisiert (update_bankroll() nie aufgerufen)
+      → Bot weiß nicht, ob er gewinnt oder verliert
+    ✗ dislocation_speed wird nie übergeben (immer 1.0 Default)
+
+  BUG: Keine Position-Tracking. Bot kann theoretisch 100% des
+  Bankrolls in einen einzigen Trade stecken, und dann nochmal 100%
+  in den nächsten.
+
+4.5 SPREAD MODEL
+─────────────────
+  Stärken:
+    ✓ Z-Score-basierte Mean-Reversion-Logik ist solide
+    ✓ Lookback von 50 Perioden
+
+  Schwächen:
+    ✗ Related Markets sind hardcoded: ("BTC_5m", "BTC_15m") etc.
+      Aber auto_discover_markets() generiert IDs wie "BTC_5m_a1b2c3d4"
+      → Die IDs matchen NIEMALS!
+    ✗ SpreadMap.get_signals() ist leer implementiert (pass)
+
+  KRITISCH: Spread-Detection funktioniert nicht, weil die
+  Market-IDs nicht übereinstimmen.
+
+4.6 MONTE CARLO
+────────────────
+  Stärken:
+    ✓ Modelliert realistische Friktionen (partial fills, slippage, clusters)
+    ✓ Drawdown-Tracking
+    ✓ Survival-Rate-Metrik
+
+  Schwächen:
+    ✗ Läuft nur einmal beim Start
+    ✗ Parameter sind nicht aus echten Bot-Daten abgeleitet
+    ✗ base_win_rate=0.55 und base_ev=MIN_EDGE sind Annahmen
+    ✗ Validierung hat keinen Einfluss - Bot läuft trotzdem weiter
+      (Zeile 166: "Continuing anyway.")
+
+
+5. MARKET DISCOVERY
+================================================================================
+
+Der Bot nutzt 2 Methoden zur Marktfindung:
+
+1. Gamma API (bevorzugt):
+   - Sucht nach "crypto" Kategorie
+   - Filtert auf Keywords: "5 minutes", "5-minute", "up or down"
+   - Max 3 Märkte pro Asset
+
+2. CLOB Fallback:
+   - Durchsucht alle Märkte (max 500)
+   - Gleiche Keyword-Suche
+
+Problem: Wenn Polymarket die Bezeichnung ändert (z.B. "5min" statt
+"5 minutes"), findet der Bot nichts mehr.
+
+Max registrierte Märkte: 7 Assets × 3 = 21
+
+
+6. ORDER EXECUTION
+================================================================================
+
+Aktueller Flow:
+  1. create_order(OrderArgs) → lokale EIP-712 Signatur
+  2. post_order(signed, GTC) → HTTP POST an CLOB
+  3. Rate-Limit Retry: bis zu 4 Versuche mit Backoff (1s, 2s, 4s, 8s)
+
+Probleme:
+  ✗ Nur GTC Orders für alles (auch wenn Stoikov "AGGRESSIVE" sagt)
+  ✗ FOK/FAK Methoden existieren aber werden nie aufgerufen
+  ✗ Kein Order-Tracking nach Platzierung
+  ✗ Kein Fill-Monitoring (weiß nicht ob Order gefüllt wurde)
+  ✗ Kein Cancel-Management (offene Orders werden nie gecancelt)
+  ✗ Stoikov sagt "use market order" → Bot platziert Limit Order
+  ✗ Kein Inventory-Update nach Fill → Stoikov-Modell bleibt bei 0
+
+
+7. PERFORMANCE-ENGPÄSSE
+================================================================================
+
+RANG 1: Redundante Order-Book-Fetches
+  get_mid_price(), get_order_book_imbalance(), get_order_book_depth()
+  rufen ALLE get_order_book() auf → 3 identische HTTP Calls pro Markt.
+  Fix: Order Book einmal fetchen, dann lokal berechnen.
+  Einsparung: 66% der Polymarket API Calls
+
+RANG 2: Synchrone, sequentielle API-Calls
+  Alles blockiert. 21 Märkte × 4 Calls = 84 sequentielle Requests.
+  Fix: asyncio + aiohttp für parallele Calls.
+  Einsparung: ~90% der Wartezeit
+
+RANG 3: Binance Price Feed (sequentiell)
+  6 einzelne GET Requests statt 1 Batch-Request.
+  Fix: Binance bietet /api/v3/ticker/price ohne symbol Parameter
+  für alle Symbole auf einmal.
+  Einsparung: 5 von 6 Calls
+
+RANG 4: REST Polling statt WebSocket
+  Jeder Tick fragt Preise ab, auch wenn sich nichts geändert hat.
+  Fix: Polymarket WebSocket für Echtzeit-Order-Book-Updates.
+  Einsparung: Latenz von ~100ms/Markt auf ~0ms (Push-basiert)
+
+
+8. BUGS & KRITISCHE PROBLEME
+================================================================================
+
+BUG-1 [KRITISCH]: Redundante API Calls
+  market_data.py: get_mid_price, get_order_book_imbalance, get_order_book_depth
+  rufen jeweils get_order_book() auf. Für 1 Markt = 4 HTTP Calls statt 1.
+
+BUG-2 [KRITISCH]: Stoikov Inventory nie aktualisiert
+  stoikov.update_inventory() wird nie aufgerufen → inventory = 0.0 immer
+  → Reservation Price = Mid Price (Stoikov hat keine Wirkung)
+
+BUG-3 [KRITISCH]: Kelly Capital nie getrackt
+  kelly.allocate() und kelly.release() werden nie aufgerufen
+  → Bot denkt immer 100% Kapital ist frei
+  → Kann theoretisch unbegrenzt Positionen öffnen
+
+BUG-4 [KRITISCH]: Within-Market Arb broken
+  edge_model gibt side="BOTH" zurück, aber _execute_opportunities()
+  kauft nur token_id_yes → Die NO-Seite der Arbitrage fehlt!
+
+BUG-5 [KRITISCH]: Spread Market-IDs matchen nicht
+  config.py: RELATED_MARKETS = [("BTC_5m", "BTC_15m"), ...]
+  auto_discover: market_id = "BTC_5m_a1b2c3d4"
+  → IDs stimmen nie überein → Spread-Detection läuft nie
+
+BUG-6 [HOCH]: Aggressive Mode ignoriert
+  Stoikov sagt is_aggressive=True → Bot platziert trotzdem GTC Limit Order
+  Sollte: FOK oder IOC für sofortige Ausführung
+
+BUG-7 [HOCH]: remaining_time ist immer 0.5
+  _estimate_remaining_time() gibt immer 0.5 zurück (Placeholder)
+  → Stoikov-Berechnung ist ungenau
+
+BUG-8 [MITTEL]: 3 von 6 Bayesian-Signalen sind wirkungslos
+  volatility=0.0, volume=0.5 (neutral), reprice_speed=0.0
+  → Diese Werte werden nie mit echten Daten gefüllt
+
+BUG-9 [MITTEL]: Keine Order-Fill-Überwachung
+  Nach place_order() wird nie geprüft ob die Order gefüllt wurde
+  → Kein PnL Tracking, kein Inventory Update, keine Cancellation
+
+BUG-10 [NIEDRIG]: Gamma Fallback identisch
+  Zeile 131-132 in bot.py: Fallback ruft dieselbe Funktion
+  mit denselben Parametern nochmal auf
+
+
+9. SICHERHEIT
+================================================================================
+
+  ✓ API Keys in .env (nicht hardcoded)
+  ✓ Private Key wird nicht geloggt
+  ✓ Rate-Limit Handling vorhanden
+  ✗ Kein Max-Loss Breaker (Bot tradet bis Bankroll = 0)
+  ✗ Kein Kill Switch außer KeyboardInterrupt
+  ✗ Keine Positionslimits durchgesetzt
+  ✗ Keine Error-Rate Überwachung (wenn 50% der Orders fehlschlagen,
+    tradet der Bot einfach weiter)
+
+
+10. ZUSAMMENFASSUNG
+================================================================================
+
+STATUS: Der Bot hat eine solide ARCHITEKTUR und gute MODELLE,
+aber die INTEGRATION ist unvollständig.
+
+Was funktioniert:
+  ✓ Market Discovery (Gamma + CLOB Fallback)
+  ✓ Binance Price Feed
+  ✓ Order Book Fetching (wenn auch redundant)
+  ✓ Bayesian Model (teilweise)
+  ✓ Directional Edge Detection
+  ✓ Kelly Sizing (Berechnung korrekt, aber kein Tracking)
+  ✓ Order Placement (GTC)
+  ✓ Monte Carlo Validierung
+  ✓ Dry-Run Modus
+
+Was NICHT funktioniert:
+  ✗ Within-Market Arbitrage (nur YES-Seite wird gekauft)
+  ✗ Cross-Market Spread Detection (IDs matchen nicht)
+  ✗ Stoikov Model (Inventory immer 0, Time immer 0.5)
+  ✗ Aggressive vs Passive Execution (immer GTC)
+  ✗ Capital Tracking (Kelly hat keinen State)
+  ✗ Order Fill Monitoring
+  ✗ 50% der Bayesian Signale (fehlende Inputs)
+
+EXECUTION SPEED:
+  Aktuell: ~2-11 Sekunden pro Tick (je nach Marktanzahl)
+  Order Placement: ~200ms
+  Theoretisch erreichbar: ~50ms pro Tick (mit async + caching)
+
+PRIORITÄTEN FÜR FIXES:
+  1. Order Book einmal fetchen, Daten wiederverwenden (BUG-1)
+  2. Within-Market Arb fixen: beide Seiten kaufen (BUG-4)
+  3. Inventory Tracking nach Order Fill (BUG-2, BUG-3)
+  4. Aggressive Execution nutzen (FOK statt GTC) (BUG-6)
+  5. Spread Market-IDs dynamisch matchen (BUG-5)
+  6. Async/parallel API Calls (Performance)
+  7. Bayesian Signale vollständig füllen (BUG-8)
+  8. remaining_time aus Polymarket end_date berechnen (BUG-7)
+
+
+================================================================================
+   Ende der Analyse
+================================================================================
