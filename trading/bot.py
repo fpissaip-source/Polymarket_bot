@@ -32,6 +32,7 @@ from models.monte_carlo import MonteCarloSimulator
 
 from data.price_feed import PriceFeed
 from data.market_data import PolymarketDataClient, GammaClient
+from data.wallet_tracker import WalletTracker
 from trading.order_executor import OrderExecutor
 
 from config import (
@@ -103,6 +104,9 @@ class ArbitrageBot:
         self.kelly = KellyModel(bankroll=starting_bankroll, lambda_fraction=kelly_lambda)
         self.mc = MonteCarloSimulator()
         self.executor = None if dry_run else OrderExecutor()
+
+        self.wallet_tracker = WalletTracker()
+        self._last_wallet_update = 0.0
 
         self._markets: dict[str, MarketState] = {}
         self._running = False
@@ -353,6 +357,12 @@ class ArbitrageBot:
         # --- 1. Fetch crypto spot prices ---
         new_prices = self.price_feed.fetch()
 
+        # --- Wallet tracker update (every 60s) ---
+        if now - self._last_wallet_update >= 60:
+            self.wallet_tracker.update()
+            logger.debug(self.wallet_tracker.summary())
+            self._last_wallet_update = now
+
         opportunities: list[TradeOpportunity] = []
 
         for market_id, state in self._markets.items():
@@ -380,6 +390,13 @@ class ArbitrageBot:
                 ob_imbalance=ob_imbalance,
             )
             q = state.bayesian.update(bayesian_data)
+
+            # --- 3b. Wallet signal adjustment ---
+            wallet_signal = self.wallet_tracker.get_signal(
+                state.token_id_yes, state.token_id_no
+            )
+            if wallet_signal.has_signal:
+                q = max(0.01, min(0.99, q + wallet_signal.confidence_boost))
 
             # --- 4. Edge check (uses dynamic MIN_EDGE from current tier) ---
             edge_result = self.edge_model.evaluate_directional(q=q, p=p_yes)
