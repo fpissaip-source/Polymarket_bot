@@ -18,7 +18,11 @@ import logging
 import threading
 from dataclasses import dataclass, field
 
-from google import genai
+try:
+    from google import genai
+except ImportError:
+    genai = None
+    logging.getLogger(__name__).warning("google-genai not installed — EventSentiment disabled")
 
 from config import EVENT_SENTIMENT_MIN_BANKROLL, EVENT_SENTIMENT_REFRESH
 
@@ -59,6 +63,11 @@ class EventSentimentAnalyzer:
     """
 
     def __init__(self):
+        if genai is None:
+            logger.warning("google-genai not installed — event sentiment disabled")
+            self._enabled = False
+            return
+
         api_key = os.getenv("GEMINI_API_KEY", "")
         if not api_key:
             logger.warning("GEMINI_API_KEY not set — event sentiment disabled")
