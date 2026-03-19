@@ -224,13 +224,13 @@ class GammaClient:
             keywords = ["5 minutes", "5-minutes", "5 minute", "5-minute", "up or down", "5min"]
 
         matched = []
-        fallback = []
 
-        for offset in range(0, 300, 100):
-            # Search by asset keyword directly — much more targeted than loading all crypto markets
-            markets = self.get_markets(active=True, keyword=asset, limit=100, offset=offset)
+        for offset in range(0, 500, 100):
+            # Try keyword+crypto tag first, then keyword only, then crypto tag only
+            markets = self.get_markets(active=True, keyword=asset, tag_slug="crypto", limit=100, offset=offset)
             if not markets:
-                # Fallback: tag_slug only (no keyword param support on this Gamma instance)
+                markets = self.get_markets(active=True, keyword=asset, limit=100, offset=offset)
+            if not markets:
                 markets = self.get_markets(active=True, tag_slug="crypto", limit=100, offset=offset)
             if not markets:
                 break
@@ -239,24 +239,36 @@ class GammaClient:
                 question = m.get("question", "").upper()
                 if asset.upper() not in question:
                     continue
+
+                # Skip resolved markets — outcomePrices near 0 or 1 means decided
+                import json as _j
+                raw = m.get("outcomePrices", [])
+                if isinstance(raw, str):
+                    try:
+                        raw = _j.loads(raw)
+                    except Exception:
+                        raw = []
+                if isinstance(raw, list) and len(raw) >= 2:
+                    try:
+                        p0, p1 = float(raw[0]), float(raw[1])
+                        if not (0.05 <= p0 <= 0.95) or not (0.05 <= p1 <= 0.95):
+                            continue  # already resolved
+                    except Exception:
+                        pass
+
                 if no_keyword_filter or not keywords:
                     matched.append(m)
                 elif any(kw.upper() in question for kw in keywords):
                     matched.append(m)
-                else:
-                    fallback.append(m)
 
             if len(markets) < 100:
                 break
 
         if matched:
             logger.info(f"Gamma: found {len(matched)} markets for {asset}")
-            return matched
-
-        # Auto-fallback: return any result with the asset name
-        if fallback:
-            logger.info(f"Gamma: no keyword match for {asset}, using {len(fallback)} broader results")
-        return fallback
+        else:
+            logger.info(f"Gamma: no active 5-min markets found for {asset}")
+        return matched
 
     def get_events(self, limit: int = 50) -> list[dict]:
         """Fetch event groups (e.g. 'US Election')."""
