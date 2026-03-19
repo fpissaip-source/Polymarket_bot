@@ -202,11 +202,27 @@ class ArbitrageBot:
     def _extract_tokens(m: dict) -> tuple[str | None, str | None]:
         """
         Extract YES and NO token IDs from a market dict.
-        Handles multiple Gamma/CLOB API response formats.
+        Handles multiple Gamma/CLOB API response formats including
+        cases where list fields are returned as JSON strings.
         """
+        import json as _json
+
+        def _parse_list(val):
+            """Parse value to list – handles both actual lists and JSON strings."""
+            if isinstance(val, list):
+                return val
+            if isinstance(val, str):
+                try:
+                    parsed = _json.loads(val)
+                    if isinstance(parsed, list):
+                        return parsed
+                except Exception:
+                    pass
+            return []
+
         # Format 1: tokens list with outcome field (CLOB format)
-        tokens = m.get("tokens", [])
-        if tokens and isinstance(tokens, list) and isinstance(tokens[0], dict):
+        tokens = _parse_list(m.get("tokens", []))
+        if tokens and isinstance(tokens[0], dict):
             yes = next((t.get("token_id") for t in tokens
                         if t.get("outcome", "").upper() in ("YES", "1")), None)
             no = next((t.get("token_id") for t in tokens
@@ -215,26 +231,27 @@ class ArbitrageBot:
                 return yes, no
 
         # Format 2: clobTokenIds list + outcomes list (Gamma format)
-        clob_ids = m.get("clobTokenIds", [])
-        outcomes = m.get("outcomes", [])
+        # NOTE: Gamma often returns these as JSON strings, not real lists!
+        clob_ids = _parse_list(m.get("clobTokenIds", []))
+        outcomes = _parse_list(m.get("outcomes", []))
         if clob_ids and len(clob_ids) >= 2:
             if outcomes and len(outcomes) >= 2:
                 yes = no = None
                 for i, outcome in enumerate(outcomes):
-                    if outcome.upper() in ("YES", "1") and i < len(clob_ids):
+                    if str(outcome).upper() in ("YES", "1") and i < len(clob_ids):
                         yes = clob_ids[i]
-                    elif outcome.upper() in ("NO", "0") and i < len(clob_ids):
+                    elif str(outcome).upper() in ("NO", "0") and i < len(clob_ids):
                         no = clob_ids[i]
                 if yes and no:
                     return yes, no
             # Fallback: first = YES, second = NO
-            return clob_ids[0], clob_ids[1]
+            return str(clob_ids[0]), str(clob_ids[1])
 
         # Format 3: token_id_yes / token_id_no directly
         yes = m.get("token_id_yes") or m.get("tokenIdYes")
         no = m.get("token_id_no") or m.get("tokenIdNo")
         if yes and no:
-            return yes, no
+            return str(yes), str(no)
 
         return None, None
 

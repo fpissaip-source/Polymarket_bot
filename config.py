@@ -70,4 +70,4 @@ MC_MAX_DD_LIMIT = 0.30        # Stop if max drawdown exceeds 30%
 
 # Bot loop
 POLL_INTERVAL_SECONDS = 1     # How often to scan markets (1s for 5-min markets)
-LOG_LEVEL = os.getenv("LOG_LEVEL", "DEBUG")  # DEBUG zeigt Gamma API Feldnamen bei 0 Märkten
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
