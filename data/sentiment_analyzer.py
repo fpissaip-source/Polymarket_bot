@@ -60,11 +60,14 @@ class GeminiSentimentAnalyzer:
             self._enabled = False
             return
 
-        self._model = "gemini-1.5-flash"
-        self._url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{self._model}:generateContent?key={self._api_key}"
-        )
+        # Try multiple model names in order — auto-detects which one works
+        self._models_to_try = [
+            "gemini-2.0-flash",
+            "gemini-2.0-flash-lite",
+            "gemini-1.5-flash",
+            "gemini-1.5-flash-001",
+        ]
+        self._model: str | None = None  # set after first successful call
         self._enabled = True
         self._consecutive_failures = 0
         self._max_failures = 3  # Disable after 3 failures to avoid log spam
@@ -100,7 +103,27 @@ class GeminiSentimentAnalyzer:
             )
 
             payload = {"contents": [{"parts": [{"text": prompt}]}]}
-            r = requests.post(self._url, json=payload, timeout=15, proxies=self._proxies)
+
+            # If we already found a working model, use it; otherwise probe the list
+            models = [self._model] if self._model else self._models_to_try
+            r = None
+            for model in models:
+                url = (
+                    f"https://generativelanguage.googleapis.com/v1beta/models/"
+                    f"{model}:generateContent?key={self._api_key}"
+                )
+                resp = requests.post(url, json=payload, timeout=15, proxies=self._proxies)
+                if resp.status_code == 200:
+                    if self._model != model:
+                        logger.info(f"Gemini: using model '{model}'")
+                        self._model = model
+                    r = resp
+                    break
+                logger.debug(f"Gemini model '{model}' returned {resp.status_code}, trying next")
+
+            if r is None:
+                raise RuntimeError(f"No working Gemini model found (tried: {models})")
+
             r.raise_for_status()
             raw = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip().replace(",", ".")
 
@@ -129,6 +152,7 @@ class GeminiSentimentAnalyzer:
                 f"Gemini [{asset}]: p(up)={prob:.2f} | boost={boost:+.3f} | "
                 f"price=${current_price:,.2f} ({price_change_pct:+.2f}%)"
             )
+            self._consecutive_failures = 0  # reset on success
 
         except Exception as e:
             self._consecutive_failures += 1
