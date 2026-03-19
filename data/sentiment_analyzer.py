@@ -12,12 +12,13 @@ The bot reads from the cache (instant, no delay).
 """
 
 import os
+import re
 import time
 import logging
 import threading
 from dataclasses import dataclass, field
 
-import google.generativeai as genai
+import requests
 
 logger = logging.getLogger(__name__)
 
@@ -53,14 +54,17 @@ class GeminiSentimentAnalyzer:
     """
 
     def __init__(self):
-        api_key = os.getenv("GEMINI_API_KEY", "")
-        if not api_key:
+        self._api_key = os.getenv("GEMINI_API_KEY", "")
+        if not self._api_key:
             logger.warning("GEMINI_API_KEY not set — sentiment analyzer disabled")
             self._enabled = False
             return
 
-        genai.configure(api_key=api_key)
-        self._model = genai.GenerativeModel("gemini-2.5-flash-preview-04-17")
+        self._model = "gemini-1.5-flash"
+        self._url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{self._model}:generateContent?key={self._api_key}"
+        )
         self._enabled = True
 
         self._cache: dict[str, SentimentResult] = {}
@@ -73,26 +77,26 @@ class GeminiSentimentAnalyzer:
         """Call Gemini and update cache. Runs in background thread."""
         try:
             direction = "up" if price_change_pct >= 0 else "down"
-            prompt = f"""You are a crypto trading signal generator. Answer with a single number only.
+            prompt = (
+                f"You are a crypto trading signal generator. Answer with a single number only.\n\n"
+                f"Asset: {asset}\n"
+                f"Current price: ${current_price:,.2f}\n"
+                f"Price change last 5 min: {price_change_pct:+.2f}%\n"
+                f"Volatility: {volatility:.4f}\n"
+                f"Recent trend: {direction}\n\n"
+                f"Question: What is the probability (0.00 to 1.00) that {asset} will be HIGHER "
+                f"in the next 5 minutes?\n\n"
+                f"Rules:\n"
+                f"- Answer with ONLY a decimal number between 0.00 and 1.00\n"
+                f"- No text, no explanation, just the number\n"
+                f"- 0.5 means uncertain, >0.5 means likely up, <0.5 means likely down"
+            )
 
-Asset: {asset}
-Current price: ${current_price:,.2f}
-Price change last 5 min: {price_change_pct:+.2f}%
-Volatility: {volatility:.4f}
-Recent trend: {direction}
+            payload = {"contents": [{"parts": [{"text": prompt}]}]}
+            r = requests.post(self._url, json=payload, timeout=15)
+            r.raise_for_status()
+            raw = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip().replace(",", ".")
 
-Question: What is the probability (0.00 to 1.00) that {asset} will be HIGHER in the next 5 minutes?
-
-Rules:
-- Answer with ONLY a decimal number between 0.00 and 1.00
-- No text, no explanation, just the number
-- 0.5 means uncertain, >0.5 means likely up, <0.5 means likely down"""
-
-            response = self._model.generate_content(prompt)
-            raw = response.text.strip().replace(",", ".")
-
-            # Extract first float found in response
-            import re
             match = re.search(r"0?\.\d+|[01]\.0*", raw)
             if not match:
                 logger.warning(f"Gemini returned unexpected response for {asset}: {raw!r}")
