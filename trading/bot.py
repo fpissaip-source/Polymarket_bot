@@ -224,13 +224,18 @@ class ArbitrageBot:
                     pass
             return []
 
+        # Outcomes that map to YES (Up/High side)
+        YES_OUTCOMES = {"YES", "1", "UP", "HOCH", "HIGH", "OVER", "ABOVE", "TRUE"}
+        # Outcomes that map to NO (Down/Low side)
+        NO_OUTCOMES = {"NO", "0", "DOWN", "RUNTER", "LOW", "UNDER", "BELOW", "FALSE"}
+
         # Format 1: tokens list with outcome field (CLOB format)
         tokens = _parse_list(m.get("tokens", []))
         if tokens and isinstance(tokens[0], dict):
             yes = next((t.get("token_id") for t in tokens
-                        if t.get("outcome", "").upper() in ("YES", "1")), None)
+                        if t.get("outcome", "").upper() in YES_OUTCOMES), None)
             no = next((t.get("token_id") for t in tokens
-                       if t.get("outcome", "").upper() in ("NO", "0")), None)
+                       if t.get("outcome", "").upper() in NO_OUTCOMES), None)
             if yes and no:
                 return yes, no
 
@@ -242,9 +247,9 @@ class ArbitrageBot:
             if outcomes and len(outcomes) >= 2:
                 yes = no = None
                 for i, outcome in enumerate(outcomes):
-                    if str(outcome).upper() in ("YES", "1") and i < len(clob_ids):
+                    if str(outcome).upper() in YES_OUTCOMES and i < len(clob_ids):
                         yes = clob_ids[i]
-                    elif str(outcome).upper() in ("NO", "0") and i < len(clob_ids):
+                    elif str(outcome).upper() in NO_OUTCOMES and i < len(clob_ids):
                         no = clob_ids[i]
                 if yes and no:
                     return yes, no

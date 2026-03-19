@@ -60,14 +60,33 @@ class PolymarketDataClient:
             logger.error(f"Failed to fetch order book for {token_id}: {e}")
             return {}
 
+    def get_midpoint(self, token_id: str) -> float | None:
+        """Fetch midpoint price directly from CLOB (works even with empty order book)."""
+        try:
+            r = self._session.get(
+                f"{self.host}/midpoint",
+                params={"token_id": token_id},
+                timeout=10,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                mid = data.get("mid") or data.get("midpoint") or data.get("price")
+                if mid is not None:
+                    return float(mid)
+        except Exception as e:
+            logger.debug(f"Midpoint fetch failed for {token_id[:16]}...: {e}")
+        return None
+
     def get_book_data(self, token_id: str, levels: int = 5) -> dict:
         """
         Fetch the order book once and return mid_price, imbalance, and depth.
+        Falls back to CLOB /midpoint if order book is empty.
         Returns: {"mid_price": float|None, "imbalance": float, "depth": float}
         """
         book = self.get_order_book(token_id)
         if not book:
-            return {"mid_price": None, "imbalance": 0.0, "depth": 0.0}
+            mid = self.get_midpoint(token_id)
+            return {"mid_price": mid, "imbalance": 0.0, "depth": 0.0}
 
         bids = book.get("bids", [])
         asks = book.get("asks", [])
