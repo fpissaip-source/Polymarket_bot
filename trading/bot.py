@@ -420,6 +420,11 @@ class ArbitrageBot:
                 p_yes = state.gamma_price_yes
             if p_no is None and state.gamma_price_no is not None:
                 p_no = state.gamma_price_no
+            # Reject obviously invalid prices (0 or 1 are not real market prices)
+            if p_yes is not None and not (0.01 <= p_yes <= 0.99):
+                p_yes = None
+            if p_no is not None and not (0.01 <= p_no <= 0.99):
+                p_no = None
             if p_yes is None or p_no is None:
                 market_stats.append(f"{state.asset}({state.timeframe}):NO_DATA")
                 continue
