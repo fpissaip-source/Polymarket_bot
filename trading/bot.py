@@ -34,6 +34,7 @@ from data.price_feed import PriceFeed
 from data.market_data import PolymarketDataClient, GammaClient
 from data.wallet_tracker import WalletTracker
 from data.sentiment_analyzer import EventSentimentAnalyzer
+from data.dry_run_tracker import DryRunTracker
 from trading.order_executor import OrderExecutor
 
 from config import (
@@ -79,6 +80,7 @@ class TradeOpportunity:
     spread_signal: SpreadSignal | None
     stoikov_quote: StoikovQuote
     kelly_result: KellyResult
+    q: float = 0.0      # Bayesian probability estimate
     timestamp: float = field(default_factory=time.time)
 
 
@@ -120,7 +122,9 @@ class ArbitrageBot:
         self._last_prices: dict[str, float] = {}
         self._last_heartbeat = 0.0
         self._last_market_refresh = 0.0
+        self._last_stats_log = 0.0
         self._tick_count = 0
+        self.dry_run_tracker = DryRunTracker()
         self._MARKET_REFRESH_INTERVAL = 30  # re-discover markets every 30s
         self._MARKET_WINDOW_MIN = 90        # skip if <90s remaining
         self._MARKET_WINDOW_MAX = 360       # skip if >6min remaining (not open yet)
@@ -488,12 +492,22 @@ class ArbitrageBot:
         Called every 30 seconds. New market windows open every 5 minutes,
         so we need to pick them up quickly.
         """
-        # Remove expired markets
+        # Remove expired markets + resolve dry-run outcomes
         expired = [mid for mid, s in self._markets.items()
                    if s.end_time > 0 and (s.end_time - now) < 0 and not s.is_event]
         for mid in expired:
+            state = self._markets[mid]
+            # Resolve outcome: last known price determines winner
+            if self.dry_run and state.last_price > 0:
+                winning_side = "YES" if state.last_price >= 0.5 else "NO"
+                self.dry_run_tracker.resolve(mid, winning_side)
             logger.debug(f"Removing expired market: {mid}")
             del self._markets[mid]
+
+        # Log dry-run stats every 5 minutes
+        if self.dry_run and now - self._last_stats_log >= 300:
+            self._last_stats_log = now
+            self.dry_run_tracker.log_stats()
 
         # Discover new crypto markets
         gamma = GammaClient()
@@ -732,6 +746,7 @@ class ArbitrageBot:
                     spread_signal=spread_signal,
                     stoikov_quote=stoikov_quote,
                     kelly_result=kelly_result,
+                    q=q,
                 )
                 opportunities.append(opp)
                 logger.info(
@@ -782,6 +797,18 @@ class ArbitrageBot:
                     f"[DRY RUN] {opp.market_id}: {side} ${size:.2f} @ {price:.4f} "
                     f"| EV={opp.edge_result.ev_net:.4f} | Kelly f={opp.kelly_result.f_kelly:.4f} "
                     f"| exec={exec_type}"
+                )
+                # Record opportunity for later analysis
+                record_side = side if side != "BOTH" else "YES"
+                self.dry_run_tracker.record(
+                    market_id=opp.market_id,
+                    asset=market.asset,
+                    side=record_side,
+                    q=opp.q,
+                    p=market.last_price,
+                    edge=opp.edge_result.ev_net,
+                    size=size,
+                    exec_price=price,
                 )
                 continue
 
