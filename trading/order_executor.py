@@ -14,7 +14,10 @@ import time
 import logging
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
-from py_clob_client.constants import BUY, SELL
+
+# py-clob-client >= 0.15 removed BUY/SELL from constants – use string literals
+BUY = "BUY"
+SELL = "SELL"
 
 from config import (
     POLYMARKET_HOST,
