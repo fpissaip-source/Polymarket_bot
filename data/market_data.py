@@ -48,9 +48,12 @@ class PolymarketDataClient:
             return {}
 
     def get_order_book(self, token_id: str) -> dict:
-        """Fetch order book for a token."""
+        """Fetch order book for a token. Returns {} on 404 (token not on CLOB)."""
         try:
             r = self._session.get(f"{self.host}/book", params={"token_id": token_id}, timeout=10)
+            if r.status_code == 404:
+                logger.debug(f"Order book not found for token {token_id[:16]}... (404)")
+                return {}
             r.raise_for_status()
             return r.json()
         except Exception as e:
