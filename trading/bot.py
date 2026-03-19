@@ -255,11 +255,17 @@ class ArbitrageBot:
 
         return None, None
 
+    def _validate_token(self, token_id: str) -> bool:
+        """Check that a token ID exists on the CLOB by fetching its order book."""
+        book = self.data_client.get_order_book(token_id)
+        return bool(book)
+
     def auto_discover_markets(self):
         """
         Fetch active crypto markets via Gamma API (preferred) and register them.
         Falls back to CLOB-based discovery if Gamma returns nothing.
         Handles multiple Gamma/CLOB API response formats robustly.
+        Only registers markets whose token IDs return a valid CLOB order book.
         """
         import datetime
         gamma = GammaClient()
@@ -280,7 +286,11 @@ class ArbitrageBot:
 
             logger.debug(f"{asset}: {len(markets)} candidates, first keys: {list(markets[0].keys())}")
 
-            for m in markets[:3]:  # max 3 per asset
+            registered_for_asset = 0
+            for m in markets:
+                if registered_for_asset >= 3:  # max 3 per asset
+                    break
+
                 yes_token, no_token = self._extract_tokens(m)
 
                 if not yes_token or not no_token:
@@ -289,6 +299,11 @@ class ArbitrageBot:
                         f"{asset}: Could not extract tokens from market. "
                         f"Keys available: {list(m.keys())}"
                     )
+                    continue
+
+                # Validate token exists on CLOB before registering
+                if not self._validate_token(yes_token):
+                    logger.debug(f"{asset}: Token {yes_token[:16]}... not found on CLOB, skipping")
                     continue
 
                 # Condition ID from various field names
@@ -317,6 +332,7 @@ class ArbitrageBot:
                     end_time=end_time,
                 )
                 registered += 1
+                registered_for_asset += 1
 
         logger.info(f"Auto-discovery complete: {registered} markets registered")
         return registered
