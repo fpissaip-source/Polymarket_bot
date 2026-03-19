@@ -21,6 +21,7 @@ import os
 import time
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from models.bayesian import BayesianModel
 from models.edge import EdgeModel, EdgeResult
@@ -44,6 +45,9 @@ from config import (
     GROWTH_TIERS,
     BANKROLL_STATE_FILE,
 )
+
+TRADES_FILE = Path(__file__).parent.parent / "trades.json"
+
 
 logger = logging.getLogger("polymarket_bot.bot")
 
@@ -205,12 +209,16 @@ class ArbitrageBot:
 
         for asset in assets:
             logger.info(f"Discovering {asset} markets via Gamma API...")
+            # find_crypto_markets with no args: tries 5-min keywords, auto-falls back to any match
             markets = gamma.find_crypto_markets(asset)
             if not markets:
-                markets = gamma.find_crypto_markets(asset, keywords=[])
+                # Pass explicit None to skip keyword filter entirely
+                markets = gamma.find_crypto_markets(asset, keywords=None)
             if not markets:
                 logger.info(f"Gamma empty, falling back to CLOB for {asset}...")
                 markets = self.data_client.find_crypto_5min_markets(asset)
+            if not markets:
+                logger.warning(f"No markets found for {asset} via any source — skipping")
 
             for m in markets[:3]:  # max 3 per asset
                 tokens = m.get("tokens", [])
@@ -414,6 +422,7 @@ class ArbitrageBot:
                 logger.info(f"Order accepted: {order_id}")
                 self.kelly.allocate(size)
                 self._save_bankroll()
+                self._record_trade(opp.market_id, side, size, price, order_id)
             else:
                 logger.warning(f"Order rejected for {opp.market_id}")
 
@@ -461,6 +470,26 @@ class ArbitrageBot:
         if remaining <= 0:
             return 0.0
         return min(1.0, remaining / window)
+
+    def _record_trade(self, market_id: str, side: str, size: float, price: float, order_id: str):
+        """Append a trade record to trades.json for the dashboard."""
+        try:
+            trades = []
+            if TRADES_FILE.exists():
+                trades = json.loads(TRADES_FILE.read_text())
+            trades.append({
+                "time": time.strftime("%H:%M:%S"),
+                "market": market_id,
+                "side": side,
+                "size": round(size, 4),
+                "price": round(price, 4),
+                "order_id": order_id,
+                "pnl": 0.0,  # Updated when market resolves
+            })
+            # Keep last 500 trades
+            TRADES_FILE.write_text(json.dumps(trades[-500:]))
+        except Exception as e:
+            logger.warning(f"Could not record trade: {e}")
 
     def stop(self):
         self._running = False

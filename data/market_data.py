@@ -2,7 +2,7 @@
 Polymarket Market Data
 ======================
 Fetches market prices, order books, and related market info
-from the Polymarket CLOB API.
+from the Polymarket CLOB API and Gamma API.
 """
 
 import time
@@ -11,6 +11,8 @@ import requests
 from config import POLYMARKET_HOST, GAMMA_API_HOST, DATA_API_HOST
 
 logger = logging.getLogger(__name__)
+
+_SENTINEL = object()   # used to distinguish "not passed" from None/[]
 
 
 class PolymarketDataClient:
@@ -58,7 +60,6 @@ class PolymarketDataClient:
     def get_book_data(self, token_id: str, levels: int = 5) -> dict:
         """
         Fetch the order book once and return mid_price, imbalance, and depth.
-        Replaces the previous pattern of 3-4 separate get_order_book() calls.
         Returns: {"mid_price": float|None, "imbalance": float, "depth": float}
         """
         book = self.get_order_book(token_id)
@@ -95,13 +96,15 @@ class PolymarketDataClient:
 
     def find_crypto_5min_markets(self, asset: str = "BTC") -> list[dict]:
         """
-        Search for active 5-minute crypto markets for the given asset.
-        Returns a list of market dicts with condition_id and token_ids.
+        Search for active crypto markets for the given asset via CLOB pagination.
+        First tries 5-minute markets; falls back to any active market for the asset.
         """
-        results = []
+        five_min_kws = ("5-MINUTE", "5 MINUTE", "5 MINUTES", "5-MINUTES", "UP OR DOWN", "5MIN")
+        results_5m = []
+        results_any = []
         cursor = ""
         seen = 0
-        while seen < 500:  # limit search scope
+        while seen < 800:  # limit search scope
             data = self.get_markets(next_cursor=cursor)
             markets = data.get("data", [])
             if not markets:
@@ -110,13 +113,21 @@ class PolymarketDataClient:
                 question = m.get("question", "").upper()
                 if asset.upper() not in question:
                     continue
-                if any(kw in question for kw in ("5-MINUTE", "5 MINUTE", "5 MINUTES", "5-MINUTES", "UP OR DOWN")):
-                    results.append(m)
+                if any(kw in question for kw in five_min_kws):
+                    results_5m.append(m)
+                else:
+                    results_any.append(m)
             cursor = data.get("next_cursor", "")
             seen += len(markets)
             if not cursor or cursor == "LTE=":
                 break
-        return results
+
+        if results_5m:
+            logger.info(f"CLOB: found {len(results_5m)} 5-min markets for {asset}")
+            return results_5m
+        if results_any:
+            logger.info(f"CLOB: no 5-min markets for {asset}, using {len(results_any)} broader matches")
+        return results_any
 
 
 def _get_with_retry(session: requests.Session, url: str, params: dict = None, timeout: int = 10) -> dict:
@@ -153,41 +164,73 @@ class GammaClient:
     def get_markets(
         self,
         active: bool = True,
-        category: str = "crypto",
         limit: int = 100,
         offset: int = 0,
+        tag_slug: str = "",
+        keyword: str = "",
     ) -> list[dict]:
-        """Fetch markets from Gamma API with optional category filter."""
-        params = {"active": str(active).lower(), "limit": limit, "offset": offset}
-        if category:
-            params["category"] = category
+        """
+        Fetch markets from Gamma API.
+        Uses 'tag_slug' for category filtering and 'keyword' for text search.
+        No 'category' param — Gamma uses tag slugs (e.g. 'crypto').
+        """
+        params: dict = {"active": "true" if active else "false", "limit": limit, "offset": offset}
+        if tag_slug:
+            params["tag_slug"] = tag_slug
+        if keyword:
+            params["keyword"] = keyword
         data = _get_with_retry(self._session, f"{self.host}/markets", params=params)
         if isinstance(data, list):
             return data
         return data.get("data", data.get("markets", []))
 
-    def find_crypto_markets(self, asset: str, keywords: list[str] | None = None) -> list[dict]:
+    def find_crypto_markets(self, asset: str, keywords: list[str] | None = _SENTINEL) -> list[dict]:
         """
         Search active crypto markets matching an asset and optional keywords.
-        Falls back to broad search if category filter returns nothing.
+
+        keywords=None (default sentinel) → searches for 5-minute variants first,
+                                           falls back to any match if none found.
+        keywords=[]                      → no keyword filter (return all with asset name).
+        keywords=[...]                   → filter by those keywords.
         """
-        # All known variants of 5-minute market naming on Polymarket
-        keywords = keywords or ["5 minutes", "5-minutes", "5 minute", "5-minute", "up or down"]
-        results = []
-        for offset in range(0, 500, 100):
-            markets = self.get_markets(active=True, category="crypto", limit=100, offset=offset)
+        # Resolve keywords default
+        no_keyword_filter = (keywords is None)
+        if keywords is _SENTINEL:
+            keywords = ["5 minutes", "5-minutes", "5 minute", "5-minute", "up or down", "5min"]
+
+        matched = []
+        fallback = []
+
+        for offset in range(0, 600, 100):
+            # Try crypto tag slug first, then unfiltered
+            markets = self.get_markets(active=True, tag_slug="crypto", limit=100, offset=offset)
+            if not markets:
+                markets = self.get_markets(active=True, limit=100, offset=offset)
             if not markets:
                 break
+
             for m in markets:
                 question = m.get("question", "").upper()
                 if asset.upper() not in question:
                     continue
-                if keywords and not any(kw.upper() in question for kw in keywords):
-                    continue
-                results.append(m)
+                if no_keyword_filter or not keywords:
+                    matched.append(m)
+                elif any(kw.upper() in question for kw in keywords):
+                    matched.append(m)
+                else:
+                    fallback.append(m)
+
             if len(markets) < 100:
                 break
-        return results
+
+        if matched:
+            logger.info(f"Gamma: found {len(matched)} markets for {asset}")
+            return matched
+
+        # Auto-fallback: return any result with the asset name
+        if fallback:
+            logger.info(f"Gamma: no keyword match for {asset}, using {len(fallback)} broader results")
+        return fallback
 
     def get_events(self, limit: int = 50) -> list[dict]:
         """Fetch event groups (e.g. 'US Election')."""
