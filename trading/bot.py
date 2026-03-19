@@ -66,6 +66,8 @@ class MarketState:
     last_price: float = 0.5
     last_price_no: float = 0.5
     end_time: float = 0.0   # Unix timestamp when market closes (0 = unknown)
+    gamma_price_yes: float | None = None  # Fallback price from Gamma API
+    gamma_price_no: float | None = None
 
 
 @dataclass
@@ -185,6 +187,8 @@ class ArbitrageBot:
         asset: str,
         timeframe: str,
         end_time: float = 0.0,
+        gamma_price_yes: float | None = None,
+        gamma_price_no: float | None = None,
     ):
         state = MarketState(
             market_id=market_id,
@@ -195,6 +199,8 @@ class ArbitrageBot:
             bayesian=BayesianModel(market_id),
             stoikov=StoikovModel(),
             end_time=end_time,
+            gamma_price_yes=gamma_price_yes,
+            gamma_price_no=gamma_price_no,
         )
         # Auto-register spread pairs: any two markets with the same asset
         for existing_id, existing in self._markets.items():
@@ -331,6 +337,22 @@ class ArbitrageBot:
                     except Exception:
                         pass
 
+                # Extract Gamma prices as CLOB fallback
+                gamma_price_yes, gamma_price_no = None, None
+                import json as _json
+                raw_prices = m.get("outcomePrices", [])
+                if isinstance(raw_prices, str):
+                    try:
+                        raw_prices = _json.loads(raw_prices)
+                    except Exception:
+                        raw_prices = []
+                if isinstance(raw_prices, list) and len(raw_prices) >= 2:
+                    try:
+                        gamma_price_yes = float(raw_prices[0])
+                        gamma_price_no = float(raw_prices[1])
+                    except Exception:
+                        pass
+
                 self.register_market(
                     market_id=market_id,
                     token_id_yes=yes_token,
@@ -338,6 +360,8 @@ class ArbitrageBot:
                     asset=asset,
                     timeframe="5m",
                     end_time=end_time,
+                    gamma_price_yes=gamma_price_yes,
+                    gamma_price_no=gamma_price_no,
                 )
                 registered += 1
                 registered_for_asset += 1
@@ -387,8 +411,15 @@ class ArbitrageBot:
             no_data = self.data_client.get_book_data(state.token_id_no)
             p_yes = yes_data["mid_price"]
             p_no = no_data["mid_price"]
+            # Fallback: use Gamma API prices if CLOB has no data
+            if p_yes is None and state.gamma_price_yes is not None:
+                p_yes = state.gamma_price_yes
+                logger.debug(f"[{market_id}] Using Gamma fallback price YES={p_yes:.3f}")
+            if p_no is None and state.gamma_price_no is not None:
+                p_no = state.gamma_price_no
+                logger.debug(f"[{market_id}] Using Gamma fallback price NO={p_no:.3f}")
             if p_yes is None or p_no is None:
-                logger.info(f"[SKIP] {market_id}: no order book (yes={p_yes}, no={p_no})")
+                logger.info(f"[SKIP] {market_id}: no price data (yes={p_yes}, no={p_no})")
                 continue
 
             ob_imbalance = yes_data["imbalance"]
