@@ -198,49 +198,95 @@ class ArbitrageBot:
         self._markets[market_id] = state
         logger.info(f"Registered market: {market_id} ({asset} {timeframe})")
 
+    @staticmethod
+    def _extract_tokens(m: dict) -> tuple[str | None, str | None]:
+        """
+        Extract YES and NO token IDs from a market dict.
+        Handles multiple Gamma/CLOB API response formats.
+        """
+        # Format 1: tokens list with outcome field (CLOB format)
+        tokens = m.get("tokens", [])
+        if tokens and isinstance(tokens, list) and isinstance(tokens[0], dict):
+            yes = next((t.get("token_id") for t in tokens
+                        if t.get("outcome", "").upper() in ("YES", "1")), None)
+            no = next((t.get("token_id") for t in tokens
+                       if t.get("outcome", "").upper() in ("NO", "0")), None)
+            if yes and no:
+                return yes, no
+
+        # Format 2: clobTokenIds list + outcomes list (Gamma format)
+        clob_ids = m.get("clobTokenIds", [])
+        outcomes = m.get("outcomes", [])
+        if clob_ids and len(clob_ids) >= 2:
+            if outcomes and len(outcomes) >= 2:
+                yes = no = None
+                for i, outcome in enumerate(outcomes):
+                    if outcome.upper() in ("YES", "1") and i < len(clob_ids):
+                        yes = clob_ids[i]
+                    elif outcome.upper() in ("NO", "0") and i < len(clob_ids):
+                        no = clob_ids[i]
+                if yes and no:
+                    return yes, no
+            # Fallback: first = YES, second = NO
+            return clob_ids[0], clob_ids[1]
+
+        # Format 3: token_id_yes / token_id_no directly
+        yes = m.get("token_id_yes") or m.get("tokenIdYes")
+        no = m.get("token_id_no") or m.get("tokenIdNo")
+        if yes and no:
+            return yes, no
+
+        return None, None
+
     def auto_discover_markets(self):
         """
         Fetch active crypto markets via Gamma API (preferred) and register them.
         Falls back to CLOB-based discovery if Gamma returns nothing.
+        Handles multiple Gamma/CLOB API response formats robustly.
         """
+        import datetime
         gamma = GammaClient()
         assets = POLYMARKET_ASSETS  # BTC, ETH, SOL, XRP, DOGE, BNB, HYPE
         registered = 0
 
         for asset in assets:
             logger.info(f"Discovering {asset} markets via Gamma API...")
-            # find_crypto_markets with no args: tries 5-min keywords, auto-falls back to any match
             markets = gamma.find_crypto_markets(asset)
             if not markets:
-                # Pass explicit None to skip keyword filter entirely
                 markets = gamma.find_crypto_markets(asset, keywords=None)
             if not markets:
                 logger.info(f"Gamma empty, falling back to CLOB for {asset}...")
                 markets = self.data_client.find_crypto_5min_markets(asset)
             if not markets:
-                logger.warning(f"No markets found for {asset} via any source — skipping")
+                logger.warning(f"No markets found for {asset} — skipping")
+                continue
+
+            logger.debug(f"{asset}: {len(markets)} candidates, first keys: {list(markets[0].keys())}")
 
             for m in markets[:3]:  # max 3 per asset
-                tokens = m.get("tokens", [])
-                if len(tokens) < 2:
-                    continue
-                yes_token = next(
-                    (t["token_id"] for t in tokens if t.get("outcome", "").upper() == "YES"), None
-                )
-                no_token = next(
-                    (t["token_id"] for t in tokens if t.get("outcome", "").upper() == "NO"), None
-                )
-                if not yes_token or not no_token:
-                    continue
-                condition_id = m.get("condition_id", "")
-                market_id = f"{asset}_5m_{condition_id[:8]}"
+                yes_token, no_token = self._extract_tokens(m)
 
+                if not yes_token or not no_token:
+                    # Log first market's keys to help diagnose future issues
+                    logger.warning(
+                        f"{asset}: Could not extract tokens from market. "
+                        f"Keys available: {list(m.keys())}"
+                    )
+                    continue
+
+                # Condition ID from various field names
+                condition_id = (m.get("conditionId") or m.get("condition_id") or
+                                m.get("id") or "unknown")
+                market_id = f"{asset}_5m_{str(condition_id)[:8]}"
+
+                # End time
                 end_time = 0.0
-                end_date = m.get("end_date_iso") or m.get("endDate") or m.get("close_time")
+                end_date = (m.get("endDate") or m.get("end_date_iso") or
+                            m.get("closeTime") or m.get("close_time") or
+                            m.get("expirationTime") or m.get("expiration"))
                 if end_date:
                     try:
-                        import datetime
-                        dt = datetime.datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+                        dt = datetime.datetime.fromisoformat(str(end_date).replace("Z", "+00:00"))
                         end_time = dt.timestamp()
                     except Exception:
                         pass
