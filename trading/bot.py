@@ -357,6 +357,11 @@ class ArbitrageBot:
                     except Exception:
                         pass
 
+                # Skip markets where Gamma prices are near 0 or 1 — already resolved
+                if gamma_price_yes is not None and not (0.05 <= gamma_price_yes <= 0.95):
+                    logger.debug(f"{asset}: skipping resolved market (p_yes={gamma_price_yes:.3f})")
+                    continue
+
                 self.register_market(
                     market_id=market_id,
                     token_id_yes=yes_token,
@@ -499,15 +504,22 @@ class ArbitrageBot:
         opportunities: list[TradeOpportunity] = []
         market_stats = []  # collect for heartbeat
 
-        for market_id, state in self._markets.items():
+        for market_id, state in list(self._markets.items()):
+            # Skip markets that expire within 90 seconds — too risky to trade
+            if state.end_time > 0 and (state.end_time - now) < 90:
+                market_stats.append(f"{state.asset}({state.timeframe}):EXPIRING")
+                continue
+
             # --- 2. Fetch market prices from Polymarket ---
             yes_data = self.data_client.get_book_data(state.token_id_yes)
             no_data = self.data_client.get_book_data(state.token_id_no)
             p_yes = yes_data["mid_price"]
             p_no = no_data["mid_price"]
             # Fallback: use Gamma API prices if CLOB has no data
+            # Note: Gamma prices are static (from discovery), so only use as last resort
             if p_yes is None and state.gamma_price_yes is not None:
                 p_yes = state.gamma_price_yes
+                # Mark as stale — Bayesian should not over-react to static prices
             if p_no is None and state.gamma_price_no is not None:
                 p_no = state.gamma_price_no
             # Reject obviously invalid prices (0 or 1 are not real market prices)
