@@ -63,6 +63,10 @@ class EventSentimentAnalyzer:
     """
 
     def __init__(self):
+        self._cache: dict[str, EventSentimentResult] = {}
+        self._lock = threading.Lock()
+        self._running: set[str] = set()
+
         if genai is None:
             logger.warning("google-genai not installed — event sentiment disabled")
             self._enabled = False
@@ -78,10 +82,6 @@ class EventSentimentAnalyzer:
         self._enabled = True
         self._consecutive_failures = 0
         self._max_failures = 5
-
-        self._cache: dict[str, EventSentimentResult] = {}
-        self._lock = threading.Lock()
-        self._running: set[str] = set()
 
         logger.info("EventSentimentAnalyzer initialized (gemini-1.5-flash, event markets only)")
 
