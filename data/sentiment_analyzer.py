@@ -66,6 +66,13 @@ class GeminiSentimentAnalyzer:
             f"{self._model}:generateContent?key={self._api_key}"
         )
         self._enabled = True
+        self._consecutive_failures = 0
+        self._max_failures = 3  # Disable after 3 failures to avoid log spam
+
+        # Use proxy if set (override no_proxy for googleapis.com)
+        http_proxy = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy") or \
+                     os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
+        self._proxies = {"https": http_proxy, "http": http_proxy} if http_proxy else None
 
         self._cache: dict[str, SentimentResult] = {}
         self._lock = threading.Lock()
@@ -93,7 +100,7 @@ class GeminiSentimentAnalyzer:
             )
 
             payload = {"contents": [{"parts": [{"text": prompt}]}]}
-            r = requests.post(self._url, json=payload, timeout=15)
+            r = requests.post(self._url, json=payload, timeout=15, proxies=self._proxies)
             r.raise_for_status()
             raw = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip().replace(",", ".")
 
@@ -124,7 +131,12 @@ class GeminiSentimentAnalyzer:
             )
 
         except Exception as e:
-            logger.warning(f"Gemini analysis failed for {asset}: {e}")
+            self._consecutive_failures += 1
+            if self._consecutive_failures <= self._max_failures:
+                logger.warning(f"Gemini analysis failed for {asset}: {e}")
+            if self._consecutive_failures == self._max_failures:
+                logger.warning("Gemini: too many failures, disabling sentiment analysis")
+                self._enabled = False
         finally:
             with self._lock:
                 self._running_assets.discard(asset)
