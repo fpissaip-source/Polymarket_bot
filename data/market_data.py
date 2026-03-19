@@ -226,11 +226,12 @@ class GammaClient:
         matched = []
         fallback = []
 
-        for offset in range(0, 600, 100):
-            # Try crypto tag slug first, then unfiltered
-            markets = self.get_markets(active=True, tag_slug="crypto", limit=100, offset=offset)
+        for offset in range(0, 300, 100):
+            # Search by asset keyword directly — much more targeted than loading all crypto markets
+            markets = self.get_markets(active=True, keyword=asset, limit=100, offset=offset)
             if not markets:
-                markets = self.get_markets(active=True, limit=100, offset=offset)
+                # Fallback: tag_slug only (no keyword param support on this Gamma instance)
+                markets = self.get_markets(active=True, tag_slug="crypto", limit=100, offset=offset)
             if not markets:
                 break
 
