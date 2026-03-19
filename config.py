@@ -24,12 +24,32 @@ BAYESIAN_PRIOR = 0.5          # Initial prior probability
 BAYESIAN_ALPHA = 0.3          # Learning rate for updates
 BAYESIAN_MIN_SAMPLES = 5      # Minimum samples before trading
 
-# Edge model
-MIN_EDGE = 0.03               # Minimum net edge to trade (3%)
-TRADING_FEE = 0.01            # Fee per side (1%)
-SLIPPAGE_ESTIMATE = 0.005     # Estimated slippage (0.5%)
-INCOMPLETE_EXEC_RISK = 0.005  # Risk of incomplete execution (0.5%)
-TOTAL_COST = TRADING_FEE + SLIPPAGE_ESTIMATE + INCOMPLETE_EXEC_RISK  # c
+# Edge model — Maker vs Taker costs
+# Maker (passive limit order): 0% fee on Polymarket → very low cost
+MAKER_FEE = 0.000             # Polymarket maker fee
+MAKER_SLIPPAGE = 0.002        # Minimal slippage for resting limit orders
+MAKER_EXEC_RISK = 0.003       # Risk of partial fill
+TOTAL_COST_MAKER = MAKER_FEE + MAKER_SLIPPAGE + MAKER_EXEC_RISK   # ~0.5%
+MIN_EDGE_MAKER = 0.005        # 0.5% edge sufficient for passive orders
+
+# Taker (aggressive market order): fees + slippage apply
+TAKER_FEE = 0.01              # Polymarket taker fee per side (1%)
+TAKER_SLIPPAGE = 0.005        # Slippage on aggressive fills
+TAKER_EXEC_RISK = 0.005       # Incomplete execution risk
+TOTAL_COST_TAKER = TAKER_FEE + TAKER_SLIPPAGE + TAKER_EXEC_RISK   # ~2%
+MIN_EDGE_TAKER = 0.020        # 2% edge required for aggressive orders
+
+# Legacy aliases (used by EdgeModel default)
+MIN_EDGE = MIN_EDGE_TAKER
+TRADING_FEE = TAKER_FEE
+SLIPPAGE_ESTIMATE = TAKER_SLIPPAGE
+INCOMPLETE_EXEC_RISK = TAKER_EXEC_RISK
+TOTAL_COST = TOTAL_COST_TAKER
+
+# Event markets (politics, geopolitics, sports) — Gemini-powered
+EVENT_SENTIMENT_MIN_BANKROLL = 100.0   # Only active above $100 portfolio
+EVENT_MARKET_TAGS = ["politics", "geopolitics", "elections", "sports", "entertainment"]
+EVENT_SENTIMENT_REFRESH = 1800         # Refresh every 30 minutes
 
 # Spread model
 SPREAD_ZSCORE_THRESHOLD = 2.0  # z-score threshold for arbitrage signal
@@ -53,7 +73,7 @@ BANKROLL = float(os.getenv("BANKROLL", "5.27"))  # Total capital in USD
 # Bot starts aggressive at $5 and scales down as bankroll grows.
 # Goal: $5.27 → $100 → $1,000 → $10,000
 GROWTH_TIERS = [
-    (0.0,    50.0,   0.50,  0.020),         # Tier 1:   $0–$50     aggressive, 2% edge
+    (0.0,    50.0,   0.50,  0.010),         # Tier 1:   $0–$50     aggressive, 1% edge
     (50.0,   100.0,  0.45,  0.025),         # Tier 2:  $50–$100    still aggressive
     (100.0,  500.0,  0.35,  0.025),         # Tier 3: $100–$500    moderate
     (500.0,  1000.0, 0.30,  0.030),         # Tier 4: $500–$1000   standard

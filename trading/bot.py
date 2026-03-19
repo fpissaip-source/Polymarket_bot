@@ -33,7 +33,7 @@ from models.monte_carlo import MonteCarloSimulator
 from data.price_feed import PriceFeed
 from data.market_data import PolymarketDataClient, GammaClient
 from data.wallet_tracker import WalletTracker
-from data.sentiment_analyzer import GeminiSentimentAnalyzer
+from data.sentiment_analyzer import EventSentimentAnalyzer
 from trading.order_executor import OrderExecutor
 
 from config import (
@@ -59,8 +59,8 @@ class MarketState:
     market_id: str
     token_id_yes: str
     token_id_no: str
-    asset: str              # "BTC", "ETH", etc.
-    timeframe: str          # "5m", "15m"
+    asset: str              # "BTC", "ETH", etc. or "EVENT"
+    timeframe: str          # "5m", "15m", "event"
     bayesian: BayesianModel = field(default_factory=BayesianModel)
     stoikov: StoikovModel = field(default_factory=StoikovModel)
     last_price: float = 0.5
@@ -68,6 +68,8 @@ class MarketState:
     end_time: float = 0.0   # Unix timestamp when market closes (0 = unknown)
     gamma_price_yes: float | None = None  # Fallback price from Gamma API
     gamma_price_no: float | None = None
+    question: str = ""      # Market question text (for event markets)
+    is_event: bool = False  # True for politics/sports/etc. markets
 
 
 @dataclass
@@ -110,7 +112,7 @@ class ArbitrageBot:
 
         self.wallet_tracker = WalletTracker()
         self._last_wallet_update = 0.0
-        self.sentiment = GeminiSentimentAnalyzer()
+        self.event_sentiment = EventSentimentAnalyzer()
 
         self._markets: dict[str, MarketState] = {}
         self._running = False
@@ -368,7 +370,95 @@ class ArbitrageBot:
                 registered += 1
                 registered_for_asset += 1
 
-        logger.info(f"Auto-discovery complete: {registered} markets registered")
+        logger.info(f"Auto-discovery complete: {registered} crypto markets registered")
+
+        # --- Discover event markets (politics, geopolitics, sports) ---
+        event_count = self._discover_event_markets(gamma)
+        logger.info(f"Event markets discovered: {event_count}")
+        return registered + event_count
+
+    def _discover_event_markets(self, gamma: GammaClient) -> int:
+        """
+        Fetch top active non-crypto event markets (politics, elections, sports).
+        Registered with is_event=True for Gemini sentiment analysis (active >= $100).
+        """
+        from config import EVENT_MARKET_TAGS
+        registered = 0
+        try:
+            # Search for active event markets via Gamma
+            import requests as _req
+            from config import GAMMA_API_HOST
+            resp = _req.get(
+                f"{GAMMA_API_HOST}/markets",
+                params={
+                    "active": "true",
+                    "closed": "false",
+                    "limit": 50,
+                    "order": "volume",
+                    "ascending": "false",
+                },
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                return 0
+            markets = resp.json() if isinstance(resp.json(), list) else resp.json().get("markets", [])
+
+            for m in markets:
+                question = m.get("question", "")
+                tags = [str(t).lower() for t in (m.get("tags") or [])]
+                # Skip crypto markets (already handled above)
+                if any(a.lower() in question.lower() for a in ["BTC", "ETH", "SOL", "XRP", "DOGE", "BNB", "HYPE",
+                                                                 "Bitcoin", "Ethereum", "Solana"]):
+                    continue
+                # Only take markets with event-related tags or by volume
+                tag_match = any(tag in " ".join(tags) for tag in EVENT_MARKET_TAGS)
+                if not tag_match and not tags:
+                    continue  # Skip untagged markets
+
+                yes_token, no_token = self._extract_tokens(m)
+                if not yes_token or not no_token:
+                    continue
+
+                market_id = m.get("conditionId") or m.get("id", "")
+                if not market_id or market_id in self._markets:
+                    continue
+
+                # Gamma prices as fallback
+                gamma_price_yes, gamma_price_no = None, None
+                import json as _json
+                raw_prices = m.get("outcomePrices", [])
+                if isinstance(raw_prices, str):
+                    try:
+                        raw_prices = _json.loads(raw_prices)
+                    except Exception:
+                        raw_prices = []
+                if isinstance(raw_prices, list) and len(raw_prices) >= 2:
+                    try:
+                        gamma_price_yes = float(raw_prices[0])
+                        gamma_price_no = float(raw_prices[1])
+                    except Exception:
+                        pass
+
+                state = MarketState(
+                    market_id=market_id,
+                    token_id_yes=yes_token,
+                    token_id_no=no_token,
+                    asset="EVENT",
+                    timeframe="event",
+                    bayesian=BayesianModel(market_id),
+                    stoikov=StoikovModel(),
+                    question=question,
+                    is_event=True,
+                    gamma_price_yes=gamma_price_yes,
+                    gamma_price_no=gamma_price_no,
+                )
+                self._markets[market_id] = state
+                logger.info(f"Event market registered: {question[:60]}")
+                registered += 1
+                if registered >= 10:  # Cap at 10 event markets
+                    break
+        except Exception as e:
+            logger.warning(f"Event market discovery failed: {e}")
         return registered
 
     def run(self):
@@ -454,23 +544,17 @@ class ArbitrageBot:
             if wallet_signal.has_signal:
                 q = max(0.01, min(0.99, q + wallet_signal.confidence_boost))
 
-            # --- 3c. Gemini sentiment boost (cached, no delay) ---
-            price_change_pct = 0.0
-            if crypto_symbol in self._last_prices and crypto_symbol in new_prices:
-                old_p = self._last_prices[crypto_symbol]
-                if old_p > 0:
-                    price_change_pct = (new_prices[crypto_symbol] - old_p) / old_p * 100
-            # Trigger async refresh (returns immediately, updates cache in background)
-            self.sentiment.update_async(
-                asset=state.asset,
-                current_price=new_prices.get(crypto_symbol, 0.0),
-                price_change_pct=price_change_pct,
-                volatility=volatility,
-            )
-            sentiment_boost = self.sentiment.get_boost(state.asset)
-            if sentiment_boost != 0.0:
-                q = max(0.01, min(0.99, q + sentiment_boost))
-                logger.debug(f"[{market_id}] Gemini boost={sentiment_boost:+.3f} → q={q:.3f}")
+            # --- 3c. Event sentiment boost (only for non-crypto markets, only above $100) ---
+            if state.is_event and state.question:
+                self.event_sentiment.analyze_async(
+                    market_id=market_id,
+                    question=state.question,
+                    bankroll=self.kelly.bankroll,
+                )
+                sentiment_boost = self.event_sentiment.get_boost(market_id)
+                if sentiment_boost != 0.0:
+                    q = max(0.01, min(0.99, q + sentiment_boost))
+                    logger.debug(f"[{market_id}] EventSentiment boost={sentiment_boost:+.3f} → q={q:.3f}")
 
             # --- 4. Edge check (uses dynamic MIN_EDGE from current tier) ---
             edge_result = self.edge_model.evaluate_directional(q=q, p=p_yes)
@@ -510,7 +594,9 @@ class ArbitrageBot:
             )
 
             # --- 7. Kelly position sizing ---
-            exec_prob = 0.9 if not stoikov_quote.is_aggressive else 0.7
+            # Maker edge → override stoikov to passive; edge model already decided
+            is_passive = edge_result.is_passive
+            exec_prob = 0.9 if is_passive else 0.7
             kelly_result = self.kelly.compute(
                 p_success=q,
                 market_price=p_yes,
@@ -550,7 +636,7 @@ class ArbitrageBot:
             logger.info(
                 f"[HEARTBEAT] tick={self._tick_count} | markets={len(self._markets)} "
                 f"({no_data} no data, {len(active)} active) | "
-                f"bankroll=${self.kelly.bankroll:.2f} | {self.sentiment.summary()}"
+                f"bankroll=${self.kelly.bankroll:.2f} | {self.event_sentiment.summary()}"
             )
             if active:
                 logger.info(f"[HEARTBEAT] Market status: {' | '.join(active)}")
@@ -567,13 +653,14 @@ class ArbitrageBot:
             price = opp.stoikov_quote.reservation_price
             size = opp.kelly_result.position_size
             side = opp.edge_result.side          # "YES", "NO", or "BOTH"
-            is_aggressive = opp.stoikov_quote.is_aggressive
+            is_passive = opp.edge_result.is_passive
+            exec_type = "GTC/MAKER" if is_passive else "FOK/TAKER"
 
             if self.dry_run:
                 logger.info(
                     f"[DRY RUN] {opp.market_id}: {side} ${size:.2f} @ {price:.4f} "
                     f"| EV={opp.edge_result.ev_net:.4f} | Kelly f={opp.kelly_result.f_kelly:.4f} "
-                    f"| exec={'FOK' if is_aggressive else 'GTC'}"
+                    f"| exec={exec_type}"
                 )
                 continue
 
@@ -586,12 +673,12 @@ class ArbitrageBot:
             token_id = market.token_id_yes if side == "YES" else market.token_id_no
             logger.info(
                 f"[LIVE] Placing order: {opp.market_id} BUY {side} ${size:.2f} @ {price:.4f} "
-                f"({'FOK' if is_aggressive else 'GTC'})"
+                f"({exec_type})"
             )
-            if is_aggressive:
-                order_id = self.executor.place_fok_order(token_id, "BUY", price, size)
-            else:
+            if is_passive:
                 order_id = self.executor.place_limit_order(token_id, "BUY", price, size)
+            else:
+                order_id = self.executor.place_fok_order(token_id, "BUY", price, size)
 
             if order_id:
                 logger.info(f"Order accepted: {order_id}")

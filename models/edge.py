@@ -17,7 +17,11 @@ Two types of edge on Polymarket:
 """
 
 from dataclasses import dataclass
-from config import MIN_EDGE, TOTAL_COST
+from config import (
+    MIN_EDGE, TOTAL_COST,
+    TOTAL_COST_MAKER, MIN_EDGE_MAKER,
+    TOTAL_COST_TAKER, MIN_EDGE_TAKER,
+)
 
 
 @dataclass
@@ -26,6 +30,7 @@ class EdgeResult:
     ev_net: float
     edge_type: str      # "directional" | "within_market" | "cross_market"
     side: str           # "YES" | "NO" | "BOTH"
+    is_passive: bool    # True = maker limit order, False = taker market order
     description: str
 
 
@@ -36,56 +41,53 @@ class EdgeModel:
 
     def evaluate_directional(self, q: float, p: float) -> EdgeResult:
         """
-        Single-market directional edge.
-        q = our model probability, p = current market price.
-        EV_net = q - p - c
+        Single-market directional edge. Tries maker first (low cost),
+        falls back to taker (higher cost, requires bigger edge).
         """
-        ev_net = q - p - self.cost
-        has_edge = ev_net > self.min_edge
-
         if q > p:
             side = "YES"
+            ev_maker = q - p - TOTAL_COST_MAKER
+            ev_taker = q - p - TOTAL_COST_TAKER
         elif q < p:
-            # Could buy NO at (1-p), our prob of NO is (1-q)
-            # EV for NO: (1-q) - (1-p) - c = p - q - c
-            ev_net_no = p - q - self.cost
-            if ev_net_no > self.min_edge:
-                return EdgeResult(
-                    has_edge=True,
-                    ev_net=ev_net_no,
-                    edge_type="directional",
-                    side="NO",
-                    description=f"Buy NO: EV_net={ev_net_no:.4f} (q={q:.3f}, p={p:.3f}, c={self.cost:.3f})"
-                )
             side = "NO"
+            ev_maker = p - q - TOTAL_COST_MAKER
+            ev_taker = p - q - TOTAL_COST_TAKER
         else:
-            side = "NONE"
+            return EdgeResult(False, 0.0, "directional", "NONE", False,
+                              "No directional signal (q == p)")
 
-        return EdgeResult(
-            has_edge=has_edge,
-            ev_net=ev_net,
-            edge_type="directional",
-            side=side if has_edge else "NONE",
-            description=f"EV_net={ev_net:.4f} (q={q:.3f}, p={p:.3f}, c={self.cost:.3f})"
-        )
+        # Prefer maker (passive) — lower cost, lower required edge
+        if ev_maker > MIN_EDGE_MAKER:
+            return EdgeResult(
+                has_edge=True, ev_net=ev_maker, edge_type="directional",
+                side=side, is_passive=True,
+                description=f"MAKER {side}: EV={ev_maker:.4f} (q={q:.3f}, p={p:.3f})"
+            )
+        if ev_taker > MIN_EDGE_TAKER:
+            return EdgeResult(
+                has_edge=True, ev_net=ev_taker, edge_type="directional",
+                side=side, is_passive=False,
+                description=f"TAKER {side}: EV={ev_taker:.4f} (q={q:.3f}, p={p:.3f})"
+            )
+        return EdgeResult(False, max(ev_maker, ev_taker), "directional", "NONE", False,
+                          f"No edge: EV_maker={ev_maker:.4f}, EV_taker={ev_taker:.4f}")
 
     def evaluate_within_market(self, p_yes: float, p_no: float) -> EdgeResult:
         """
         Within-market arbitrage: buy both YES and NO if p_yes + p_no < 1.
-        Edge = 1 - (p_yes + p_no) - c
+        Uses maker cost (both legs as limit orders).
         """
         total = p_yes + p_no
-        edge = 1.0 - total - self.cost
-        has_edge = edge > self.min_edge
+        edge = 1.0 - total - TOTAL_COST_MAKER * 2  # two maker legs
+        has_edge = edge > MIN_EDGE_MAKER
 
         return EdgeResult(
             has_edge=has_edge,
             ev_net=edge,
             edge_type="within_market",
             side="BOTH",
-            description=(
-                f"Within-market arb: 1-({p_yes:.3f}+{p_no:.3f})-{self.cost:.3f}={edge:.4f}"
-            )
+            is_passive=True,
+            description=f"Within-market arb: 1-({p_yes:.3f}+{p_no:.3f})-2*{TOTAL_COST_MAKER:.3f}={edge:.4f}"
         )
 
     def evaluate_cross_market(
@@ -114,7 +116,6 @@ class EdgeModel:
             ev_net=edge,
             edge_type="cross_market",
             side=side,
-            description=(
-                f"Cross-market arb: |{p1:.3f}-{p2:.3f}|-2*{self.cost:.3f}={edge:.4f}"
-            )
+            is_passive=True,
+            description=f"Cross-market arb: |{p1:.3f}-{p2:.3f}|-2*{TOTAL_COST_MAKER:.3f}={edge:.4f}"
         )

@@ -1,14 +1,14 @@
 """
-Gemini Sentiment Analyzer
-=========================
-Runs in a background thread — never blocks the trading loop.
+Event Sentiment Analyzer (Gemini-powered)
+==========================================
+Analyzes NON-crypto event markets: politics, elections, geopolitics,
+sports, entertainment — markets where LLMs have genuine information advantage.
 
-For each asset (BTC, ETH, ...) it asks Gemini to estimate the probability
-that the asset price will be HIGHER in the next 5 minutes, given current
-price context and volatility.
+NOT used for 5-minute crypto price markets (Gemini cannot predict short-term
+price movements better than math).
 
-The result is cached per asset and updated every REFRESH_INTERVAL seconds.
-The bot reads from the cache (instant, no delay).
+Only activates when portfolio >= EVENT_SENTIMENT_MIN_BANKROLL ($100).
+Updates each market every 30 minutes in background threads.
 """
 
 import os
@@ -20,23 +20,18 @@ from dataclasses import dataclass, field
 
 from google import genai
 
+from config import EVENT_SENTIMENT_MIN_BANKROLL, EVENT_SENTIMENT_REFRESH
+
 logger = logging.getLogger(__name__)
-
-# How often to refresh sentiment per asset (seconds)
-REFRESH_INTERVAL = 300  # 5 minutes
-
-# How much Gemini can move the Bayesian prior (max boost/penalty)
-MAX_BOOST = 0.08  # ±8%
-
-MODEL = "gemini-1.5-flash"
 
 
 @dataclass
-class SentimentResult:
-    asset: str
-    probability_up: float       # 0.0–1.0 from Gemini
-    boost: float                # value added to Bayesian prior (-MAX_BOOST to +MAX_BOOST)
-    reasoning: str              # short explanation from Gemini
+class EventSentimentResult:
+    market_id: str
+    question: str
+    probability_yes: float      # 0.0–1.0 Gemini estimate
+    confidence: float           # 0.0–1.0 how confident Gemini is
+    reasoning: str
     updated_at: float = field(default_factory=time.time)
 
     @property
@@ -45,139 +40,150 @@ class SentimentResult:
 
     @property
     def is_fresh(self) -> bool:
-        return self.age_seconds < REFRESH_INTERVAL * 1.5
+        return self.age_seconds < EVENT_SENTIMENT_REFRESH * 1.5
+
+    @property
+    def boost(self) -> float:
+        """Probability adjustment: distance from 0.5, scaled by confidence."""
+        return (self.probability_yes - 0.5) * self.confidence * 0.15
 
 
-class GeminiSentimentAnalyzer:
+class EventSentimentAnalyzer:
     """
-    Background sentiment analyzer using Gemini.
-    Call update_async() to trigger a non-blocking refresh.
-    Call get_boost(asset) to read the cached result instantly.
+    Uses Gemini to estimate probabilities for event/political/sports markets.
+
+    Usage:
+        analyzer.analyze_async(market_id, question, bankroll)
+        boost = analyzer.get_boost(market_id)       # instant, cached
+        prob  = analyzer.get_probability(market_id) # None if no data
     """
 
     def __init__(self):
         api_key = os.getenv("GEMINI_API_KEY", "")
         if not api_key:
-            logger.warning("GEMINI_API_KEY not set — sentiment analyzer disabled")
+            logger.warning("GEMINI_API_KEY not set — event sentiment disabled")
             self._enabled = False
             return
 
         self._client = genai.Client(api_key=api_key)
         self._enabled = True
         self._consecutive_failures = 0
-        self._max_failures = 3  # Disable after 3 failures to avoid log spam
+        self._max_failures = 5
 
-        self._cache: dict[str, SentimentResult] = {}
+        self._cache: dict[str, EventSentimentResult] = {}
         self._lock = threading.Lock()
-        self._running_assets: set[str] = set()
+        self._running: set[str] = set()
 
-        logger.info(f"GeminiSentimentAnalyzer initialized (model: {MODEL})")
+        logger.info("EventSentimentAnalyzer initialized (gemini-1.5-flash, event markets only)")
 
-    def _analyze(self, asset: str, current_price: float, price_change_pct: float, volatility: float):
-        """Call Gemini and update cache. Runs in background thread."""
+    def _analyze(self, market_id: str, question: str):
+        """Call Gemini for an event market. Runs in background thread."""
         try:
-            direction = "up" if price_change_pct >= 0 else "down"
             prompt = (
-                f"You are a crypto trading signal generator. Answer with a single number only.\n\n"
-                f"Asset: {asset}\n"
-                f"Current price: ${current_price:,.2f}\n"
-                f"Price change last 5 min: {price_change_pct:+.2f}%\n"
-                f"Volatility: {volatility:.4f}\n"
-                f"Recent trend: {direction}\n\n"
-                f"Question: What is the probability (0.00 to 1.00) that {asset} will be HIGHER "
-                f"in the next 5 minutes?\n\n"
+                f"You are a prediction market analyst. Estimate the probability of the following event.\n\n"
+                f"Market question: {question}\n\n"
+                f"Answer in exactly this format (two lines):\n"
+                f"PROBABILITY: 0.XX\n"
+                f"CONFIDENCE: 0.XX\n\n"
                 f"Rules:\n"
-                f"- Answer with ONLY a decimal number between 0.00 and 1.00\n"
-                f"- No text, no explanation, just the number\n"
-                f"- 0.5 means uncertain, >0.5 means likely up, <0.5 means likely down"
+                f"- PROBABILITY: your best estimate that the answer is YES (0.00 to 1.00)\n"
+                f"- CONFIDENCE: how confident you are in this estimate (0.00=guess, 1.00=certain)\n"
+                f"- Use only your training knowledge, no real-time data\n"
+                f"- If you have no relevant knowledge, set CONFIDENCE to 0.10\n"
+                f"- No other text"
             )
 
             response = self._client.models.generate_content(
-                model=MODEL,
+                model="gemini-1.5-flash",
                 contents=prompt,
             )
-            raw = response.text.strip().replace(",", ".")
+            text = response.text.strip()
 
-            match = re.search(r"0?\.\d+|[01]\.0*", raw)
-            if not match:
-                logger.warning(f"Gemini returned unexpected response for {asset}: {raw!r}")
+            prob_match = re.search(r"PROBABILITY:\s*(0?\.\d+|[01]\.0*)", text)
+            conf_match = re.search(r"CONFIDENCE:\s*(0?\.\d+|[01]\.0*)", text)
+
+            if not prob_match or not conf_match:
+                logger.warning(f"Gemini event response unparseable for {market_id}: {text!r}")
                 return
 
-            prob = float(match.group())
-            prob = max(0.0, min(1.0, prob))
+            prob = max(0.0, min(1.0, float(prob_match.group(1))))
+            conf = max(0.0, min(1.0, float(conf_match.group(1))))
 
-            # Convert probability to boost: 0.5 → 0.0, 1.0 → +MAX_BOOST, 0.0 → -MAX_BOOST
-            boost = (prob - 0.5) * 2 * MAX_BOOST
-
-            result = SentimentResult(
-                asset=asset,
-                probability_up=prob,
-                boost=boost,
-                reasoning=f"p(up)={prob:.2f} → boost={boost:+.3f}",
+            result = EventSentimentResult(
+                market_id=market_id,
+                question=question,
+                probability_yes=prob,
+                confidence=conf,
+                reasoning=f"p(YES)={prob:.2f} conf={conf:.2f} boost={((prob-0.5)*conf*0.15):+.3f}",
             )
-
             with self._lock:
-                self._cache[asset] = result
+                self._cache[market_id] = result
 
             logger.info(
-                f"Gemini [{asset}]: p(up)={prob:.2f} | boost={boost:+.3f} | "
-                f"price=${current_price:,.2f} ({price_change_pct:+.2f}%)"
+                f"EventSentiment [{market_id[:20]}...]: "
+                f"p(YES)={prob:.2f} conf={conf:.2f} → boost={result.boost:+.3f}"
             )
-            self._consecutive_failures = 0  # reset on success
+            self._consecutive_failures = 0
 
         except Exception as e:
             self._consecutive_failures += 1
             if self._consecutive_failures <= self._max_failures:
-                logger.warning(f"Gemini analysis failed for {asset}: {e}")
-            if self._consecutive_failures == self._max_failures:
-                logger.warning("Gemini: too many failures, disabling sentiment analysis")
+                logger.warning(f"EventSentiment failed for {market_id}: {e}")
+            if self._consecutive_failures >= self._max_failures:
+                logger.warning("EventSentiment: too many failures, disabling")
                 self._enabled = False
         finally:
             with self._lock:
-                self._running_assets.discard(asset)
+                self._running.discard(market_id)
 
-    def update_async(self, asset: str, current_price: float, price_change_pct: float, volatility: float = 0.0):
+    def analyze_async(self, market_id: str, question: str, bankroll: float):
         """
-        Trigger a background refresh for this asset.
-        Returns immediately — result will be cached when done.
-        Skips if already running or cache is still fresh.
+        Trigger background analysis for an event market.
+        Skips if bankroll < $100, cache is fresh, or already running.
         """
         if not self._enabled:
             return
+        if bankroll < EVENT_SENTIMENT_MIN_BANKROLL:
+            return  # Not active until $100
 
         with self._lock:
-            cached = self._cache.get(asset)
+            cached = self._cache.get(market_id)
             if cached and cached.is_fresh:
-                return  # Cache still valid
-            if asset in self._running_assets:
-                return  # Already updating
-            self._running_assets.add(asset)
+                return
+            if market_id in self._running:
+                return
+            self._running.add(market_id)
 
         t = threading.Thread(
             target=self._analyze,
-            args=(asset, current_price, price_change_pct, volatility),
+            args=(market_id, question),
             daemon=True,
-            name=f"gemini-{asset}",
+            name=f"eventsent-{market_id[:12]}",
         )
         t.start()
 
-    def get_boost(self, asset: str) -> float:
-        """
-        Return cached sentiment boost for this asset.
-        Returns 0.0 if no data available (no delay, instant).
-        """
+    def get_boost(self, market_id: str) -> float:
+        """Cached probability boost. Returns 0.0 if no data or stale."""
         if not self._enabled:
             return 0.0
         with self._lock:
-            result = self._cache.get(asset)
+            result = self._cache.get(market_id)
         if result and result.is_fresh:
             return result.boost
         return 0.0
 
+    def get_probability(self, market_id: str) -> float | None:
+        """Cached Gemini probability estimate. None if not available."""
+        with self._lock:
+            result = self._cache.get(market_id)
+        if result and result.is_fresh:
+            return result.probability_yes
+        return None
+
     def summary(self) -> str:
         with self._lock:
-            items = list(self._cache.values())
+            items = [r for r in self._cache.values() if r.is_fresh]
         if not items:
-            return "Gemini: no data yet"
-        parts = [f"{r.asset}={r.probability_up:.2f}({r.boost:+.3f})" for r in items if r.is_fresh]
-        return f"Gemini sentiment: {', '.join(parts)}" if parts else "Gemini: cache stale"
+            return "EventSentiment: no data"
+        parts = [f"{r.market_id[:15]}={r.probability_yes:.2f}(conf={r.confidence:.1f})" for r in items]
+        return f"EventSentiment: {', '.join(parts)}"
