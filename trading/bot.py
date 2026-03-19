@@ -307,12 +307,10 @@ class ArbitrageBot:
             logger.info(f"Discovering {asset} markets via Gamma API...")
             markets = gamma.find_crypto_markets(asset)
             if not markets:
-                markets = gamma.find_crypto_markets(asset, keywords=None)
-            if not markets:
                 logger.info(f"Gamma empty, falling back to CLOB for {asset}...")
                 markets = self.data_client.find_crypto_5min_markets(asset)
             if not markets:
-                logger.warning(f"No markets found for {asset} — skipping")
+                logger.warning(f"No 5-min markets found for {asset} — skipping")
                 continue
 
             logger.debug(f"{asset}: {len(markets)} candidates, first keys: {list(markets[0].keys())}")
@@ -514,8 +512,6 @@ class ArbitrageBot:
         new_count = 0
         for asset in POLYMARKET_ASSETS:
             markets = gamma.find_crypto_markets(asset)
-            if not markets:
-                markets = gamma.find_crypto_markets(asset, keywords=None)
             for m in markets:
                 import datetime, json as _json
                 condition_id = m.get("conditionId") or m.get("id", "")

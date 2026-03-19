@@ -126,12 +126,12 @@ class DryRunTracker:
         s = self.stats()
         if s["resolved"] == 0:
             logger.info(
-                f"[DRY RUN STATS] {s['total_opportunities']} opportunities recorded, "
+                f"[DRY RUN STATS] {s['total']} opportunities recorded, "
                 f"0 resolved yet (markets still open)"
             )
         else:
             logger.info(
-                f"[DRY RUN STATS] opportunities={s['total_opportunities']} | "
+                f"[DRY RUN STATS] opportunities={s['total']} | "
                 f"resolved={s['resolved']} | win_rate={s['win_rate']:.1%} | "
                 f"P&L=${s['total_pnl']:+.4f} | avg_edge={s['avg_edge']:.3f} | "
                 f"Sharpe={s['sharpe']:.2f}"
