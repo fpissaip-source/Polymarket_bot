@@ -12,8 +12,16 @@ Supported order types:
 
 import time
 import logging
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
+
+try:
+    from py_clob_client.client import ClobClient
+    from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
+    _PY_CLOB_AVAILABLE = True
+except ImportError:
+    _PY_CLOB_AVAILABLE = False
+    logging.getLogger("polymarket_bot.executor").warning(
+        "py_clob_client not installed – OrderExecutor disabled (dry-run only)"
+    )
 
 # py-clob-client >= 0.15 removed BUY/SELL from constants – use string literals
 BUY = "BUY"
@@ -62,6 +70,10 @@ class OrderExecutor:
     """Places and manages orders via py-clob-client."""
 
     def __init__(self):
+        if not _PY_CLOB_AVAILABLE:
+            raise RuntimeError(
+                "py_clob_client is not installed. Run: pip install poly-market-maker"
+            )
         creds = ApiCreds(
             api_key=POLYMARKET_API_KEY,
             api_secret=POLYMARKET_API_SECRET,
