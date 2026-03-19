@@ -289,7 +289,20 @@ class ArbitrageBot:
                 if registered_for_asset >= 3:  # max 3 per asset
                     break
 
-                yes_token, no_token = self._extract_tokens(m)
+                # Condition ID from various field names
+                condition_id = (m.get("conditionId") or m.get("condition_id") or
+                                m.get("id") or "unknown")
+
+                # Try to get authoritative token IDs directly from CLOB
+                yes_token, no_token = None, None
+                if condition_id and condition_id != "unknown":
+                    clob_market = self.data_client.get_market(condition_id)
+                    if clob_market:
+                        yes_token, no_token = self._extract_tokens(clob_market)
+
+                # Fall back to Gamma token IDs if CLOB lookup failed
+                if not yes_token or not no_token:
+                    yes_token, no_token = self._extract_tokens(m)
 
                 if not yes_token or not no_token:
                     logger.warning(
@@ -297,10 +310,6 @@ class ArbitrageBot:
                         f"Keys available: {list(m.keys())}"
                     )
                     continue
-
-                # Condition ID from various field names
-                condition_id = (m.get("conditionId") or m.get("condition_id") or
-                                m.get("id") or "unknown")
                 market_id = f"{asset}_5m_{str(condition_id)[:8]}"
 
                 # End time
