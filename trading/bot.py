@@ -245,15 +245,23 @@ class ArbitrageBot:
         # Outcomes that map to NO (Down/Low side)
         NO_OUTCOMES = {"NO", "0", "DOWN", "RUNTER", "LOW", "UNDER", "BELOW", "FALSE"}
 
-        # Format 1: tokens list with outcome field (CLOB format)
+        # Format 1: tokens list with outcome field (CLOB/Gamma format)
+        # Gamma uses camelCase "tokenId"; CLOB uses snake_case "token_id"
         tokens = _parse_list(m.get("tokens", []))
         if tokens and isinstance(tokens[0], dict):
-            yes = next((t.get("token_id") for t in tokens
+            def _tid(t):
+                return t.get("token_id") or t.get("tokenId")
+
+            yes = next((_tid(t) for t in tokens
                         if t.get("outcome", "").upper() in YES_OUTCOMES), None)
-            no = next((t.get("token_id") for t in tokens
+            no = next((_tid(t) for t in tokens
                        if t.get("outcome", "").upper() in NO_OUTCOMES), None)
             if yes and no:
                 return yes, no
+
+            # Gamma tokens may have no "outcome" field — use positional (first=YES, second=NO)
+            if len(tokens) >= 2 and _tid(tokens[0]) and _tid(tokens[1]):
+                return _tid(tokens[0]), _tid(tokens[1])
 
         # Format 2: clobTokenIds list + outcomes list (Gamma format)
         # NOTE: Gamma often returns these as JSON strings, not real lists!
@@ -314,16 +322,9 @@ class ArbitrageBot:
                 condition_id = (m.get("conditionId") or m.get("condition_id") or
                                 m.get("id") or "unknown")
 
-                # Try to get authoritative token IDs directly from CLOB
-                yes_token, no_token = None, None
-                if condition_id and condition_id != "unknown":
-                    clob_market = self.data_client.get_market(condition_id)
-                    if clob_market:
-                        yes_token, no_token = self._extract_tokens(clob_market)
-
-                # Fall back to Gamma token IDs if CLOB lookup failed
-                if not yes_token or not no_token:
-                    yes_token, no_token = self._extract_tokens(m)
+                # Extract token IDs from Gamma response (tokenId field)
+                # Do NOT call CLOB /markets/{id} — it returns 404 for Gamma condition IDs
+                yes_token, no_token = self._extract_tokens(m)
 
                 if not yes_token or not no_token:
                     logger.warning(
@@ -384,6 +385,10 @@ class ArbitrageBot:
         # --- Discover event markets (politics, geopolitics, sports) ---
         event_count = self._discover_event_markets(gamma)
         logger.info(f"Event markets discovered: {event_count}")
+
+        # Reset refresh timer so the first tick doesn't immediately re-run discovery
+        self._last_market_refresh = time.time()
+
         return registered + event_count
 
     def _discover_event_markets(self, gamma: GammaClient) -> int:
