@@ -1,0 +1,3838 @@
+=============================================
+POLYMARKET BOT - COMPLETE SOURCE CODE
+Generated: Fri Mar 20 10:02:06 PM UTC 2026
+=============================================
+
+
+================================================================
+FILE: main.py
+================================================================
+
+"""
+Polymarket Arbitrage Bot
+========================
+Entry point.
+
+Architecture (6 models from the Twitter thread):
+  1. Bayesian   - estimates true probability q
+  2. Edge       - filters: EV_net = q - p - c > threshold
+  3. Spread     - detects cross-market dislocations (z-score)
+  4. Stoikov    - quality execution: r = s - q*gamma*sigma^2*(T-t)
+  5. Kelly      - position sizing: f* = (b*p - q) / b
+  6. Monte Carlo- strategy validation: W(t+1) = W(t) * (1 + r(t))
+
+Usage:
+  python main.py              # live mode (auto-discovers markets)
+  python main.py --dry-run   # simulate only, no real orders
+  python main.py --validate  # run Monte Carlo validation and exit
+
+Environment variables (.env):
+  POLYMARKET_PRIVATE_KEY
+  POLYMARKET_PROXY_ADDRESS
+  POLYMARKET_API_KEY / SECRET / PASSPHRASE
+  BANKROLL
+  LOG_LEVEL
+"""
+
+import argparse
+import logging
+from utils.logger import setup_logger
+from trading.bot import ArbitrageBot
+from models.monte_carlo import MonteCarloSimulator
+from config import MIN_EDGE
+
+logger = setup_logger()
+
+
+def run_validation_only():
+    """Run Monte Carlo validation and print results."""
+    mc = MonteCarloSimulator(n_simulations=1000, n_trades=200)
+    logger.info("=== Monte Carlo Validation ===")
+    for ev in [0.02, 0.03, 0.05]:
+        result = mc.run(
+            base_ev=ev,
+            base_win_rate=0.55 + ev,
+            avg_position_fraction=0.25,
+        )
+        logger.info(f"EV={ev:.0%}: {result.description}")
+    logger.info("=== Validation Complete ===")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Polymarket Arbitrage Bot")
+    parser.add_argument(
+        "--dry-run", action="store_true", default=True,
+        help="Log opportunities without placing real orders (default: True)",
+    )
+    parser.add_argument(
+        "--live", action="store_true", default=False,
+        help="Enable live trading (real orders)",
+    )
+    parser.add_argument(
+        "--validate", action="store_true",
+        help="Run Monte Carlo validation only and exit",
+    )
+    args = parser.parse_args()
+
+    if args.validate:
+        run_validation_only()
+        return
+
+    dry_run = not args.live  # dry-run is default, --live enables real orders
+    logger.info("Initializing Polymarket Arbitrage Bot...")
+    logger.info(f"Mode: {'DRY RUN' if dry_run else '*** LIVE TRADING ***'}")
+
+    bot = ArbitrageBot(dry_run=dry_run)
+
+    # Auto-discover active crypto markets on Polymarket
+    logger.info("Auto-discovering active markets...")
+    count = bot.auto_discover_markets()
+
+    if count == 0:
+        logger.warning(
+            "No markets found via auto-discovery. "
+            "Markets may have different naming - check Polymarket manually."
+        )
+    else:
+        logger.info(f"Starting bot with {count} markets...")
+        bot.run()
+
+
+if __name__ == "__main__":
+    main()
+
+
+================================================================
+FILE: config.py
+================================================================
+
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Polymarket API
+POLYMARKET_HOST = os.getenv("POLYMARKET_HOST", "https://clob.polymarket.com")
+GAMMA_API_HOST = os.getenv("GAMMA_API_HOST", "https://gamma-api.polymarket.com")
+DATA_API_HOST = os.getenv("DATA_API_HOST", "https://data-api.polymarket.com")
+POLYMARKET_PRIVATE_KEY = "".join(os.getenv("POLYMARKET_PRIVATE_KEY", "").split())
+POLYMARKET_API_KEY = os.getenv("POLYMARKET_API_KEY", "")
+POLYMARKET_API_SECRET = os.getenv("POLYMARKET_API_SECRET", "")
+POLYMARKET_API_PASSPHRASE = os.getenv("POLYMARKET_API_PASSPHRASE", "")
+CHAIN_ID = int(os.getenv("CHAIN_ID", "137"))  # Polygon
+
+# Crypto price feed
+PRICE_FEED_URL = os.getenv("PRICE_FEED_URL", "https://api.binance.com/api/v3/ticker/price")
+CRYPTO_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "BNBUSDT"]
+# HYPE is not on Binance – excluded from price feed, still discovered on Polymarket
+POLYMARKET_ASSETS = ["BTC", "ETH", "SOL", "XRP", "DOGE", "BNB", "HYPE"]
+
+# Bayesian model
+BAYESIAN_PRIOR = 0.5          # Initial prior probability
+BAYESIAN_ALPHA = 0.3          # Learning rate for updates
+BAYESIAN_MIN_SAMPLES = 5      # Minimum samples before trading
+
+# Edge model — Maker vs Taker costs
+# Maker (passive limit order): 0% fee on Polymarket → very low cost
+MAKER_FEE = 0.000             # Polymarket maker fee
+MAKER_SLIPPAGE = 0.002        # Minimal slippage for resting limit orders
+MAKER_EXEC_RISK = 0.003       # Risk of partial fill
+TOTAL_COST_MAKER = MAKER_FEE + MAKER_SLIPPAGE + MAKER_EXEC_RISK   # ~0.5%
+MIN_EDGE_MAKER = 0.005        # 0.5% edge sufficient for passive orders
+
+# Taker (aggressive market order): fees + slippage apply
+TAKER_FEE = 0.01              # Polymarket taker fee per side (1%)
+TAKER_SLIPPAGE = 0.005        # Slippage on aggressive fills
+TAKER_EXEC_RISK = 0.005       # Incomplete execution risk
+TOTAL_COST_TAKER = TAKER_FEE + TAKER_SLIPPAGE + TAKER_EXEC_RISK   # ~2%
+MIN_EDGE_TAKER = 0.020        # 2% edge required for aggressive orders
+
+# Legacy aliases (used by EdgeModel default)
+MIN_EDGE = MIN_EDGE_TAKER
+TRADING_FEE = TAKER_FEE
+SLIPPAGE_ESTIMATE = TAKER_SLIPPAGE
+INCOMPLETE_EXEC_RISK = TAKER_EXEC_RISK
+TOTAL_COST = TOTAL_COST_TAKER
+
+# Event markets (politics, geopolitics, sports) — Gemini-powered
+EVENT_SENTIMENT_MIN_BANKROLL = 100.0   # Only active above $100 portfolio
+EVENT_MARKET_TAGS = ["politics", "geopolitics", "elections", "sports", "entertainment"]
+EVENT_SENTIMENT_REFRESH = 1800         # Refresh every 30 minutes
+
+# Spread model
+SPREAD_ZSCORE_THRESHOLD = 2.0  # z-score threshold for arbitrage signal
+SPREAD_LOOKBACK = 50           # Number of periods for mu/sigma calculation
+RELATED_MARKETS = [
+    ("BTC_5m", "BTC_15m"),
+    ("ETH_5m", "ETH_15m"),
+    ("SOL_5m", "SOL_15m"),
+]
+
+# Stoikov model
+STOIKOV_GAMMA = 0.1           # Risk aversion coefficient
+STOIKOV_SIGMA_DEFAULT = 0.02  # Default variance estimate
+
+# Kelly model
+KELLY_FRACTION = 0.25         # Fractional Kelly (lambda), conservative
+KELLY_MAX_FRACTION = 0.5      # Maximum fraction of bankroll per trade
+BANKROLL = float(os.getenv("BANKROLL", "5.27"))  # Total capital in USD
+
+# Growth tiers: (min_balance, max_balance, kelly_lambda, min_edge)
+# Bot starts aggressive at $5 and scales down as bankroll grows.
+# Goal: $5.27 → $100 → $1,000 → $10,000
+GROWTH_TIERS = [
+    (0.0,    50.0,   0.50,  0.010),         # Tier 1:   $0–$50     aggressive, 1% edge
+    (50.0,   100.0,  0.45,  0.025),         # Tier 2:  $50–$100    still aggressive
+    (100.0,  500.0,  0.35,  0.025),         # Tier 3: $100–$500    moderate
+    (500.0,  1000.0, 0.30,  0.030),         # Tier 4: $500–$1000   standard
+    (1000.0, float("inf"), 0.25, 0.030),    # Tier 5: $1000+       conservative
+]
+
+# State file for bankroll persistence across restarts
+BANKROLL_STATE_FILE = "bankroll_state.json"
+
+# Monte Carlo
+MC_SIMULATIONS = 600          # Number of simulation paths
+MC_TRADES = 200               # Number of trades per simulation
+MC_MAX_DD_LIMIT = 0.30        # Stop if max drawdown exceeds 30%
+
+# Bot loop
+POLL_INTERVAL_SECONDS = 1     # How often to scan markets (1s for 5-min markets)
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+
+
+================================================================
+FILE: setup_api_keys.py
+================================================================
+
+"""
+Setup API Keys
+==============
+Run ONCE to generate Polymarket API credentials from your private key.
+
+Usage:
+  python setup_api_keys.py
+
+Requires in .env:
+  POLYMARKET_PRIVATE_KEY=0x...
+  POLYMARKET_PROXY_ADDRESS=0x...   (only for Magic/email wallets)
+"""
+
+import os
+from dotenv import load_dotenv, set_key
+from py_clob_client.client import ClobClient
+
+load_dotenv()
+
+CLOB_HOST = "https://clob.polymarket.com"
+CHAIN_ID = 137
+
+private_key = os.getenv("POLYMARKET_PRIVATE_KEY", "").strip()
+private_key = "".join(private_key.split())
+proxy_address = os.getenv("POLYMARKET_PROXY_ADDRESS", "").strip()
+
+if not private_key:
+    print("ERROR: POLYMARKET_PRIVATE_KEY not set in .env")
+    exit(1)
+
+print(f"Using proxy address: {proxy_address or 'none (EOA mode)'}")
+
+# signature_type=1 for Magic/email wallets (proxy wallet)
+# signature_type=0 for standard MetaMask EOA
+if proxy_address:
+    client = ClobClient(
+        host=CLOB_HOST,
+        key=private_key,
+        chain_id=CHAIN_ID,
+        signature_type=1,
+        funder=proxy_address,
+    )
+else:
+    client = ClobClient(
+        host=CLOB_HOST,
+        key=private_key,
+        chain_id=CHAIN_ID,
+        signature_type=0,
+    )
+
+print("Generating API credentials...")
+try:
+    creds = client.create_or_derive_api_creds()
+except Exception as e:
+    print(f"ERROR: {e}")
+    exit(1)
+
+print(f"\nAPI_KEY:     {creds.api_key}")
+print(f"API_SECRET:  {creds.api_secret}")
+print(f"PASSPHRASE:  {creds.api_passphrase}")
+
+env_path = ".env"
+set_key(env_path, "POLYMARKET_API_KEY", creds.api_key)
+set_key(env_path, "POLYMARKET_API_SECRET", creds.api_secret)
+set_key(env_path, "POLYMARKET_API_PASSPHRASE", creds.api_passphrase)
+
+print("\nCredentials saved to .env - you can now start the bot.")
+
+
+================================================================
+FILE: requirements.txt
+================================================================
+
+requests>=2.31.0
+websocket-client>=1.7.0
+numpy>=1.26.0
+scipy>=1.11.0
+pandas>=2.1.0
+python-dotenv>=1.0.0
+py-clob-client>=0.14.0
+
+
+================================================================
+FILE: data/__init__.py
+================================================================
+
+
+
+================================================================
+FILE: data/market_data.py
+================================================================
+
+"""
+Polymarket Market Data
+======================
+Fetches market prices, order books, and related market info
+from the Polymarket CLOB API and Gamma API.
+"""
+
+import time
+import logging
+import requests
+from config import POLYMARKET_HOST, GAMMA_API_HOST, DATA_API_HOST
+
+logger = logging.getLogger(__name__)
+
+_SENTINEL = object()   # used to distinguish "not passed" from None/[]
+
+
+class PolymarketDataClient:
+    """
+    Lightweight client for Polymarket's CLOB REST API.
+    Handles market discovery and price fetching.
+    """
+
+    def __init__(self, host: str = POLYMARKET_HOST):
+        self.host = host.rstrip("/")
+        self._session = requests.Session()
+        self._session.headers.update({"Content-Type": "application/json"})
+
+    def get_markets(self, next_cursor: str = "") -> dict:
+        """Fetch list of active markets."""
+        params = {"next_cursor": next_cursor} if next_cursor else {}
+        try:
+            r = self._session.get(f"{self.host}/markets", params=params, timeout=10)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            logger.error(f"Failed to fetch markets: {e}")
+            return {}
+
+    def get_market(self, condition_id: str) -> dict:
+        """Fetch a single market by condition ID."""
+        try:
+            r = self._session.get(f"{self.host}/markets/{condition_id}", timeout=10)
+            if r.status_code == 404:
+                logger.debug(f"Market {condition_id[:16]}... not on CLOB (404)")
+                return {}
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            logger.debug(f"Failed to fetch market {condition_id[:16]}...: {e}")
+            return {}
+
+    def get_order_book(self, token_id: str) -> dict:
+        """Fetch order book for a token. Returns {} on 404 (token not on CLOB)."""
+        try:
+            r = self._session.get(f"{self.host}/book", params={"token_id": token_id}, timeout=10)
+            if r.status_code == 404:
+                logger.debug(f"Order book not found for token {token_id[:16]}... (404)")
+                return {}
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            logger.error(f"Failed to fetch order book for {token_id}: {e}")
+            return {}
+
+    def get_midpoint(self, token_id: str) -> float | None:
+        """Fetch midpoint price directly from CLOB (works even with empty order book)."""
+        try:
+            r = self._session.get(
+                f"{self.host}/midpoint",
+                params={"token_id": token_id},
+                timeout=10,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                mid = data.get("mid") or data.get("midpoint") or data.get("price")
+                if mid is not None:
+                    return float(mid)
+        except Exception as e:
+            logger.debug(f"Midpoint fetch failed for {token_id[:16]}...: {e}")
+        return None
+
+    def get_book_data(self, token_id: str, levels: int = 5) -> dict:
+        """
+        Fetch the order book once and return mid_price, imbalance, and depth.
+        Falls back to CLOB /midpoint if order book is empty.
+        Returns: {"mid_price": float|None, "imbalance": float, "depth": float}
+        """
+        book = self.get_order_book(token_id)
+        if not book:
+            mid = self.get_midpoint(token_id)
+            return {"mid_price": mid, "imbalance": 0.0, "depth": 0.0}
+
+        bids = book.get("bids", [])
+        asks = book.get("asks", [])
+
+        best_bid = float(bids[0]["price"]) if bids else None
+        best_ask = float(asks[0]["price"]) if asks else None
+        if best_bid and best_ask:
+            mid_price = (best_bid + best_ask) / 2.0
+        else:
+            mid_price = best_bid or best_ask
+
+        bid_vol = sum(float(b.get("size", 0)) for b in bids[:levels])
+        ask_vol = sum(float(a.get("size", 0)) for a in asks[:levels])
+        total = bid_vol + ask_vol
+        imbalance = (bid_vol - ask_vol) / total if total > 1e-8 else 0.0
+        depth = min(1.0, total / 1000.0)
+
+        return {"mid_price": mid_price, "imbalance": imbalance, "depth": depth}
+
+    def get_mid_price(self, token_id: str) -> float | None:
+        """Compute mid price from order book."""
+        return self.get_book_data(token_id)["mid_price"]
+
+    def get_order_book_imbalance(self, token_id: str) -> float:
+        return self.get_book_data(token_id)["imbalance"]
+
+    def get_order_book_depth(self, token_id: str, levels: int = 5) -> float:
+        return self.get_book_data(token_id)["depth"]
+
+    def find_crypto_5min_markets(self, asset: str = "BTC") -> list[dict]:
+        """
+        Search for active crypto markets for the given asset via CLOB pagination.
+        First tries 5-minute markets; falls back to any active market for the asset.
+        """
+        five_min_kws = ("5-MINUTE", "5 MINUTE", "5 MINUTES", "5-MINUTES", "UP OR DOWN", "5MIN")
+        results_5m = []
+        results_any = []
+        cursor = ""
+        seen = 0
+        while seen < 800:  # limit search scope
+            data = self.get_markets(next_cursor=cursor)
+            markets = data.get("data", [])
+            if not markets:
+                break
+            for m in markets:
+                question = m.get("question", "").upper()
+                if asset.upper() not in question:
+                    continue
+                if any(kw in question for kw in five_min_kws):
+                    results_5m.append(m)
+                else:
+                    results_any.append(m)
+            cursor = data.get("next_cursor", "")
+            seen += len(markets)
+            if not cursor or cursor == "LTE=":
+                break
+
+        if results_5m:
+            logger.info(f"CLOB: found {len(results_5m)} 5-min markets for {asset}")
+            return results_5m
+        if results_any:
+            logger.info(f"CLOB: no 5-min markets for {asset}, using {len(results_any)} broader matches")
+        return results_any
+
+
+def _get_with_retry(session: requests.Session, url: str, params: dict = None, timeout: int = 10) -> dict:
+    """GET with automatic 429 backoff."""
+    for attempt in range(4):
+        try:
+            r = session.get(url, params=params, timeout=timeout)
+            if r.status_code == 429:
+                wait = 2 ** attempt
+                logger.warning(f"Rate limited (429), retrying in {wait}s...")
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            return r.json()
+        except requests.exceptions.HTTPError:
+            raise
+        except Exception as e:
+            logger.error(f"Request failed ({url}): {e}")
+            return {}
+    return {}
+
+
+class GammaClient:
+    """
+    Client for the Gamma API (Market Discovery & Metadata).
+    Level 0 – no authentication required.
+    """
+
+    def __init__(self, host: str = GAMMA_API_HOST):
+        self.host = host.rstrip("/")
+        self._session = requests.Session()
+        self._session.headers.update({"Content-Type": "application/json"})
+
+    def get_markets(
+        self,
+        active: bool = True,
+        limit: int = 100,
+        offset: int = 0,
+        tag_slug: str = "",
+        keyword: str = "",
+    ) -> list[dict]:
+        """
+        Fetch markets from Gamma API.
+        Uses 'tag_slug' for category filtering and 'keyword' for text search.
+        No 'category' param — Gamma uses tag slugs (e.g. 'crypto').
+        """
+        params: dict = {"active": "true" if active else "false", "limit": limit, "offset": offset}
+        if tag_slug:
+            params["tag_slug"] = tag_slug
+        if keyword:
+            params["keyword"] = keyword
+        data = _get_with_retry(self._session, f"{self.host}/markets", params=params)
+        if isinstance(data, list):
+            return data
+        return data.get("data", data.get("markets", []))
+
+    def find_crypto_markets(self, asset: str, keywords: list[str] | None = _SENTINEL) -> list[dict]:
+        """
+        Search active crypto markets matching an asset and optional keywords.
+
+        keywords=None (default sentinel) → searches for 5-minute variants first,
+                                           falls back to any match if none found.
+        keywords=[]                      → no keyword filter (return all with asset name).
+        keywords=[...]                   → filter by those keywords.
+        """
+        # Resolve keywords default
+        no_keyword_filter = (keywords is None)
+        if keywords is _SENTINEL:
+            keywords = ["5 minutes", "5-minutes", "5 minute", "5-minute", "up or down", "5min"]
+
+        matched = []
+
+        for offset in range(0, 500, 100):
+            # Try keyword+crypto tag first, then keyword only, then crypto tag only
+            markets = self.get_markets(active=True, keyword=asset, tag_slug="crypto", limit=100, offset=offset)
+            if not markets:
+                markets = self.get_markets(active=True, keyword=asset, limit=100, offset=offset)
+            if not markets:
+                markets = self.get_markets(active=True, tag_slug="crypto", limit=100, offset=offset)
+            if not markets:
+                break
+
+            for m in markets:
+                question = m.get("question", "").upper()
+                if asset.upper() not in question:
+                    continue
+
+                # Skip resolved markets — outcomePrices near 0 or 1 means decided
+                import json as _j
+                raw = m.get("outcomePrices", [])
+                if isinstance(raw, str):
+                    try:
+                        raw = _j.loads(raw)
+                    except Exception:
+                        raw = []
+                if isinstance(raw, list) and len(raw) >= 2:
+                    try:
+                        p0, p1 = float(raw[0]), float(raw[1])
+                        if not (0.05 <= p0 <= 0.95) or not (0.05 <= p1 <= 0.95):
+                            continue  # already resolved
+                    except Exception:
+                        pass
+
+                if no_keyword_filter or not keywords:
+                    matched.append(m)
+                elif any(kw.upper() in question for kw in keywords):
+                    matched.append(m)
+
+            if len(markets) < 100:
+                break
+
+        if matched:
+            logger.info(f"Gamma: found {len(matched)} markets for {asset}")
+        else:
+            logger.info(f"Gamma: no active 5-min markets found for {asset}")
+        return matched
+
+    def get_events(self, limit: int = 50) -> list[dict]:
+        """Fetch event groups (e.g. 'US Election')."""
+        data = _get_with_retry(self._session, f"{self.host}/events", params={"limit": limit})
+        if isinstance(data, list):
+            return data
+        return data.get("data", [])
+
+
+class DataApiClient:
+    """
+    Client for the Data API (Portfolio, Positions, Activity).
+    Level 0 for public endpoints; user address required for positions.
+    """
+
+    def __init__(self, host: str = DATA_API_HOST):
+        self.host = host.rstrip("/")
+        self._session = requests.Session()
+        self._session.headers.update({"Content-Type": "application/json"})
+
+    def get_positions(self, user_address: str) -> list[dict]:
+        """Fetch open positions for a wallet address."""
+        data = _get_with_retry(
+            self._session,
+            f"{self.host}/positions",
+            params={"user": user_address},
+        )
+        if isinstance(data, list):
+            return data
+        return data.get("data", [])
+
+    def get_activity(self, user_address: str, limit: int = 100) -> list[dict]:
+        """Fetch trade history / PnL for a wallet address."""
+        data = _get_with_retry(
+            self._session,
+            f"{self.host}/activity",
+            params={"user": user_address, "limit": limit},
+        )
+        if isinstance(data, list):
+            return data
+        return data.get("data", [])
+
+
+================================================================
+FILE: data/price_feed.py
+================================================================
+
+"""
+Crypto Price Feed
+=================
+Fetches real-time spot prices for BTC, ETH, SOL, XRP from Binance.
+Used as external data (D) for the Bayesian model.
+"""
+
+import math
+import time
+import logging
+import requests
+from collections import deque
+from config import PRICE_FEED_URL, CRYPTO_SYMBOLS
+
+logger = logging.getLogger(__name__)
+
+
+class PriceFeed:
+    def __init__(self, symbols: list[str] = CRYPTO_SYMBOLS, volatility_window: int = 20):
+        self.symbols = symbols
+        self._last_prices: dict[str, float] = {}
+        self._last_update: float = 0.0
+        # Rolling return history for volatility calculation
+        self._return_history: dict[str, deque] = {
+            s: deque(maxlen=volatility_window) for s in symbols
+        }
+
+    def fetch(self) -> dict[str, float]:
+        """Fetch current prices for all configured symbols."""
+        prices = {}
+        try:
+            for symbol in self.symbols:
+                response = requests.get(
+                    PRICE_FEED_URL,
+                    params={"symbol": symbol},
+                    timeout=5,
+                )
+                response.raise_for_status()
+                data = response.json()
+                prices[symbol] = float(data["price"])
+        except Exception as e:
+            logger.warning(f"Price feed error: {e}, using last known prices")
+            return dict(self._last_prices)
+
+        # Update return history for volatility
+        for symbol, price in prices.items():
+            last = self._last_prices.get(symbol)
+            if last and last > 0:
+                ret = (price - last) / last
+                if symbol not in self._return_history:
+                    self._return_history[symbol] = deque(maxlen=20)
+                self._return_history[symbol].append(ret)
+
+        self._last_prices = dict(prices)
+        self._last_update = time.time()
+        return prices
+
+    def get_returns(self, new_prices: dict[str, float]) -> dict[str, float]:
+        """Compute % returns vs last known prices."""
+        returns = {}
+        for symbol, price in new_prices.items():
+            last = self._last_prices.get(symbol)
+            if last and last > 0:
+                returns[symbol] = (price - last) / last
+            else:
+                returns[symbol] = 0.0
+        return returns
+
+    def get_speed(self, new_prices: dict[str, float], elapsed_seconds: float) -> dict[str, float]:
+        """Compute absolute price change per second."""
+        speed = {}
+        for symbol, price in new_prices.items():
+            last = self._last_prices.get(symbol)
+            if last and last > 0 and elapsed_seconds > 0:
+                speed[symbol] = abs(price - last) / (last * elapsed_seconds)
+            else:
+                speed[symbol] = 0.0
+        return speed
+
+    def get_volatility(self, symbol: str) -> float:
+        """
+        Compute realized volatility as std of recent returns, normalized to [0, 1].
+        Returns 0.0 if insufficient history.
+        """
+        history = self._return_history.get(symbol)
+        if not history or len(history) < 3:
+            return 0.0
+        mean = sum(history) / len(history)
+        variance = sum((r - mean) ** 2 for r in history) / len(history)
+        std = math.sqrt(variance)
+        # Normalize: 1% std per tick ≈ 1.0 volatility score
+        return min(1.0, std * 100)
+
+    def build_bayesian_data(
+        self,
+        symbol: str | None,
+        new_prices: dict[str, float],
+        elapsed_seconds: float,
+        volatility: float = 0.0,
+        volume: float = 0.5,
+        ob_imbalance: float = 0.0,
+        reprice_speed: float = 0.0,
+    ) -> dict:
+        """Build the data dict expected by BayesianModel.update().
+        symbol=None for assets without a Binance price feed (e.g. HYPE).
+        """
+        returns = self.get_returns(new_prices)
+        speeds = self.get_speed(new_prices, elapsed_seconds)
+
+        return {
+            "spot_return": returns.get(symbol, 0.0) if symbol else 0.0,
+            "speed": speeds.get(symbol, 0.0) if symbol else 0.0,
+            "volatility": volatility,
+            "volume": volume,
+            "ob_imbalance": ob_imbalance,
+            "reprice_speed": reprice_speed,
+        }
+
+    @property
+    def stale(self) -> bool:
+        return (time.time() - self._last_update) > 30
+
+
+================================================================
+FILE: data/dry_run_tracker.py
+================================================================
+
+"""
+Dry Run Tracker
+===============
+Records every opportunity seen in dry-run mode, checks market outcomes,
+simulates P&L, and prints periodic statistics.
+
+Data is stored in dry_run_log.json (one entry per opportunity).
+"""
+
+import json
+import time
+import logging
+from pathlib import Path
+from dataclasses import dataclass, asdict
+
+logger = logging.getLogger(__name__)
+
+DRY_RUN_LOG = Path(__file__).parent.parent / "dry_run_log.json"
+
+
+@dataclass
+class DryRunEntry:
+    timestamp: float
+    market_id: str
+    asset: str
+    side: str           # "YES" or "NO"
+    q: float            # Bayesian probability
+    p: float            # Market price
+    edge: float         # EV_net
+    size: float         # Kelly position size $
+    exec_price: float   # Stoikov reservation price
+    outcome: str = ""   # "WIN" / "LOSS" / "UNKNOWN"
+    pnl: float = 0.0    # Simulated P&L in $
+
+
+class DryRunTracker:
+    def __init__(self):
+        self._entries: list[DryRunEntry] = []
+        self._load()
+
+    def _load(self):
+        if DRY_RUN_LOG.exists():
+            try:
+                raw = json.loads(DRY_RUN_LOG.read_text())
+                self._entries = [DryRunEntry(**e) for e in raw]
+                logger.info(f"DryRunTracker: loaded {len(self._entries)} existing entries")
+            except Exception as e:
+                logger.warning(f"DryRunTracker: could not load log: {e}")
+
+    def _save(self):
+        try:
+            DRY_RUN_LOG.write_text(json.dumps([asdict(e) for e in self._entries], indent=2))
+        except Exception as e:
+            logger.warning(f"DryRunTracker: could not save log: {e}")
+
+    def record(self, market_id: str, asset: str, side: str,
+               q: float, p: float, edge: float, size: float, exec_price: float):
+        """Record a new dry-run opportunity."""
+        entry = DryRunEntry(
+            timestamp=time.time(),
+            market_id=market_id,
+            asset=asset,
+            side=side,
+            q=q,
+            p=p,
+            edge=edge,
+            size=size,
+            exec_price=exec_price,
+        )
+        self._entries.append(entry)
+        self._save()
+
+    def resolve(self, market_id: str, winning_side: str):
+        """
+        Mark all open entries for a market as WIN or LOSS and compute P&L.
+        winning_side: "YES" or "NO"
+        Call this when a market resolves.
+        """
+        resolved = 0
+        for e in self._entries:
+            if e.market_id == market_id and e.outcome == "UNKNOWN":
+                if e.side == winning_side:
+                    # WIN: receive $1 per share, paid exec_price per share
+                    e.outcome = "WIN"
+                    e.pnl = round(e.size * (1.0 - e.exec_price), 4)
+                else:
+                    # LOSS: lose the amount invested
+                    e.outcome = "LOSS"
+                    e.pnl = round(-e.size * e.exec_price, 4)
+                resolved += 1
+        if resolved:
+            self._save()
+            logger.info(f"DryRunTracker: resolved {resolved} entries for {market_id} → {winning_side} wins")
+
+    def stats(self) -> dict:
+        """Compute summary statistics over all resolved entries."""
+        resolved = [e for e in self._entries if e.outcome in ("WIN", "LOSS")]
+        total = len(self._entries)
+        n = len(resolved)
+        if n == 0:
+            return {"total": total, "resolved": 0}
+
+        wins = sum(1 for e in resolved if e.outcome == "WIN")
+        total_pnl = sum(e.pnl for e in resolved)
+        avg_edge = sum(e.edge for e in resolved) / n
+        avg_size = sum(e.size for e in resolved) / n
+
+        # Simulated Sharpe: mean_pnl / std_pnl
+        mean_pnl = total_pnl / n
+        variance = sum((e.pnl - mean_pnl) ** 2 for e in resolved) / n
+        std_pnl = variance ** 0.5
+        sharpe = mean_pnl / std_pnl if std_pnl > 1e-8 else 0.0
+
+        return {
+            "total_opportunities": total,
+            "resolved": n,
+            "win_rate": round(wins / n, 3),
+            "total_pnl": round(total_pnl, 4),
+            "avg_edge": round(avg_edge, 4),
+            "avg_size": round(avg_size, 4),
+            "sharpe": round(sharpe, 3),
+        }
+
+    def log_stats(self):
+        """Log a stats summary — call this periodically."""
+        s = self.stats()
+        if s["resolved"] == 0:
+            logger.info(
+                f"[DRY RUN STATS] {s['total']} opportunities recorded, "
+                f"0 resolved yet (markets still open)"
+            )
+        else:
+            logger.info(
+                f"[DRY RUN STATS] opportunities={s['total']} | "
+                f"resolved={s['resolved']} | win_rate={s['win_rate']:.1%} | "
+                f"P&L=${s['total_pnl']:+.4f} | avg_edge={s['avg_edge']:.3f} | "
+                f"Sharpe={s['sharpe']:.2f}"
+            )
+
+
+================================================================
+FILE: data/sentiment_analyzer.py
+================================================================
+
+"""
+Event Sentiment Analyzer (Gemini-powered)
+==========================================
+Analyzes NON-crypto event markets: politics, elections, geopolitics,
+sports, entertainment — markets where LLMs have genuine information advantage.
+
+NOT used for 5-minute crypto price markets (Gemini cannot predict short-term
+price movements better than math).
+
+Only activates when portfolio >= EVENT_SENTIMENT_MIN_BANKROLL ($100).
+Updates each market every 30 minutes in background threads.
+"""
+
+import os
+import re
+import time
+import logging
+import threading
+from dataclasses import dataclass, field
+
+try:
+    from google import genai
+except ImportError:
+    genai = None
+    logging.getLogger(__name__).warning("google-genai not installed — EventSentiment disabled")
+
+from config import EVENT_SENTIMENT_MIN_BANKROLL, EVENT_SENTIMENT_REFRESH
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class EventSentimentResult:
+    market_id: str
+    question: str
+    probability_yes: float      # 0.0–1.0 Gemini estimate
+    confidence: float           # 0.0–1.0 how confident Gemini is
+    reasoning: str
+    updated_at: float = field(default_factory=time.time)
+
+    @property
+    def age_seconds(self) -> float:
+        return time.time() - self.updated_at
+
+    @property
+    def is_fresh(self) -> bool:
+        return self.age_seconds < EVENT_SENTIMENT_REFRESH * 1.5
+
+    @property
+    def boost(self) -> float:
+        """Probability adjustment: distance from 0.5, scaled by confidence."""
+        return (self.probability_yes - 0.5) * self.confidence * 0.15
+
+
+class EventSentimentAnalyzer:
+    """
+    Uses Gemini to estimate probabilities for event/political/sports markets.
+
+    Usage:
+        analyzer.analyze_async(market_id, question, bankroll)
+        boost = analyzer.get_boost(market_id)       # instant, cached
+        prob  = analyzer.get_probability(market_id) # None if no data
+    """
+
+    def __init__(self):
+        self._cache: dict[str, EventSentimentResult] = {}
+        self._lock = threading.Lock()
+        self._running: set[str] = set()
+
+        if genai is None:
+            logger.warning("google-genai not installed — event sentiment disabled")
+            self._enabled = False
+            return
+
+        api_key = os.getenv("GEMINI_API_KEY", "")
+        if not api_key:
+            logger.warning("GEMINI_API_KEY not set — event sentiment disabled")
+            self._enabled = False
+            return
+
+        self._client = genai.Client(api_key=api_key)
+        self._enabled = True
+        self._consecutive_failures = 0
+        self._max_failures = 5
+
+        logger.info("EventSentimentAnalyzer initialized (gemini-1.5-flash, event markets only)")
+
+    def _analyze(self, market_id: str, question: str):
+        """Call Gemini for an event market. Runs in background thread."""
+        try:
+            prompt = (
+                f"You are a prediction market analyst. Estimate the probability of the following event.\n\n"
+                f"Market question: {question}\n\n"
+                f"Answer in exactly this format (two lines):\n"
+                f"PROBABILITY: 0.XX\n"
+                f"CONFIDENCE: 0.XX\n\n"
+                f"Rules:\n"
+                f"- PROBABILITY: your best estimate that the answer is YES (0.00 to 1.00)\n"
+                f"- CONFIDENCE: how confident you are in this estimate (0.00=guess, 1.00=certain)\n"
+                f"- Use only your training knowledge, no real-time data\n"
+                f"- If you have no relevant knowledge, set CONFIDENCE to 0.10\n"
+                f"- No other text"
+            )
+
+            response = self._client.models.generate_content(
+                model="gemini-1.5-flash",
+                contents=prompt,
+            )
+            text = response.text.strip()
+
+            prob_match = re.search(r"PROBABILITY:\s*(0?\.\d+|[01]\.0*)", text)
+            conf_match = re.search(r"CONFIDENCE:\s*(0?\.\d+|[01]\.0*)", text)
+
+            if not prob_match or not conf_match:
+                logger.warning(f"Gemini event response unparseable for {market_id}: {text!r}")
+                return
+
+            prob = max(0.0, min(1.0, float(prob_match.group(1))))
+            conf = max(0.0, min(1.0, float(conf_match.group(1))))
+
+            result = EventSentimentResult(
+                market_id=market_id,
+                question=question,
+                probability_yes=prob,
+                confidence=conf,
+                reasoning=f"p(YES)={prob:.2f} conf={conf:.2f} boost={((prob-0.5)*conf*0.15):+.3f}",
+            )
+            with self._lock:
+                self._cache[market_id] = result
+
+            logger.info(
+                f"EventSentiment [{market_id[:20]}...]: "
+                f"p(YES)={prob:.2f} conf={conf:.2f} → boost={result.boost:+.3f}"
+            )
+            self._consecutive_failures = 0
+
+        except Exception as e:
+            self._consecutive_failures += 1
+            if self._consecutive_failures <= self._max_failures:
+                logger.warning(f"EventSentiment failed for {market_id}: {e}")
+            if self._consecutive_failures >= self._max_failures:
+                logger.warning("EventSentiment: too many failures, disabling")
+                self._enabled = False
+        finally:
+            with self._lock:
+                self._running.discard(market_id)
+
+    def analyze_async(self, market_id: str, question: str, bankroll: float):
+        """
+        Trigger background analysis for an event market.
+        Skips if bankroll < $100, cache is fresh, or already running.
+        """
+        if not self._enabled:
+            return
+        if bankroll < EVENT_SENTIMENT_MIN_BANKROLL:
+            return  # Not active until $100
+
+        with self._lock:
+            cached = self._cache.get(market_id)
+            if cached and cached.is_fresh:
+                return
+            if market_id in self._running:
+                return
+            self._running.add(market_id)
+
+        t = threading.Thread(
+            target=self._analyze,
+            args=(market_id, question),
+            daemon=True,
+            name=f"eventsent-{market_id[:12]}",
+        )
+        t.start()
+
+    def get_boost(self, market_id: str) -> float:
+        """Cached probability boost. Returns 0.0 if no data or stale."""
+        if not self._enabled:
+            return 0.0
+        with self._lock:
+            result = self._cache.get(market_id)
+        if result and result.is_fresh:
+            return result.boost
+        return 0.0
+
+    def get_probability(self, market_id: str) -> float | None:
+        """Cached Gemini probability estimate. None if not available."""
+        with self._lock:
+            result = self._cache.get(market_id)
+        if result and result.is_fresh:
+            return result.probability_yes
+        return None
+
+    def summary(self) -> str:
+        with self._lock:
+            items = [r for r in self._cache.values() if r.is_fresh]
+        if not items:
+            return "EventSentiment: no data"
+        parts = [f"{r.market_id[:15]}={r.probability_yes:.2f}(conf={r.confidence:.1f})" for r in items]
+        return f"EventSentiment: {', '.join(parts)}"
+
+
+================================================================
+FILE: data/wallet_tracker.py
+================================================================
+
+"""
+Wallet Tracker
+==============
+Tracks top-performing wallets on Polymarket and extracts trading signals.
+
+Strategy:
+  1. Fetch leaderboard to find consistently profitable wallets
+  2. Analyze their recent activity (which tokens, which side, timing)
+  3. Compute per-wallet win rate and confidence score
+  4. For active markets: check if smart money has a position → Bayesian boost
+"""
+
+import time
+import logging
+from collections import defaultdict
+from dataclasses import dataclass, field
+
+import requests
+
+from config import DATA_API_HOST
+
+logger = logging.getLogger(__name__)
+
+# Only trust wallets with this many trades or more
+MIN_TRADES_FOR_SIGNAL = 10
+# Minimum win rate to be considered a "smart wallet"
+MIN_WIN_RATE = 0.58
+# How old (seconds) a trade can be and still count as a signal
+SIGNAL_MAX_AGE = 300  # 5 minutes
+# Cache leaderboard for this many seconds before refreshing
+LEADERBOARD_TTL = 600  # 10 minutes
+# Cache wallet activity for this many seconds
+ACTIVITY_TTL = 60  # 1 minute
+
+
+@dataclass
+class WalletStats:
+    address: str
+    total_trades: int = 0
+    winning_trades: int = 0
+    total_pnl: float = 0.0
+    recent_positions: list = field(default_factory=list)  # [{token_id, side, timestamp, size}]
+    last_updated: float = 0.0
+
+    @property
+    def win_rate(self) -> float:
+        if self.total_trades < MIN_TRADES_FOR_SIGNAL:
+            return 0.0
+        return self.winning_trades / self.total_trades
+
+    @property
+    def is_smart(self) -> bool:
+        return self.win_rate >= MIN_WIN_RATE and self.total_trades >= MIN_TRADES_FOR_SIGNAL
+
+
+@dataclass
+class WalletSignal:
+    """Signal derived from smart wallet activity for a specific token."""
+    token_id: str
+    smart_wallet_count: int      # How many smart wallets hold this position
+    dominant_side: str           # "YES" or "NO"
+    avg_win_rate: float          # Average win rate of those wallets
+    confidence_boost: float      # Value in [-0.15, +0.15] to add to Bayesian prior
+
+    @property
+    def has_signal(self) -> bool:
+        return self.smart_wallet_count > 0
+
+
+class WalletTracker:
+    """
+    Tracks profitable wallets and generates trading signals.
+    Integrates with the Bayesian model as an additional data source.
+    """
+
+    def __init__(self, host: str = DATA_API_HOST, top_n: int = 50):
+        self.host = host.rstrip("/")
+        self.top_n = top_n
+        self._session = requests.Session()
+        self._session.headers.update({"Content-Type": "application/json"})
+
+        self._wallets: dict[str, WalletStats] = {}
+        self._leaderboard_cache: list[str] = []
+        self._leaderboard_updated: float = 0.0
+
+        # token_id → list of (address, side, timestamp)
+        self._token_positions: dict[str, list] = defaultdict(list)
+
+    # ------------------------------------------------------------------
+    # Leaderboard
+    # ------------------------------------------------------------------
+    def _fetch_leaderboard(self) -> list[str]:
+        """Fetch top wallet addresses from Polymarket leaderboard."""
+        endpoints = [
+            ("https://data-api.polymarket.com/leaderboard", {"limit": self.top_n}),
+            ("https://data-api.polymarket.com/leaderboard", {"limit": self.top_n, "window": "1m"}),
+            ("https://gamma-api.polymarket.com/leaderboard", {"limit": self.top_n}),
+        ]
+        for url, params in endpoints:
+            try:
+                r = self._session.get(url, params=params, timeout=10)
+                if r.status_code != 200:
+                    continue
+                data = r.json()
+                entries = data if isinstance(data, list) else data.get("data", data.get("leaderboard", []))
+                addresses = []
+                for entry in entries:
+                    addr = (entry.get("proxyWallet") or entry.get("proxy_wallet") or
+                            entry.get("address") or entry.get("user"))
+                    if addr:
+                        addresses.append(addr)
+                if addresses:
+                    logger.info(f"WalletTracker: fetched {len(addresses)} wallets from {url}")
+                    return addresses
+            except Exception:
+                continue
+        logger.debug("WalletTracker: leaderboard not available, skipping smart wallet signals")
+        return []
+
+    def _refresh_leaderboard(self):
+        """Refresh leaderboard cache if stale."""
+        if time.time() - self._leaderboard_updated < LEADERBOARD_TTL:
+            return
+        addresses = self._fetch_leaderboard()
+        if addresses:
+            self._leaderboard_cache = addresses
+            self._leaderboard_updated = time.time()
+            # Initialize WalletStats for new wallets
+            for addr in addresses:
+                if addr not in self._wallets:
+                    self._wallets[addr] = WalletStats(address=addr)
+
+    # ------------------------------------------------------------------
+    # Activity fetching
+    # ------------------------------------------------------------------
+    def _fetch_activity(self, address: str) -> list[dict]:
+        """Fetch recent trade activity for a wallet."""
+        try:
+            r = self._session.get(
+                f"{self.host}/activity",
+                params={"user": address, "limit": 50},
+                timeout=10,
+            )
+            if r.status_code != 200:
+                return []
+            data = r.json()
+            if isinstance(data, list):
+                return data
+            return data.get("data", [])
+        except Exception as e:
+            logger.debug(f"WalletTracker: activity fetch failed for {address[:10]}...: {e}")
+            return []
+
+    def _fetch_positions(self, address: str) -> list[dict]:
+        """Fetch current open positions for a wallet."""
+        try:
+            r = self._session.get(
+                f"{self.host}/positions",
+                params={"user": address},
+                timeout=10,
+            )
+            if r.status_code != 200:
+                return []
+            data = r.json()
+            if isinstance(data, list):
+                return data
+            return data.get("data", [])
+        except Exception as e:
+            logger.debug(f"WalletTracker: positions fetch failed for {address[:10]}...: {e}")
+            return []
+
+    def _update_wallet(self, address: str):
+        """Update stats and positions for a single wallet."""
+        stats = self._wallets.get(address)
+        if not stats:
+            stats = WalletStats(address=address)
+            self._wallets[address] = stats
+
+        # Don't refresh too often
+        if time.time() - stats.last_updated < ACTIVITY_TTL:
+            return
+
+        activity = self._fetch_activity(address)
+        positions = self._fetch_positions(address)
+
+        # Compute win/loss from activity
+        wins = losses = 0
+        total_pnl = 0.0
+        for trade in activity:
+            pnl = float(trade.get("profit", trade.get("pnl", trade.get("cashPnl", 0))) or 0)
+            total_pnl += pnl
+            if pnl > 0:
+                wins += 1
+            elif pnl < 0:
+                losses += 1
+
+        if wins + losses > 0:
+            stats.total_trades = wins + losses
+            stats.winning_trades = wins
+            stats.total_pnl = total_pnl
+
+        # Extract recent positions with token IDs
+        now = time.time()
+        recent = []
+        for pos in positions:
+            token_id = (pos.get("asset") or pos.get("token_id") or
+                        pos.get("tokenId") or pos.get("conditionId"))
+            outcome = str(pos.get("outcome", pos.get("side", "")) or "").upper()
+            size = float(pos.get("size", pos.get("currentValue", 0)) or 0)
+            # Use current time as proxy if no timestamp
+            ts = float(pos.get("timestamp", pos.get("createdAt", now)) or now)
+            if token_id and size > 0:
+                side = "YES" if outcome in ("YES", "1", "TRUE") else "NO"
+                recent.append({
+                    "token_id": token_id,
+                    "side": side,
+                    "timestamp": ts,
+                    "size": size,
+                })
+
+        stats.recent_positions = recent
+        stats.last_updated = now
+
+        if stats.is_smart:
+            logger.debug(
+                f"Smart wallet {address[:10]}...: "
+                f"win_rate={stats.win_rate:.1%}, trades={stats.total_trades}, "
+                f"pnl=${stats.total_pnl:.2f}, positions={len(recent)}"
+            )
+
+    # ------------------------------------------------------------------
+    # Signal generation
+    # ------------------------------------------------------------------
+    def update(self, watched_token_ids: list[str] | None = None):
+        """
+        Refresh leaderboard and update a sample of smart wallets.
+        Call this periodically (e.g. every 60s) from the bot loop.
+        watched_token_ids: if provided, only update wallets holding these tokens.
+        """
+        self._refresh_leaderboard()
+
+        # Update top wallets (staggered to avoid rate limits)
+        for addr in self._leaderboard_cache[:self.top_n]:
+            self._update_wallet(addr)
+
+    def get_signal(self, token_id_yes: str, token_id_no: str) -> WalletSignal:
+        """
+        Return a signal for a market based on smart wallet positions.
+
+        Checks which smart wallets have recent positions in this market
+        and returns a confidence boost for the Bayesian model.
+        """
+        now = time.time()
+        yes_smart = []
+        no_smart = []
+
+        for addr, stats in self._wallets.items():
+            if not stats.is_smart:
+                continue
+            for pos in stats.recent_positions:
+                tid = pos["token_id"]
+                age = now - pos["timestamp"]
+                if age > SIGNAL_MAX_AGE:
+                    continue
+                if tid == token_id_yes:
+                    yes_smart.append(stats.win_rate)
+                elif tid == token_id_no:
+                    no_smart.append(stats.win_rate)
+
+        yes_count = len(yes_smart)
+        no_count = len(no_smart)
+
+        if yes_count == 0 and no_count == 0:
+            return WalletSignal(
+                token_id=token_id_yes,
+                smart_wallet_count=0,
+                dominant_side="",
+                avg_win_rate=0.0,
+                confidence_boost=0.0,
+            )
+
+        if yes_count >= no_count:
+            dominant = "YES"
+            avg_wr = sum(yes_smart) / yes_count if yes_smart else 0.0
+            count = yes_count
+            # Positive boost: smart money says YES
+            boost = min(0.15, count * 0.03 * avg_wr)
+        else:
+            dominant = "NO"
+            avg_wr = sum(no_smart) / no_count if no_smart else 0.0
+            count = no_count
+            # Negative boost: smart money says NO (reduces YES probability)
+            boost = -min(0.15, count * 0.03 * avg_wr)
+
+        if yes_count + no_count > 0:
+            logger.info(
+                f"WalletSignal: YES={yes_count} NO={no_count} smart wallets "
+                f"→ {dominant} boost={boost:+.3f}"
+            )
+
+        return WalletSignal(
+            token_id=token_id_yes,
+            smart_wallet_count=yes_count + no_count,
+            dominant_side=dominant,
+            avg_win_rate=avg_wr,
+            confidence_boost=boost,
+        )
+
+    def summary(self) -> str:
+        """Short summary of tracked wallets for logging."""
+        smart = [s for s in self._wallets.values() if s.is_smart]
+        return (
+            f"WalletTracker: {len(self._wallets)} tracked, "
+            f"{len(smart)} smart (≥{MIN_WIN_RATE:.0%} win rate)"
+        )
+
+
+================================================================
+FILE: models/__init__.py
+================================================================
+
+
+
+================================================================
+FILE: models/bayesian.py
+================================================================
+
+"""
+Bayesian Model
+==============
+Builds an internal estimate of the true probability of an outcome
+using Bayes' theorem: P(H|D) = P(D|H) * P(H) / P(D)
+
+Instead of blindly following the market price, the bot updates
+its own probability as new data arrives (spot price changes,
+volatility, volume, order book imbalance, reprice speed).
+"""
+
+import math
+from collections import deque
+from config import BAYESIAN_PRIOR, BAYESIAN_ALPHA, BAYESIAN_MIN_SAMPLES
+
+
+class BayesianModel:
+    def __init__(self, market_id: str, prior: float = BAYESIAN_PRIOR):
+        self.market_id = market_id
+        self.prior = prior          # P(H) - initial probability estimate
+        self.posterior = prior      # P(H|D) - updated after each data point
+        self.samples: deque = deque(maxlen=100)
+        self.update_count = 0
+
+    def update(self, data: dict) -> float:
+        """
+        Update posterior probability given new market data.
+
+        data keys:
+          - spot_return: float   # % change in underlying crypto spot price
+          - speed: float         # speed of price movement (abs change / time)
+          - volatility: float    # short-term realized volatility
+          - volume: float        # normalized trading volume
+          - ob_imbalance: float  # order book imbalance [-1, 1]
+          - reprice_speed: float # how fast nearby markets repriced [0, 1]
+        """
+        likelihood = self._compute_likelihood(data)
+        self.posterior = self._bayes_update(self.posterior, likelihood)
+        self.posterior = max(0.01, min(0.99, self.posterior))
+        self.samples.append(self.posterior)
+        self.update_count += 1
+        return self.posterior
+
+    def _compute_likelihood(self, data: dict) -> float:
+        """
+        P(D|H): probability of observing this data if H is true.
+        Each data signal pushes the likelihood above or below 0.5.
+        Returns a value in (0, 1).
+        """
+        score = 0.5  # neutral baseline
+
+        spot_return = data.get("spot_return", 0.0)
+        speed = data.get("speed", 0.0)
+        volatility = data.get("volatility", 0.0)
+        volume = data.get("volume", 0.5)
+        ob_imbalance = data.get("ob_imbalance", 0.0)
+        reprice_speed = data.get("reprice_speed", 0.0)
+
+        # Strong positive spot return → higher likelihood
+        score += 0.20 * math.tanh(spot_return * 10)
+
+        # Fast price move → stronger signal
+        score += 0.10 * math.tanh(speed * 5)
+
+        # High volatility → more uncertainty, pull toward 0.5
+        score -= 0.05 * min(volatility, 1.0)
+
+        # High volume → confirm signal direction
+        score += 0.10 * (volume - 0.5) * 2
+
+        # Order book imbalance: positive = more buy pressure
+        score += 0.15 * ob_imbalance
+
+        # Fast reprice of nearby markets → our market likely lags
+        score += 0.10 * reprice_speed
+
+        return max(0.05, min(0.95, score))
+
+    def _bayes_update(self, prior: float, likelihood: float) -> float:
+        """
+        P(H|D) = P(D|H) * P(H) / P(D)
+        P(D) = P(D|H)*P(H) + P(D|~H)*(1-P(H))
+        Uses exponential smoothing with BAYESIAN_ALPHA to avoid overreacting.
+        """
+        p_d_given_h = likelihood
+        p_d_given_not_h = 1.0 - likelihood
+        p_d = p_d_given_h * prior + p_d_given_not_h * (1.0 - prior)
+
+        if p_d < 1e-10:
+            return prior
+
+        raw_posterior = (p_d_given_h * prior) / p_d
+        # Exponential smoothing: don't jump too fast
+        smoothed = (1 - BAYESIAN_ALPHA) * prior + BAYESIAN_ALPHA * raw_posterior
+        return smoothed
+
+    @property
+    def is_ready(self) -> bool:
+        """Returns True once we have enough data points to trust the estimate."""
+        return self.update_count >= BAYESIAN_MIN_SAMPLES
+
+    @property
+    def confidence(self) -> float:
+        """Confidence: distance from 0.5, scaled to [0, 1]."""
+        return abs(self.posterior - 0.5) * 2
+
+    def reset(self, prior: float = BAYESIAN_PRIOR):
+        self.prior = prior
+        self.posterior = prior
+        self.samples.clear()
+        self.update_count = 0
+
+
+================================================================
+FILE: models/edge.py
+================================================================
+
+"""
+Edge Model
+==========
+Determines whether a detected dislocation represents a real mathematical
+advantage after all costs are taken into account.
+
+EV_net = q - p - c
+  q = internal model probability
+  p = market price
+  c = fees + spread + slippage + incomplete execution risk
+
+Only trades where EV_net > MIN_EDGE are considered.
+
+Two types of edge on Polymarket:
+  1. Within-market: p_yes + p_no < 1  →  Edge = 1 - (p_yes + p_no) - c
+  2. Between related markets: price gap covers fees + spread + exec risk
+"""
+
+from dataclasses import dataclass
+from config import (
+    MIN_EDGE, TOTAL_COST,
+    TOTAL_COST_MAKER, MIN_EDGE_MAKER,
+    TOTAL_COST_TAKER, MIN_EDGE_TAKER,
+)
+
+
+@dataclass
+class EdgeResult:
+    has_edge: bool
+    ev_net: float
+    edge_type: str      # "directional" | "within_market" | "cross_market"
+    side: str           # "YES" | "NO" | "BOTH"
+    is_passive: bool    # True = maker limit order, False = taker market order
+    description: str
+
+
+class EdgeModel:
+    def __init__(self, min_edge: float = MIN_EDGE, cost: float = TOTAL_COST):
+        self.min_edge = min_edge
+        self.cost = cost
+
+    def evaluate_directional(self, q: float, p: float) -> EdgeResult:
+        """
+        Single-market directional edge. Tries maker first (low cost),
+        falls back to taker (higher cost, requires bigger edge).
+        """
+        if q > p:
+            side = "YES"
+            ev_maker = q - p - TOTAL_COST_MAKER
+            ev_taker = q - p - TOTAL_COST_TAKER
+        elif q < p:
+            side = "NO"
+            ev_maker = p - q - TOTAL_COST_MAKER
+            ev_taker = p - q - TOTAL_COST_TAKER
+        else:
+            return EdgeResult(False, 0.0, "directional", "NONE", False,
+                              "No directional signal (q == p)")
+
+        # Prefer maker (passive) — lower cost, lower required edge
+        if ev_maker > MIN_EDGE_MAKER:
+            return EdgeResult(
+                has_edge=True, ev_net=ev_maker, edge_type="directional",
+                side=side, is_passive=True,
+                description=f"MAKER {side}: EV={ev_maker:.4f} (q={q:.3f}, p={p:.3f})"
+            )
+        if ev_taker > MIN_EDGE_TAKER:
+            return EdgeResult(
+                has_edge=True, ev_net=ev_taker, edge_type="directional",
+                side=side, is_passive=False,
+                description=f"TAKER {side}: EV={ev_taker:.4f} (q={q:.3f}, p={p:.3f})"
+            )
+        return EdgeResult(False, max(ev_maker, ev_taker), "directional", "NONE", False,
+                          f"No edge: EV_maker={ev_maker:.4f}, EV_taker={ev_taker:.4f}")
+
+    def evaluate_within_market(self, p_yes: float, p_no: float) -> EdgeResult:
+        """
+        Within-market arbitrage: buy both YES and NO if p_yes + p_no < 1.
+        Uses maker cost (both legs as limit orders).
+        """
+        total = p_yes + p_no
+        edge = 1.0 - total - TOTAL_COST_MAKER * 2  # two maker legs
+        has_edge = edge > MIN_EDGE_MAKER
+
+        return EdgeResult(
+            has_edge=has_edge,
+            ev_net=edge,
+            edge_type="within_market",
+            side="BOTH",
+            is_passive=True,
+            description=f"Within-market arb: 1-({p_yes:.3f}+{p_no:.3f})-2*{TOTAL_COST_MAKER:.3f}={edge:.4f}"
+        )
+
+    def evaluate_cross_market(
+        self,
+        p1: float,
+        p2: float,
+        market1_id: str,
+        market2_id: str,
+    ) -> EdgeResult:
+        """
+        Cross-market arbitrage between two related markets.
+        If p1 >> p2 (abnormally): sell p1, buy p2.
+        Edge = (p1 - p2) - c (need to cover both legs of the trade)
+        """
+        spread = p1 - p2
+        edge = abs(spread) - self.cost * 2  # cost applies to both legs
+        has_edge = edge > self.min_edge
+
+        if spread > 0:
+            side = f"SELL {market1_id} / BUY {market2_id}"
+        else:
+            side = f"BUY {market1_id} / SELL {market2_id}"
+
+        return EdgeResult(
+            has_edge=has_edge,
+            ev_net=edge,
+            edge_type="cross_market",
+            side=side,
+            is_passive=True,
+            description=f"Cross-market arb: |{p1:.3f}-{p2:.3f}|-2*{TOTAL_COST_MAKER:.3f}={edge:.4f}"
+        )
+
+
+================================================================
+FILE: models/kelly.py
+================================================================
+
+"""
+Kelly Position Sizing
+=====================
+Determines how much capital to allocate to each opportunity.
+
+Classic Kelly formula:
+  f* = (b * p - q) / b
+  f* = optimal fraction of capital
+  b  = payoff per unit of risk (e.g. 1/(1-price) - 1 for binary markets)
+  p  = probability of success (our model's q)
+  q  = 1 - p (probability of failure)
+
+Fractional Kelly (safer in practice):
+  f = lambda * f*    (lambda < 1, typically 0.25–0.5)
+
+The Kelly layer also accounts for:
+  - Edge size
+  - Probability of full execution
+  - Order book depth
+  - Speed at which the dislocation is closing
+  - Total capital already committed in other positions
+"""
+
+from dataclasses import dataclass
+from config import KELLY_FRACTION, KELLY_MAX_FRACTION, BANKROLL
+
+
+@dataclass
+class KellyResult:
+    f_star: float           # full Kelly fraction
+    f_kelly: float          # fractional Kelly fraction (lambda * f*)
+    position_size: float    # dollar amount to allocate
+    is_viable: bool         # True if f* > 0
+    description: str
+
+
+class KellyModel:
+    def __init__(
+        self,
+        bankroll: float = BANKROLL,
+        lambda_fraction: float = KELLY_FRACTION,
+        max_fraction: float = KELLY_MAX_FRACTION,
+    ):
+        self.bankroll = bankroll
+        self.lambda_fraction = lambda_fraction
+        self.max_fraction = max_fraction
+        self.committed_capital: float = 0.0
+
+    def compute(
+        self,
+        p_success: float,
+        market_price: float,
+        exec_probability: float = 1.0,
+        ob_depth_factor: float = 1.0,
+        dislocation_speed: float = 1.0,
+    ) -> KellyResult:
+        """
+        Compute optimal position size.
+
+        p_success        : model's estimated probability of winning
+        market_price     : current market price (0–1)
+        exec_probability : probability that both legs fill fully [0,1]
+        ob_depth_factor  : how deep the order book is relative to our size [0,1]
+        dislocation_speed: how fast the spread is closing (1=fast, 0=slow) [0,1]
+        """
+        p = p_success
+        q_fail = 1.0 - p
+
+        # Payoff ratio for binary market: win (1 - price) per unit, risk price per unit
+        # b = (1 - market_price) / market_price   (simplified)
+        if market_price <= 0.01 or market_price >= 0.99:
+            return KellyResult(0.0, 0.0, 0.0, False, "Market price out of range")
+
+        b = (1.0 - market_price) / market_price
+
+        # Full Kelly
+        f_star = (b * p - q_fail) / b
+
+        if f_star <= 0:
+            return KellyResult(
+                f_star=f_star,
+                f_kelly=0.0,
+                position_size=0.0,
+                is_viable=False,
+                description=f"Negative Kelly f*={f_star:.4f}: no edge after costs"
+            )
+
+        # Fractional Kelly
+        f_kelly = self.lambda_fraction * f_star
+
+        # Adjust for execution risk and liquidity
+        f_adjusted = f_kelly * exec_probability * ob_depth_factor
+
+        # If spread closing fast, reduce size (less time to complete structure)
+        if dislocation_speed > 0.8:
+            f_adjusted *= 0.7
+
+        # Cap at max fraction
+        f_final = min(f_adjusted, self.max_fraction)
+
+        # Available capital (subtract already committed)
+        available = max(0.0, self.bankroll - self.committed_capital)
+        position_size = f_final * available
+
+        return KellyResult(
+            f_star=f_star,
+            f_kelly=f_final,
+            position_size=round(position_size, 2),
+            is_viable=True,
+            description=(
+                f"f*={f_star:.4f}, λ={self.lambda_fraction}, "
+                f"f_adj={f_adjusted:.4f} → ${position_size:.2f} "
+                f"(exec_prob={exec_probability:.2f}, ob={ob_depth_factor:.2f})"
+            )
+        )
+
+    def allocate(self, amount: float):
+        """Mark capital as committed to an open position."""
+        self.committed_capital += amount
+        self.committed_capital = min(self.committed_capital, self.bankroll)
+
+    def release(self, amount: float):
+        """Release capital from a closed position."""
+        self.committed_capital = max(0.0, self.committed_capital - amount)
+
+    def update_bankroll(self, pnl: float):
+        """Update bankroll after a trade result."""
+        self.bankroll = max(0.0, self.bankroll + pnl)
+
+    @property
+    def available_capital(self) -> float:
+        return max(0.0, self.bankroll - self.committed_capital)
+
+    @property
+    def utilization(self) -> float:
+        if self.bankroll <= 0:
+            return 1.0
+        return self.committed_capital / self.bankroll
+
+
+================================================================
+FILE: models/monte_carlo.py
+================================================================
+
+"""
+Monte Carlo Simulation
+======================
+Tests whether the overall system is viable in a real market.
+
+Capital dynamics: W(t+1) = W(t) * (1 + r(t))
+  W(t)  = capital at time t
+  r(t)  = return of a trade or trade sequence
+
+Maximum drawdown: DD = max((Peak(t) - W(t)) / Peak(t))
+
+The simulation injects realistic market friction:
+  - Different fill rates (partial fills)
+  - Different levels of slippage
+  - Random execution delays
+  - Different percentages of incomplete structures
+  - Probability estimation errors
+  - Clusters of consecutive unsuccessful trades
+
+Returns: expected growth, possible drawdown, and robustness metrics.
+"""
+
+import random
+import math
+from dataclasses import dataclass
+from config import MC_SIMULATIONS, MC_TRADES, MC_MAX_DD_LIMIT
+
+
+@dataclass
+class MonteCarloResult:
+    median_final_capital: float
+    p5_final_capital: float
+    p25_final_capital: float
+    p75_final_capital: float
+    p95_final_capital: float
+    median_max_drawdown: float
+    p95_max_drawdown: float
+    survival_rate: float        # fraction of paths that did not blow up
+    expected_growth_pct: float  # median growth as %
+    is_viable: bool
+    description: str
+
+
+class MonteCarloSimulator:
+    def __init__(
+        self,
+        n_simulations: int = MC_SIMULATIONS,
+        n_trades: int = MC_TRADES,
+        max_dd_limit: float = MC_MAX_DD_LIMIT,
+        initial_capital: float = 100.0,
+    ):
+        self.n_simulations = n_simulations
+        self.n_trades = n_trades
+        self.max_dd_limit = max_dd_limit
+        self.initial_capital = initial_capital
+
+    def run(
+        self,
+        base_ev: float,
+        base_win_rate: float,
+        avg_position_fraction: float,
+        partial_fill_rate: float = 0.85,
+        slippage_std: float = 0.005,
+        incomplete_structure_rate: float = 0.10,
+        estimation_error_std: float = 0.02,
+        cluster_prob: float = 0.05,
+        cluster_length: int = 5,
+    ) -> MonteCarloResult:
+        """
+        Run Monte Carlo simulation.
+
+        base_ev              : expected value per trade (e.g. 0.03 = 3%)
+        base_win_rate        : probability of winning a trade
+        avg_position_fraction: fraction of capital per trade
+        partial_fill_rate    : probability that the structure fills completely
+        slippage_std         : std of random slippage per trade
+        incomplete_structure_rate: fraction of trades where only 1 leg fills
+        estimation_error_std : noise in probability estimation
+        cluster_prob         : probability of entering a losing cluster
+        cluster_length       : number of consecutive losses in a cluster
+        """
+        final_capitals = []
+        max_drawdowns = []
+        survivals = 0
+
+        for _ in range(self.n_simulations):
+            capital = self.initial_capital
+            peak = capital
+            max_dd = 0.0
+            in_cluster = False
+            cluster_remaining = 0
+
+            for _ in range(self.n_trades):
+                if capital <= 0:
+                    break
+
+                # Determine if we're in a losing cluster
+                if not in_cluster and random.random() < cluster_prob:
+                    in_cluster = True
+                    cluster_remaining = cluster_length
+
+                # Adjust win probability
+                if in_cluster:
+                    win_prob = base_win_rate * 0.3
+                    cluster_remaining -= 1
+                    if cluster_remaining <= 0:
+                        in_cluster = False
+                else:
+                    # Add estimation error
+                    noise = random.gauss(0, estimation_error_std)
+                    win_prob = max(0.0, min(1.0, base_win_rate + noise))
+
+                # Determine position size (fraction of current capital)
+                f = avg_position_fraction * random.uniform(0.8, 1.2)
+                f = min(f, 0.5)  # cap at 50%
+                position = capital * f
+
+                # Fill rate (partial fills)
+                fill = 1.0 if random.random() < partial_fill_rate else random.uniform(0.3, 0.7)
+
+                # Incomplete structure (only 1 leg fills = directional risk)
+                if random.random() < incomplete_structure_rate:
+                    # Only half the hedge fills → higher variance
+                    fill *= 0.5
+                    effective_ev = base_ev * 0.3  # much lower effective edge
+                else:
+                    effective_ev = base_ev
+
+                # Slippage
+                slippage = abs(random.gauss(0, slippage_std))
+
+                # Trade outcome
+                if random.random() < win_prob:
+                    r = effective_ev - slippage
+                else:
+                    r = -(effective_ev + slippage) * 1.5  # losses tend to be larger
+
+                # Apply return to filled portion
+                capital_change = position * fill * r
+                capital = capital * (1.0 + f * fill * r)
+                capital = max(0.0, capital)
+
+                # Track drawdown
+                if capital > peak:
+                    peak = capital
+                if peak > 0:
+                    dd = (peak - capital) / peak
+                    max_dd = max(max_dd, dd)
+
+            final_capitals.append(capital)
+            max_drawdowns.append(max_dd)
+            if capital > 0 and max_dd < self.max_dd_limit:
+                survivals += 1
+
+        final_capitals.sort()
+        max_drawdowns.sort()
+
+        n = len(final_capitals)
+        p5 = final_capitals[int(0.05 * n)]
+        p25 = final_capitals[int(0.25 * n)]
+        median = final_capitals[int(0.50 * n)]
+        p75 = final_capitals[int(0.75 * n)]
+        p95 = final_capitals[int(0.95 * n)]
+
+        median_dd = max_drawdowns[int(0.50 * n)]
+        p95_dd = max_drawdowns[int(0.95 * n)]
+
+        survival_rate = survivals / self.n_simulations
+        growth_pct = (median / self.initial_capital - 1.0) * 100
+
+        is_viable = survival_rate > 0.5 and p25 > self.initial_capital * 0.7
+
+        description = (
+            f"Survival rate: {survival_rate:.1%}, "
+            f"Median growth: {growth_pct:+.1f}%, "
+            f"Median max DD: {median_dd:.1%}, "
+            f"P95 max DD: {p95_dd:.1%}, "
+            f"Viable: {is_viable}"
+        )
+
+        return MonteCarloResult(
+            median_final_capital=median,
+            p5_final_capital=p5,
+            p25_final_capital=p25,
+            p75_final_capital=p75,
+            p95_final_capital=p95,
+            median_max_drawdown=median_dd,
+            p95_max_drawdown=p95_dd,
+            survival_rate=survival_rate,
+            expected_growth_pct=growth_pct,
+            is_viable=is_viable,
+            description=description,
+        )
+
+    def validate_strategy(
+        self,
+        ev: float,
+        win_rate: float,
+        position_fraction: float,
+    ) -> bool:
+        """Quick check: run simulation and return True if strategy is viable."""
+        result = self.run(
+            base_ev=ev,
+            base_win_rate=win_rate,
+            avg_position_fraction=position_fraction,
+        )
+        return result.is_viable
+
+
+================================================================
+FILE: models/spread.py
+================================================================
+
+"""
+Spread Model
+============
+Identifies cross-market dislocations: situations where two related
+markets temporarily diverge more than they should.
+
+S = P1 - P2
+z = (S - mu_S) / sigma_S
+
+If |z| > SPREAD_ZSCORE_THRESHOLD, the bot flags an arbitrage opportunity.
+
+The bot maintains a map of related markets:
+  - BTC 5m vs BTC 15m
+  - Current BTC 5m window vs next BTC 5m window
+  - One market vs a synthetic combination of related probabilities
+"""
+
+from collections import deque
+from dataclasses import dataclass
+import statistics
+from config import SPREAD_ZSCORE_THRESHOLD, SPREAD_LOOKBACK
+
+
+@dataclass
+class SpreadSignal:
+    market1_id: str
+    market2_id: str
+    spread: float           # S = P1 - P2
+    z_score: float          # z = (S - mu_S) / sigma_S
+    mu_s: float             # historical mean spread
+    sigma_s: float          # historical std of spread
+    is_signal: bool         # |z| > threshold
+    direction: str          # "market1_overpriced" | "market2_overpriced" | "neutral"
+
+
+class SpreadModel:
+    def __init__(
+        self,
+        market1_id: str,
+        market2_id: str,
+        lookback: int = SPREAD_LOOKBACK,
+        z_threshold: float = SPREAD_ZSCORE_THRESHOLD,
+    ):
+        self.market1_id = market1_id
+        self.market2_id = market2_id
+        self.lookback = lookback
+        self.z_threshold = z_threshold
+        self._history: deque = deque(maxlen=lookback)
+
+    def update(self, p1: float, p2: float) -> SpreadSignal:
+        """
+        Update spread history and return the current signal.
+        """
+        s = p1 - p2
+        self._history.append(s)
+
+        if len(self._history) < 3:
+            return SpreadSignal(
+                market1_id=self.market1_id,
+                market2_id=self.market2_id,
+                spread=s,
+                z_score=0.0,
+                mu_s=s,
+                sigma_s=0.0,
+                is_signal=False,
+                direction="neutral",
+            )
+
+        mu_s = statistics.mean(self._history)
+        sigma_s = statistics.stdev(self._history)
+
+        if sigma_s < 1e-8:
+            z = 0.0
+        else:
+            z = (s - mu_s) / sigma_s
+
+        is_signal = abs(z) > self.z_threshold
+
+        if is_signal and z > 0:
+            direction = "market1_overpriced"
+        elif is_signal and z < 0:
+            direction = "market2_overpriced"
+        else:
+            direction = "neutral"
+
+        return SpreadSignal(
+            market1_id=self.market1_id,
+            market2_id=self.market2_id,
+            spread=s,
+            z_score=z,
+            mu_s=mu_s,
+            sigma_s=sigma_s,
+            is_signal=is_signal,
+            direction=direction,
+        )
+
+    @property
+    def is_ready(self) -> bool:
+        return len(self._history) >= self.lookback // 2
+
+    def mean_spread(self) -> float:
+        if not self._history:
+            return 0.0
+        return statistics.mean(self._history)
+
+    def std_spread(self) -> float:
+        if len(self._history) < 2:
+            return 0.0
+        return statistics.stdev(self._history)
+
+
+class SpreadMap:
+    """
+    Manages a collection of related market pairs and detects
+    which pairs currently have abnormal spreads.
+    """
+
+    def __init__(self):
+        self._models: dict[tuple, SpreadModel] = {}
+
+    def register_pair(
+        self,
+        market1_id: str,
+        market2_id: str,
+        lookback: int = SPREAD_LOOKBACK,
+        z_threshold: float = SPREAD_ZSCORE_THRESHOLD,
+    ):
+        key = (market1_id, market2_id)
+        if key not in self._models:
+            self._models[key] = SpreadModel(market1_id, market2_id, lookback, z_threshold)
+
+    def update_pair(self, market1_id: str, market2_id: str, p1: float, p2: float) -> SpreadSignal:
+        key = (market1_id, market2_id)
+        if key not in self._models:
+            self.register_pair(market1_id, market2_id)
+        return self._models[key].update(p1, p2)
+
+    def get_signals(self) -> list[SpreadSignal]:
+        """Return all pairs currently showing an arbitrage signal."""
+        signals = []
+        for model in self._models.values():
+            if model.is_ready:
+                # Re-use last computed signal via dummy update is not ideal;
+                # caller should call update_pair and collect signals live.
+                pass
+        return signals
+
+    def all_pairs(self) -> list[tuple]:
+        return list(self._models.keys())
+
+
+================================================================
+FILE: models/stoikov.py
+================================================================
+
+"""
+Stoikov Execution Model
+=======================
+Used for quality execution of an arbitrage structure.
+
+The key reservation price formula:
+  r = s - q * gamma * sigma^2 * (T - t)
+
+  r     = internal quoting price (adjusted bid/ask)
+  s     = mid price
+  q     = current inventory (signed: positive = long, negative = short)
+  gamma = risk aversion coefficient
+  sigma^2 = variance of the market price
+  (T-t) = remaining time until market closes
+
+The larger the inventory imbalance and the higher the risk,
+the more the bot adjusts its execution price.
+
+The Stoikov layer:
+  - Does not keep mechanically increasing the accumulated side
+  - More actively completes the missing part of the structure
+  - Repositions limit orders based on current inventory imbalance
+  - Decides when to remain passive vs switch to aggressive execution
+"""
+
+from dataclasses import dataclass
+from config import STOIKOV_GAMMA, STOIKOV_SIGMA_DEFAULT
+
+
+@dataclass
+class StoikovQuote:
+    reservation_price: float   # r = s - q*gamma*sigma^2*(T-t)
+    bid: float                 # reservation_price - half_spread
+    ask: float                 # reservation_price + half_spread
+    half_spread: float
+    is_aggressive: bool        # True = use market order, False = limit order
+    action: str                # human-readable recommendation
+
+
+class StoikovModel:
+    def __init__(
+        self,
+        gamma: float = STOIKOV_GAMMA,
+        sigma: float = STOIKOV_SIGMA_DEFAULT,
+    ):
+        self.gamma = gamma
+        self.sigma = sigma
+        self.inventory: float = 0.0        # current net position (signed)
+        self.target_inventory: float = 0.0  # desired net position
+
+    def quote(
+        self,
+        mid_price: float,
+        remaining_time: float,
+        sigma: float | None = None,
+    ) -> StoikovQuote:
+        """
+        Compute reservation price and optimal quotes.
+
+        mid_price      : current mid price of the market (0 to 1)
+        remaining_time : (T - t) in minutes, normalized to [0, 1]
+        sigma          : variance override (uses default if None)
+        """
+        s = mid_price
+        q = self.inventory
+        gamma = self.gamma
+        sigma2 = (sigma if sigma is not None else self.sigma) ** 2
+
+        # Reservation price: penalize for holding inventory
+        r = s - q * gamma * sigma2 * remaining_time
+        r = max(0.01, min(0.99, r))
+
+        # Optimal half-spread (simplified Stoikov formula)
+        half_spread = gamma * sigma2 * remaining_time / 2.0
+        half_spread = max(0.005, half_spread)  # minimum 0.5% spread
+
+        bid = max(0.01, r - half_spread)
+        ask = min(0.99, r + half_spread)
+
+        # Decide passive vs aggressive based on inventory imbalance
+        inventory_imbalance = abs(q - self.target_inventory)
+        is_aggressive = inventory_imbalance > 0.5 or remaining_time < 0.1
+
+        if is_aggressive:
+            action = (
+                f"AGGRESSIVE: inventory imbalance={inventory_imbalance:.2f}, "
+                f"remaining_time={remaining_time:.2f} → use market order at {r:.4f}"
+            )
+        else:
+            action = (
+                f"PASSIVE: post bid={bid:.4f}, ask={ask:.4f} "
+                f"(reservation={r:.4f}, half_spread={half_spread:.4f})"
+            )
+
+        return StoikovQuote(
+            reservation_price=r,
+            bid=bid,
+            ask=ask,
+            half_spread=half_spread,
+            is_aggressive=is_aggressive,
+            action=action,
+        )
+
+    def update_inventory(self, filled_qty: float, side: str):
+        """
+        side: "YES" = +qty, "NO" = -qty
+        """
+        if side == "YES":
+            self.inventory += filled_qty
+        else:
+            self.inventory -= filled_qty
+
+    def set_target(self, target: float):
+        """Set the desired net inventory (e.g. 0 for delta-neutral)."""
+        self.target_inventory = target
+
+    def inventory_risk(self, sigma: float | None = None, remaining_time: float = 1.0) -> float:
+        """
+        Estimate current inventory risk exposure.
+        Higher value = more urgent to rebalance.
+        """
+        sigma2 = (sigma if sigma is not None else self.sigma) ** 2
+        return abs(self.inventory) * self.gamma * sigma2 * remaining_time
+
+    def reposition_needed(self, threshold: float = 0.3) -> bool:
+        return abs(self.inventory - self.target_inventory) > threshold
+
+
+================================================================
+FILE: trading/__init__.py
+================================================================
+
+
+
+================================================================
+FILE: trading/bot.py
+================================================================
+
+"""
+Main Bot Orchestration
+======================
+Ties all 6 models together in a single trading loop:
+
+1. Bayesian  → estimates true probability q for each market
+2. Edge      → checks EV_net = q - p - c > MIN_EDGE
+3. Spread    → detects cross-market dislocations via z-score
+4. Stoikov   → computes optimal execution price and passive/aggressive mode
+5. Kelly     → sizes the position based on edge and execution probability
+6. MonteCarlo→ (runs offline / periodically) validates the strategy
+
+Growth strategy: $5.27 → $100 → $1,000 → $10,000
+  - Start aggressive (Kelly λ=0.50, MIN_EDGE=2%) to compound fast
+  - Automatically reduce aggressiveness as bankroll grows
+  - Bankroll is persisted to disk between restarts
+"""
+
+import json
+import os
+import time
+import logging
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from models.bayesian import BayesianModel
+from models.edge import EdgeModel, EdgeResult
+from models.spread import SpreadMap, SpreadSignal
+from models.stoikov import StoikovModel, StoikovQuote
+from models.kelly import KellyModel, KellyResult
+from models.monte_carlo import MonteCarloSimulator
+
+from data.price_feed import PriceFeed
+from data.market_data import PolymarketDataClient, GammaClient
+from data.wallet_tracker import WalletTracker
+from data.sentiment_analyzer import EventSentimentAnalyzer
+from data.dry_run_tracker import DryRunTracker
+from trading.order_executor import OrderExecutor
+
+from config import (
+    POLL_INTERVAL_SECONDS,
+    RELATED_MARKETS,
+    BANKROLL,
+    MIN_EDGE,
+    TOTAL_COST,
+    CRYPTO_SYMBOLS,
+    POLYMARKET_ASSETS,
+    GROWTH_TIERS,
+    BANKROLL_STATE_FILE,
+)
+
+TRADES_FILE = Path(__file__).parent.parent / "trades.json"
+
+
+logger = logging.getLogger("polymarket_bot.bot")
+
+
+@dataclass
+class MarketState:
+    market_id: str
+    token_id_yes: str
+    token_id_no: str
+    asset: str              # "BTC", "ETH", etc. or "EVENT"
+    timeframe: str          # "5m", "15m", "event"
+    bayesian: BayesianModel = field(default_factory=BayesianModel)
+    stoikov: StoikovModel = field(default_factory=StoikovModel)
+    last_price: float = 0.5
+    last_price_no: float = 0.5
+    end_time: float = 0.0   # Unix timestamp when market closes (0 = unknown)
+    gamma_price_yes: float | None = None  # Fallback price from Gamma API
+    gamma_price_no: float | None = None
+    question: str = ""      # Market question text (for event markets)
+    is_event: bool = False  # True for politics/sports/etc. markets
+
+
+@dataclass
+class TradeOpportunity:
+    market_id: str
+    edge_result: EdgeResult
+    spread_signal: SpreadSignal | None
+    stoikov_quote: StoikovQuote
+    kelly_result: KellyResult
+    q: float = 0.0      # Bayesian probability estimate
+    timestamp: float = field(default_factory=time.time)
+
+
+def _get_tier(bankroll: float) -> tuple:
+    """Return (kelly_lambda, min_edge) for the current bankroll tier."""
+    for min_bal, max_bal, kelly_lambda, min_edge in GROWTH_TIERS:
+        if min_bal <= bankroll < max_bal:
+            return kelly_lambda, min_edge
+    return GROWTH_TIERS[-1][2], GROWTH_TIERS[-1][3]
+
+
+class ArbitrageBot:
+    def __init__(self, dry_run: bool = False):
+        self.dry_run = dry_run
+        self.data_client = PolymarketDataClient()
+        self.price_feed = PriceFeed()
+        self.edge_model = EdgeModel()
+        self.spread_map = SpreadMap()
+
+        # Load persisted bankroll or use config default
+        starting_bankroll = self._load_bankroll()
+        kelly_lambda, self._current_min_edge = _get_tier(starting_bankroll)
+        logger.info(
+            f"Starting bankroll: ${starting_bankroll:.2f} | "
+            f"Tier: Kelly λ={kelly_lambda:.2f}, MIN_EDGE={self._current_min_edge:.1%}"
+        )
+
+        self.kelly = KellyModel(bankroll=starting_bankroll, lambda_fraction=kelly_lambda)
+        self.mc = MonteCarloSimulator()
+        self.executor = None if dry_run else OrderExecutor()
+
+        self.wallet_tracker = WalletTracker()
+        self._last_wallet_update = 0.0
+        self.event_sentiment = EventSentimentAnalyzer()
+
+        self._markets: dict[str, MarketState] = {}
+        self._running = False
+        self._last_price_fetch = 0.0
+        self._last_prices: dict[str, float] = {}
+        self._last_heartbeat = 0.0
+        self._last_market_refresh = 0.0
+        self._last_stats_log = 0.0
+        self._tick_count = 0
+        self.dry_run_tracker = DryRunTracker()
+        self._MARKET_REFRESH_INTERVAL = 30  # re-discover markets every 30s
+        self._MARKET_WINDOW_MIN = 90        # skip if <90s remaining
+        self._MARKET_WINDOW_MAX = 360       # skip if >6min remaining (not open yet)
+
+        # Register known related pairs
+        for m1, m2 in RELATED_MARKETS:
+            self.spread_map.register_pair(m1, m2)
+
+        self._mc_validated = False
+
+    # ------------------------------------------------------------------
+    # Bankroll persistence
+    # ------------------------------------------------------------------
+    def _load_bankroll(self) -> float:
+        if os.path.exists(BANKROLL_STATE_FILE):
+            try:
+                with open(BANKROLL_STATE_FILE) as f:
+                    data = json.load(f)
+                    br = float(data.get("bankroll", BANKROLL))
+                    logger.info(f"Loaded bankroll from state file: ${br:.2f}")
+                    return br
+            except Exception as e:
+                logger.warning(f"Could not load bankroll state: {e}")
+        return BANKROLL
+
+    def _save_bankroll(self):
+        try:
+            with open(BANKROLL_STATE_FILE, "w") as f:
+                json.dump({"bankroll": round(self.kelly.bankroll, 4)}, f)
+        except Exception as e:
+            logger.warning(f"Could not save bankroll state: {e}")
+
+    # ------------------------------------------------------------------
+    # Dynamic tier adjustment
+    # ------------------------------------------------------------------
+    def _apply_growth_tier(self):
+        """Adjust Kelly lambda and MIN_EDGE based on current bankroll."""
+        kelly_lambda, min_edge = _get_tier(self.kelly.bankroll)
+        changed = False
+        if abs(kelly_lambda - self.kelly.lambda_fraction) > 0.001:
+            self.kelly.lambda_fraction = kelly_lambda
+            changed = True
+        if abs(min_edge - self._current_min_edge) > 0.0001:
+            self._current_min_edge = min_edge
+            self.edge_model.min_edge = min_edge
+            changed = True
+        if changed:
+            logger.info(
+                f"TIER CHANGE | Bankroll=${self.kelly.bankroll:.2f} | "
+                f"Kelly λ={kelly_lambda:.2f} | MIN_EDGE={min_edge:.1%}"
+            )
+
+    # ------------------------------------------------------------------
+    # Monte Carlo validation
+    # ------------------------------------------------------------------
+    def validate_with_monte_carlo(self) -> bool:
+        logger.info("Running Monte Carlo validation...")
+        result = self.mc.run(
+            base_ev=self._current_min_edge,
+            base_win_rate=0.55,
+            avg_position_fraction=self.kelly.lambda_fraction,
+        )
+        logger.info(f"Monte Carlo result: {result.description}")
+        self._mc_validated = result.is_viable
+        return result.is_viable
+
+    def register_market(
+        self,
+        market_id: str,
+        token_id_yes: str,
+        token_id_no: str,
+        asset: str,
+        timeframe: str,
+        end_time: float = 0.0,
+        gamma_price_yes: float | None = None,
+        gamma_price_no: float | None = None,
+    ):
+        state = MarketState(
+            market_id=market_id,
+            token_id_yes=token_id_yes,
+            token_id_no=token_id_no,
+            asset=asset,
+            timeframe=timeframe,
+            bayesian=BayesianModel(market_id),
+            stoikov=StoikovModel(),
+            end_time=end_time,
+            gamma_price_yes=gamma_price_yes,
+            gamma_price_no=gamma_price_no,
+        )
+        # Auto-register spread pairs: any two markets with the same asset
+        for existing_id, existing in self._markets.items():
+            if existing.asset == asset:
+                self.spread_map.register_pair(existing_id, market_id)
+                logger.info(f"Spread pair registered: {existing_id} <-> {market_id}")
+        self._markets[market_id] = state
+        logger.info(f"Registered market: {market_id} ({asset} {timeframe})")
+
+    @staticmethod
+    def _extract_tokens(m: dict) -> tuple[str | None, str | None]:
+        """
+        Extract YES and NO token IDs from a market dict.
+        Handles multiple Gamma/CLOB API response formats including
+        cases where list fields are returned as JSON strings.
+        """
+        import json as _json
+
+        def _parse_list(val):
+            """Parse value to list – handles both actual lists and JSON strings."""
+            if isinstance(val, list):
+                return val
+            if isinstance(val, str):
+                try:
+                    parsed = _json.loads(val)
+                    if isinstance(parsed, list):
+                        return parsed
+                except Exception:
+                    pass
+            return []
+
+        # Outcomes that map to YES (Up/High side)
+        YES_OUTCOMES = {"YES", "1", "UP", "HOCH", "HIGH", "OVER", "ABOVE", "TRUE"}
+        # Outcomes that map to NO (Down/Low side)
+        NO_OUTCOMES = {"NO", "0", "DOWN", "RUNTER", "LOW", "UNDER", "BELOW", "FALSE"}
+
+        # Format 1: tokens list with outcome field (CLOB/Gamma format)
+        # Gamma uses camelCase "tokenId"; CLOB uses snake_case "token_id"
+        tokens = _parse_list(m.get("tokens", []))
+        if tokens and isinstance(tokens[0], dict):
+            def _tid(t):
+                return t.get("token_id") or t.get("tokenId")
+
+            yes = next((_tid(t) for t in tokens
+                        if t.get("outcome", "").upper() in YES_OUTCOMES), None)
+            no = next((_tid(t) for t in tokens
+                       if t.get("outcome", "").upper() in NO_OUTCOMES), None)
+            if yes and no:
+                return yes, no
+
+            # Gamma tokens may have no "outcome" field — use positional (first=YES, second=NO)
+            if len(tokens) >= 2 and _tid(tokens[0]) and _tid(tokens[1]):
+                return _tid(tokens[0]), _tid(tokens[1])
+
+        # Format 2: clobTokenIds list + outcomes list (Gamma format)
+        # NOTE: Gamma often returns these as JSON strings, not real lists!
+        clob_ids = _parse_list(m.get("clobTokenIds", []))
+        outcomes = _parse_list(m.get("outcomes", []))
+        if clob_ids and len(clob_ids) >= 2:
+            if outcomes and len(outcomes) >= 2:
+                yes = no = None
+                for i, outcome in enumerate(outcomes):
+                    if str(outcome).upper() in YES_OUTCOMES and i < len(clob_ids):
+                        yes = clob_ids[i]
+                    elif str(outcome).upper() in NO_OUTCOMES and i < len(clob_ids):
+                        no = clob_ids[i]
+                if yes and no:
+                    return yes, no
+            # Fallback: first = YES, second = NO
+            return str(clob_ids[0]), str(clob_ids[1])
+
+        # Format 3: token_id_yes / token_id_no directly
+        yes = m.get("token_id_yes") or m.get("tokenIdYes")
+        no = m.get("token_id_no") or m.get("tokenIdNo")
+        if yes and no:
+            return str(yes), str(no)
+
+        return None, None
+
+    def auto_discover_markets(self):
+        """
+        Fetch active crypto markets via CLOB API (primary) with Gamma as fallback.
+        CLOB indexes live 5-minute markets directly; Gamma often misses them.
+        Handles multiple CLOB/Gamma API response formats robustly.
+        """
+        import datetime
+        gamma = GammaClient()
+        assets = POLYMARKET_ASSETS  # BTC, ETH, SOL, XRP, DOGE, BNB, HYPE
+        registered = 0
+
+        for asset in assets:
+            logger.info(f"Discovering {asset} markets via CLOB API (primary)...")
+            markets = self.data_client.find_crypto_5min_markets(asset)
+            if not markets:
+                logger.info(f"CLOB empty, falling back to Gamma for {asset}...")
+                markets = gamma.find_crypto_markets(asset)
+            if not markets:
+                logger.warning(f"No 5-min markets found for {asset} — skipping")
+                continue
+
+            logger.debug(f"{asset}: {len(markets)} candidates, first keys: {list(markets[0].keys())}")
+
+            registered_for_asset = 0
+            for m in markets:
+                if registered_for_asset >= 3:  # max 3 per asset
+                    break
+
+                # Condition ID from various field names
+                condition_id = (m.get("conditionId") or m.get("condition_id") or
+                                m.get("id") or "unknown")
+
+                # Extract token IDs from Gamma response (tokenId field)
+                # Do NOT call CLOB /markets/{id} — it returns 404 for Gamma condition IDs
+                yes_token, no_token = self._extract_tokens(m)
+
+                if not yes_token or not no_token:
+                    logger.warning(
+                        f"{asset}: Could not extract tokens from market. "
+                        f"Keys available: {list(m.keys())}"
+                    )
+                    continue
+                market_id = f"{asset}_5m_{str(condition_id)[:8]}"
+
+                # End time — ignore clearly invalid dates (more than a day in the past)
+                end_time = 0.0
+                now_ts = time.time()
+                end_date = (m.get("endDate") or m.get("end_date_iso") or
+                            m.get("closeTime") or m.get("close_time") or
+                            m.get("expirationTime") or m.get("expiration"))
+                if end_date:
+                    try:
+                        dt = datetime.datetime.fromisoformat(str(end_date).replace("Z", "+00:00"))
+                        ts = dt.timestamp()
+                        if ts > now_ts - 86400:  # only accept if not more than 1 day in the past
+                            end_time = ts
+                    except Exception:
+                        pass
+
+                # Skip already-expired markets
+                if end_time > 0 and end_time < now_ts:
+                    continue
+
+                # Extract Gamma prices as CLOB fallback
+                gamma_price_yes, gamma_price_no = None, None
+                import json as _json
+                raw_prices = m.get("outcomePrices", [])
+                if isinstance(raw_prices, str):
+                    try:
+                        raw_prices = _json.loads(raw_prices)
+                    except Exception:
+                        raw_prices = []
+                if isinstance(raw_prices, list) and len(raw_prices) >= 2:
+                    try:
+                        gamma_price_yes = float(raw_prices[0])
+                        gamma_price_no = float(raw_prices[1])
+                    except Exception:
+                        pass
+
+                # Skip markets where Gamma prices are near 0 or 1 — already resolved
+                if gamma_price_yes is not None and not (0.05 <= gamma_price_yes <= 0.95):
+                    logger.debug(f"{asset}: skipping resolved market (p_yes={gamma_price_yes:.3f})")
+                    continue
+
+                self.register_market(
+                    market_id=market_id,
+                    token_id_yes=yes_token,
+                    token_id_no=no_token,
+                    asset=asset,
+                    timeframe="5m",
+                    end_time=end_time,
+                    gamma_price_yes=gamma_price_yes,
+                    gamma_price_no=gamma_price_no,
+                )
+                registered += 1
+                registered_for_asset += 1
+
+        logger.info(f"Auto-discovery complete: {registered} crypto markets registered")
+
+        # --- Discover event markets (politics, geopolitics, sports) ---
+        event_count = self._discover_event_markets(gamma)
+        logger.info(f"Event markets discovered: {event_count}")
+
+        # Reset refresh timer so the first tick doesn't immediately re-run discovery
+        self._last_market_refresh = time.time()
+
+        return registered + event_count
+
+    def _discover_event_markets(self, gamma: GammaClient) -> int:
+        """
+        Fetch top active non-crypto event markets (politics, elections, sports).
+        Registered with is_event=True for Gemini sentiment analysis (active >= $100).
+        """
+        from config import EVENT_MARKET_TAGS
+        registered = 0
+        try:
+            # Search for active event markets via Gamma
+            import requests as _req
+            from config import GAMMA_API_HOST
+            resp = _req.get(
+                f"{GAMMA_API_HOST}/markets",
+                params={
+                    "active": "true",
+                    "closed": "false",
+                    "limit": 50,
+                    "order": "volume",
+                    "ascending": "false",
+                },
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                return 0
+            markets = resp.json() if isinstance(resp.json(), list) else resp.json().get("markets", [])
+
+            for m in markets:
+                question = m.get("question", "")
+                tags = [str(t).lower() for t in (m.get("tags") or [])]
+                # Skip crypto markets (already handled above)
+                if any(a.lower() in question.lower() for a in ["BTC", "ETH", "SOL", "XRP", "DOGE", "BNB", "HYPE",
+                                                                 "Bitcoin", "Ethereum", "Solana"]):
+                    continue
+                # Only take markets with event-related tags or by volume
+                tag_match = any(tag in " ".join(tags) for tag in EVENT_MARKET_TAGS)
+                if not tag_match and not tags:
+                    continue  # Skip untagged markets
+
+                yes_token, no_token = self._extract_tokens(m)
+                if not yes_token or not no_token:
+                    continue
+
+                market_id = m.get("conditionId") or m.get("id", "")
+                if not market_id or market_id in self._markets:
+                    continue
+
+                # Gamma prices as fallback
+                gamma_price_yes, gamma_price_no = None, None
+                import json as _json
+                raw_prices = m.get("outcomePrices", [])
+                if isinstance(raw_prices, str):
+                    try:
+                        raw_prices = _json.loads(raw_prices)
+                    except Exception:
+                        raw_prices = []
+                if isinstance(raw_prices, list) and len(raw_prices) >= 2:
+                    try:
+                        gamma_price_yes = float(raw_prices[0])
+                        gamma_price_no = float(raw_prices[1])
+                    except Exception:
+                        pass
+
+                state = MarketState(
+                    market_id=market_id,
+                    token_id_yes=yes_token,
+                    token_id_no=no_token,
+                    asset="EVENT",
+                    timeframe="event",
+                    bayesian=BayesianModel(market_id),
+                    stoikov=StoikovModel(),
+                    question=question,
+                    is_event=True,
+                    gamma_price_yes=gamma_price_yes,
+                    gamma_price_no=gamma_price_no,
+                )
+                self._markets[market_id] = state
+                logger.info(f"Event market registered: {question[:60]}")
+                registered += 1
+                if registered >= 10:  # Cap at 10 event markets
+                    break
+        except Exception as e:
+            logger.warning(f"Event market discovery failed: {e}")
+        return registered
+
+    def _refresh_markets(self, now: float):
+        """
+        Re-discover active 5-minute markets and remove expired ones.
+        Called every 30 seconds. New market windows open every 5 minutes,
+        so we need to pick them up quickly.
+        """
+        # Remove expired markets + resolve dry-run outcomes
+        expired = [mid for mid, s in self._markets.items()
+                   if s.end_time > 0 and (s.end_time - now) < 0 and not s.is_event]
+        for mid in expired:
+            state = self._markets[mid]
+            # Resolve outcome: last known price determines winner
+            if self.dry_run and state.last_price > 0:
+                winning_side = "YES" if state.last_price >= 0.5 else "NO"
+                self.dry_run_tracker.resolve(mid, winning_side)
+            logger.debug(f"Removing expired market: {mid}")
+            del self._markets[mid]
+
+        # Log dry-run stats every 5 minutes
+        if self.dry_run and now - self._last_stats_log >= 300:
+            self._last_stats_log = now
+            self.dry_run_tracker.log_stats()
+
+        # Discover new crypto markets — CLOB first (indexes live 5-min markets),
+        # Gamma as fallback (often misses live 5-min markets).
+        gamma = GammaClient()
+        new_count = 0
+        for asset in POLYMARKET_ASSETS:
+            markets = self.data_client.find_crypto_5min_markets(asset)
+            if not markets:
+                markets = gamma.find_crypto_markets(asset)
+            for m in markets:
+                import datetime, json as _json
+                condition_id = m.get("conditionId") or m.get("id", "")
+                if not condition_id:
+                    continue
+                market_id = f"{asset}_5m_{str(condition_id)[:8]}"
+                if market_id in self._markets:
+                    continue  # already known
+
+                # Parse end time; ignore clearly invalid dates (more than a day in the past)
+                end_time = 0.0
+                end_date = (m.get("endDate") or m.get("end_date_iso") or
+                            m.get("closeTime") or m.get("expirationTime"))
+                if end_date:
+                    try:
+                        dt = datetime.datetime.fromisoformat(str(end_date).replace("Z", "+00:00"))
+                        ts = dt.timestamp()
+                        if ts > now - 86400:  # only accept if not more than 1 day in the past
+                            end_time = ts
+                    except Exception:
+                        pass
+
+                # Skip markets that are already expired (end_time known and in the past)
+                if end_time > 0 and end_time < now:
+                    continue
+
+                yes_token, no_token = self._extract_tokens(m)
+                if not yes_token or not no_token:
+                    continue
+
+                # Gamma prices
+                gamma_price_yes, gamma_price_no = None, None
+                raw_prices = m.get("outcomePrices", [])
+                if isinstance(raw_prices, str):
+                    try:
+                        raw_prices = _json.loads(raw_prices)
+                    except Exception:
+                        raw_prices = []
+                if isinstance(raw_prices, list) and len(raw_prices) >= 2:
+                    try:
+                        gamma_price_yes = float(raw_prices[0])
+                        gamma_price_no = float(raw_prices[1])
+                    except Exception:
+                        pass
+
+                if gamma_price_yes is not None and not (0.05 <= gamma_price_yes <= 0.95):
+                    continue
+
+                self.register_market(
+                    market_id=market_id,
+                    token_id_yes=yes_token,
+                    token_id_no=no_token,
+                    asset=asset,
+                    timeframe="5m",
+                    end_time=end_time,
+                    gamma_price_yes=gamma_price_yes,
+                    gamma_price_no=gamma_price_no,
+                )
+                new_count += 1
+
+        if new_count:
+            logger.info(f"[REFRESH] +{new_count} new markets | total={len(self._markets)}")
+
+    def run(self):
+        if not self.validate_with_monte_carlo():
+            logger.warning("Monte Carlo validation failed. Strategy may not be viable. Continuing anyway.")
+
+        logger.info(f"Starting bot main loop (mode: {'DRY RUN' if self.dry_run else 'LIVE'})...")
+        logger.info(f"GROWTH GOAL: ${self.kelly.bankroll:.2f} → $100 → $1,000 → $10,000")
+        self._running = True
+
+        while self._running:
+            try:
+                self._tick()
+            except KeyboardInterrupt:
+                logger.info("Shutting down...")
+                self._running = False
+            except Exception as e:
+                logger.error(f"Tick error: {e}", exc_info=True)
+            time.sleep(POLL_INTERVAL_SECONDS)
+
+    def _tick(self):
+        now = time.time()
+        elapsed = now - self._last_price_fetch if self._last_price_fetch else 1.0
+        self._tick_count += 1
+
+        # Apply growth tier (adjusts Kelly λ and MIN_EDGE based on bankroll)
+        self._apply_growth_tier()
+
+        # --- 1. Fetch crypto spot prices ---
+        new_prices = self.price_feed.fetch()
+
+        # --- Periodic market refresh (every 30s) ---
+        if now - self._last_market_refresh >= self._MARKET_REFRESH_INTERVAL:
+            self._last_market_refresh = now
+            self._refresh_markets(now)
+
+        # --- Wallet tracker update (every 60s) ---
+        if now - self._last_wallet_update >= 60:
+            self.wallet_tracker.update()
+            logger.debug(self.wallet_tracker.summary())
+            self._last_wallet_update = now
+
+        opportunities: list[TradeOpportunity] = []
+        market_stats = []  # collect for heartbeat
+
+        for market_id, state in list(self._markets.items()):
+            # Skip markets outside active window — but trade freely if end_time unknown (=0)
+            if state.end_time > 0:
+                remaining = state.end_time - now
+                if remaining < self._MARKET_WINDOW_MIN:
+                    market_stats.append(f"{state.asset}:EXPIRING({remaining:.0f}s)")
+                    continue
+                if not state.is_event and remaining > self._MARKET_WINDOW_MAX:
+                    market_stats.append(f"{state.asset}:NOT_OPEN_YET({remaining:.0f}s)")
+                    continue
+
+            # --- 2. Fetch market prices from Polymarket ---
+            yes_data = self.data_client.get_book_data(state.token_id_yes)
+            no_data = self.data_client.get_book_data(state.token_id_no)
+            p_yes = yes_data["mid_price"]
+            p_no = no_data["mid_price"]
+            # Fallback: use Gamma API prices if CLOB has no data
+            # Note: Gamma prices are static (from discovery), so only use as last resort
+            if p_yes is None and state.gamma_price_yes is not None:
+                p_yes = state.gamma_price_yes
+                # Mark as stale — Bayesian should not over-react to static prices
+            if p_no is None and state.gamma_price_no is not None:
+                p_no = state.gamma_price_no
+            # Reject obviously invalid prices (0 or 1 are not real market prices)
+            if p_yes is not None and not (0.01 <= p_yes <= 0.99):
+                p_yes = None
+            if p_no is not None and not (0.01 <= p_no <= 0.99):
+                p_no = None
+            if p_yes is None or p_no is None:
+                market_stats.append(f"{state.asset}({state.timeframe}):NO_DATA")
+                continue
+
+            ob_imbalance = yes_data["imbalance"] or 0.0
+            # Use CLOB depth if available; fall back to 0.5 for Gamma-only markets
+            ob_depth = yes_data["depth"] if yes_data["depth"] else 0.5
+
+            crypto_symbol = f"{state.asset}USDT"
+            has_spot_price = crypto_symbol in new_prices
+
+            # --- 3. Bayesian update ---
+            volatility = self.price_feed.get_volatility(crypto_symbol) if has_spot_price else 0.0
+            bayesian_data = self.price_feed.build_bayesian_data(
+                symbol=crypto_symbol if has_spot_price else None,
+                new_prices=new_prices,
+                elapsed_seconds=elapsed,
+                volatility=volatility,
+                ob_imbalance=ob_imbalance,
+            )
+            q = state.bayesian.update(bayesian_data)
+
+            # --- 3b. Wallet signal adjustment ---
+            wallet_signal = self.wallet_tracker.get_signal(
+                state.token_id_yes, state.token_id_no
+            )
+            if wallet_signal.has_signal:
+                q = max(0.01, min(0.99, q + wallet_signal.confidence_boost))
+
+            # --- 3c. Event sentiment boost (only for non-crypto markets, only above $100) ---
+            if state.is_event and state.question:
+                self.event_sentiment.analyze_async(
+                    market_id=market_id,
+                    question=state.question,
+                    bankroll=self.kelly.bankroll,
+                )
+                sentiment_boost = self.event_sentiment.get_boost(market_id)
+                if sentiment_boost != 0.0:
+                    q = max(0.01, min(0.99, q + sentiment_boost))
+                    logger.debug(f"[{market_id}] EventSentiment boost={sentiment_boost:+.3f} → q={q:.3f}")
+
+            # --- 4. Edge check (uses dynamic MIN_EDGE from current tier) ---
+            edge_result = self.edge_model.evaluate_directional(q=q, p=p_yes)
+
+            # Also check within-market arbitrage
+            within_result = self.edge_model.evaluate_within_market(p_yes, p_no)
+            if within_result.has_edge and within_result.ev_net > edge_result.ev_net:
+                edge_result = within_result
+
+            market_stats.append(
+                f"{state.asset}({state.timeframe}):q={q:.3f},p={p_yes:.3f},EV={edge_result.ev_net:+.3f}"
+            )
+
+            if not edge_result.has_edge:
+                state.last_price = p_yes
+                state.last_price_no = p_no
+                continue
+
+            # --- 5. Spread check (cross-market) ---
+            spread_signal = None
+            for m1_id, m2_id in self.spread_map.all_pairs():
+                if market_id in (m1_id, m2_id):
+                    other_id = m2_id if market_id == m1_id else m1_id
+                    other = self._markets.get(other_id)
+                    if other:
+                        p_other = self.data_client.get_mid_price(other.token_id_yes)
+                        if p_other:
+                            sig = self.spread_map.update_pair(m1_id, m2_id, p_yes, p_other)
+                            if sig.is_signal:
+                                spread_signal = sig
+
+            # --- 6. Stoikov execution quote ---
+            remaining_time = self._estimate_remaining_time(state)
+            stoikov_quote = state.stoikov.quote(
+                mid_price=p_yes,
+                remaining_time=remaining_time,
+            )
+
+            # --- 7. Kelly position sizing ---
+            # Maker edge → override stoikov to passive; edge model already decided
+            is_passive = edge_result.is_passive
+            exec_prob = 0.9 if is_passive else 0.7
+            kelly_result = self.kelly.compute(
+                p_success=q,
+                market_price=p_yes,
+                exec_probability=exec_prob,
+                ob_depth_factor=ob_depth,
+            )
+
+            if kelly_result.is_viable and kelly_result.position_size > 0:
+                opp = TradeOpportunity(
+                    market_id=market_id,
+                    edge_result=edge_result,
+                    spread_signal=spread_signal,
+                    stoikov_quote=stoikov_quote,
+                    kelly_result=kelly_result,
+                    q=q,
+                )
+                opportunities.append(opp)
+                logger.info(
+                    f"OPPORTUNITY [{market_id}]: "
+                    f"edge={edge_result.ev_net:.4f}, "
+                    f"q={q:.3f}, p={p_yes:.3f}, "
+                    f"size=${kelly_result.position_size:.2f}, "
+                    f"bankroll=${self.kelly.bankroll:.2f}, "
+                    f"exec={'AGGRESSIVE' if stoikov_quote.is_aggressive else 'PASSIVE'}"
+                )
+
+            state.last_price = p_yes
+            state.last_price_no = p_no
+
+        self._last_price_fetch = now
+        self._last_prices = new_prices
+
+        # --- Heartbeat: log status every 60 seconds ---
+        if now - self._last_heartbeat >= 60:
+            self._last_heartbeat = now
+            no_data = sum(1 for s in market_stats if "NO_DATA" in s)
+            active = [s for s in market_stats if "NO_DATA" not in s]
+            logger.info(
+                f"[HEARTBEAT] tick={self._tick_count} | markets={len(self._markets)} "
+                f"({no_data} no data, {len(active)} active) | "
+                f"bankroll=${self.kelly.bankroll:.2f} | {self.event_sentiment.summary()}"
+            )
+            if active:
+                logger.info(f"[HEARTBEAT] Market status: {' | '.join(active)}")
+
+        if opportunities:
+            self._execute_opportunities(opportunities)
+
+    def _execute_opportunities(self, opportunities: list[TradeOpportunity]):
+        """Execute the best opportunities. Dry-run logs only; live mode places orders."""
+        opportunities.sort(key=lambda o: o.edge_result.ev_net, reverse=True)
+
+        for opp in opportunities:
+            market = self._markets[opp.market_id]
+            price = opp.stoikov_quote.reservation_price
+            size = opp.kelly_result.position_size
+            side = opp.edge_result.side          # "YES", "NO", or "BOTH"
+            is_passive = opp.edge_result.is_passive
+            exec_type = "GTC/MAKER" if is_passive else "FOK/TAKER"
+
+            if self.dry_run:
+                logger.info(
+                    f"[DRY RUN] {opp.market_id}: {side} ${size:.2f} @ {price:.4f} "
+                    f"| EV={opp.edge_result.ev_net:.4f} | Kelly f={opp.kelly_result.f_kelly:.4f} "
+                    f"| exec={exec_type}"
+                )
+                # Record opportunity for later analysis
+                record_side = side if side != "BOTH" else "YES"
+                self.dry_run_tracker.record(
+                    market_id=opp.market_id,
+                    asset=market.asset,
+                    side=record_side,
+                    q=opp.q,
+                    p=market.last_price,
+                    edge=opp.edge_result.ev_net,
+                    size=size,
+                    exec_price=price,
+                )
+                continue
+
+            # Within-market arb: buy both YES and NO simultaneously
+            if side == "BOTH":
+                self._place_arb_both_sides(market, size, not is_passive)
+                continue
+
+            # Directional: BUY YES or BUY NO
+            token_id = market.token_id_yes if side == "YES" else market.token_id_no
+            logger.info(
+                f"[LIVE] Placing order: {opp.market_id} BUY {side} ${size:.2f} @ {price:.4f} "
+                f"({exec_type})"
+            )
+            if is_passive:
+                order_id = self.executor.place_limit_order(token_id, "BUY", price, size)
+            else:
+                order_id = self.executor.place_fok_order(token_id, "BUY", price, size)
+
+            if order_id:
+                logger.info(f"Order accepted: {order_id}")
+                self.kelly.allocate(size)
+                self._save_bankroll()
+                self._record_trade(opp.market_id, side, size, price, order_id)
+            else:
+                logger.warning(f"Order rejected for {opp.market_id}")
+
+    def _place_arb_both_sides(self, market: MarketState, size: float, aggressive: bool):
+        """Place both YES and NO legs of a within-market arbitrage."""
+        half = size / 2.0
+        yes_price = market.last_price
+        no_price = market.last_price_no
+
+        logger.info(
+            f"[LIVE] Within-market arb {market.market_id}: "
+            f"BUY YES ${half:.2f} @ {yes_price:.4f} + BUY NO ${half:.2f} @ {no_price:.4f}"
+        )
+        if aggressive:
+            yes_id = self.executor.place_fok_order(market.token_id_yes, "BUY", yes_price, half)
+            no_id = self.executor.place_fok_order(market.token_id_no, "BUY", no_price, half)
+        else:
+            yes_id = self.executor.place_limit_order(market.token_id_yes, "BUY", yes_price, half)
+            no_id = self.executor.place_limit_order(market.token_id_no, "BUY", no_price, half)
+
+        if yes_id and no_id:
+            logger.info(f"Both legs accepted: YES={yes_id}, NO={no_id}")
+            self.kelly.allocate(size)
+            self._save_bankroll()
+        elif yes_id or no_id:
+            logger.warning(
+                f"Partial arb fill for {market.market_id}: "
+                f"YES={yes_id}, NO={no_id} — directional exposure!"
+            )
+            self.kelly.allocate(half)
+            self._save_bankroll()
+        else:
+            logger.warning(f"Both legs rejected for {market.market_id}")
+
+    def _estimate_remaining_time(self, state: MarketState) -> float:
+        """
+        Estimate (T-t) as a normalized value [0, 1].
+        Uses the market's end_time if available; falls back to 0.5.
+        """
+        if state.end_time <= 0:
+            return 0.5
+        now = time.time()
+        window = 5 * 60  # 5-minute markets assumed
+        remaining = state.end_time - now
+        if remaining <= 0:
+            return 0.0
+        return min(1.0, remaining / window)
+
+    def _record_trade(self, market_id: str, side: str, size: float, price: float, order_id: str):
+        """Append a trade record to trades.json for the dashboard."""
+        try:
+            trades = []
+            if TRADES_FILE.exists():
+                trades = json.loads(TRADES_FILE.read_text())
+            trades.append({
+                "time": time.strftime("%H:%M:%S"),
+                "market": market_id,
+                "side": side,
+                "size": round(size, 4),
+                "price": round(price, 4),
+                "order_id": order_id,
+                "pnl": 0.0,  # Updated when market resolves
+            })
+            # Keep last 500 trades
+            TRADES_FILE.write_text(json.dumps(trades[-500:]))
+        except Exception as e:
+            logger.warning(f"Could not record trade: {e}")
+
+    def stop(self):
+        self._running = False
+        self._save_bankroll()
+        logger.info("Bot stopped.")
+
+
+================================================================
+FILE: trading/order_executor.py
+================================================================
+
+"""
+Order Executor
+==============
+Wraps py-clob-client to place, cancel, and track real orders on Polymarket.
+
+Supported order types:
+  GTC  – Good Till Cancelled (default, stays in book)
+  GTD  – Good Till Date (expires at given timestamp)
+  FOK  – Fill or Kill (immediate full fill or cancel)
+  FAK  – Fill and Kill (immediate partial fill, rest cancelled)
+"""
+
+import time
+import logging
+
+try:
+    from py_clob_client.client import ClobClient
+    from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
+    _PY_CLOB_AVAILABLE = True
+except ImportError:
+    _PY_CLOB_AVAILABLE = False
+    logging.getLogger("polymarket_bot.executor").warning(
+        "py_clob_client not installed – OrderExecutor disabled (dry-run only)"
+    )
+
+# py-clob-client >= 0.15 removed BUY/SELL from constants – use string literals
+BUY = "BUY"
+SELL = "SELL"
+
+from config import (
+    POLYMARKET_HOST,
+    POLYMARKET_PRIVATE_KEY,
+    POLYMARKET_API_KEY,
+    POLYMARKET_API_SECRET,
+    POLYMARKET_API_PASSPHRASE,
+    CHAIN_ID,
+)
+
+import os
+
+logger = logging.getLogger("polymarket_bot.executor")
+
+PROXY_ADDRESS = os.getenv("POLYMARKET_PROXY_ADDRESS", "").strip()
+
+_ORDER_TYPE_MAP = {
+    "GTC": OrderType.GTC,
+    "GTD": OrderType.GTD,
+    "FOK": OrderType.FOK,
+    "FAK": OrderType.FAK,
+} if _PY_CLOB_AVAILABLE else {}
+
+
+def _post_with_retry(fn, *args, retries: int = 4):
+    """Call fn(*args) with exponential backoff on rate-limit errors."""
+    for attempt in range(retries):
+        try:
+            return fn(*args)
+        except Exception as e:
+            msg = str(e)
+            if "429" in msg or "rate limit" in msg.lower():
+                wait = 2 ** attempt
+                logger.warning(f"Rate limited, retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                raise
+    raise RuntimeError("Exceeded retry limit due to rate limiting")
+
+
+class OrderExecutor:
+    """Places and manages orders via py-clob-client."""
+
+    def __init__(self):
+        if not _PY_CLOB_AVAILABLE:
+            raise RuntimeError(
+                "py_clob_client is not installed. Run: pip install poly-market-maker"
+            )
+        creds = ApiCreds(
+            api_key=POLYMARKET_API_KEY,
+            api_secret=POLYMARKET_API_SECRET,
+            api_passphrase=POLYMARKET_API_PASSPHRASE,
+        )
+        sig_type = 1 if PROXY_ADDRESS else 0
+        self.client = ClobClient(
+            host=POLYMARKET_HOST,
+            key=POLYMARKET_PRIVATE_KEY,
+            chain_id=CHAIN_ID,
+            creds=creds,
+            signature_type=sig_type,
+            funder=PROXY_ADDRESS if PROXY_ADDRESS else None,
+        )
+        logger.info(f"OrderExecutor initialized (sig_type={sig_type})")
+
+    def place_order(
+        self,
+        token_id: str,
+        side: str,                      # "BUY" or "SELL"
+        price: float,                   # limit price [0, 1]
+        size: float,                    # USDC amount
+        order_type: str = "GTC",        # GTC | GTD | FOK | FAK
+        expiration: int | None = None,  # Unix timestamp (GTD only)
+    ) -> str | None:
+        """
+        Place a limit order. Returns order_id or None on failure.
+
+        - GTC: stays in book until filled or cancelled
+        - GTD: expires at `expiration` Unix timestamp
+        - FOK: fill entire size immediately or cancel
+        - FAK: fill what's available now, cancel remainder
+        """
+        clob_side = BUY if side.upper() == "BUY" else SELL
+        ot = _ORDER_TYPE_MAP.get(order_type.upper(), OrderType.GTC)
+
+        order_args = OrderArgs(
+            token_id=token_id,
+            price=round(price, 4),
+            size=round(size, 2),
+            side=clob_side,
+            expiration=expiration,
+        )
+
+        try:
+            signed = self.client.create_order(order_args)
+            resp = _post_with_retry(self.client.post_order, signed, ot)
+            order_id = resp.get("orderID") or resp.get("id")
+            logger.info(
+                f"[{order_type}] {side} {size:.2f} USDC @ {price:.4f} "
+                f"| token={token_id[:12]}... | id={order_id}"
+            )
+            return order_id
+        except Exception as e:
+            logger.error(f"Failed to place {order_type} order: {e}")
+            return None
+
+    # Convenience wrappers
+    def place_limit_order(self, token_id: str, side: str, price: float, size: float) -> str | None:
+        return self.place_order(token_id, side, price, size, order_type="GTC")
+
+    def place_fok_order(self, token_id: str, side: str, price: float, size: float) -> str | None:
+        return self.place_order(token_id, side, price, size, order_type="FOK")
+
+    def place_gtd_order(
+        self, token_id: str, side: str, price: float, size: float, expiration: int
+    ) -> str | None:
+        return self.place_order(token_id, side, price, size, order_type="GTD", expiration=expiration)
+
+    def cancel_order(self, order_id: str) -> bool:
+        try:
+            self.client.cancel(order_id)
+            logger.info(f"Cancelled order {order_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to cancel order {order_id}: {e}")
+            return False
+
+    def get_open_orders(self) -> list[dict]:
+        try:
+            return self.client.get_orders() or []
+        except Exception as e:
+            logger.error(f"Failed to fetch open orders: {e}")
+            return []
+
+
+================================================================
+FILE: utils/__init__.py
+================================================================
+
+
+
+================================================================
+FILE: utils/logger.py
+================================================================
+
+import logging
+import sys
+from pathlib import Path
+from config import LOG_LEVEL
+
+LOG_FILE = Path(__file__).parent.parent / "bot.log"
+MAX_LOG_BYTES = 5 * 1024 * 1024  # 5 MB max log file
+
+
+def setup_logger(name: str = "polymarket_bot") -> logging.Logger:
+    logger = logging.getLogger(name)
+    if logger.handlers:
+        return logger
+    logger.setLevel(getattr(logging, LOG_LEVEL.upper(), logging.INFO))
+
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+    # Console handler
+    console = logging.StreamHandler(sys.stdout)
+    console.setFormatter(fmt)
+    logger.addHandler(console)
+
+    # File handler (for dashboard)
+    try:
+        from logging.handlers import RotatingFileHandler
+        fh = RotatingFileHandler(LOG_FILE, maxBytes=MAX_LOG_BYTES, backupCount=2, encoding="utf-8")
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+    except Exception:
+        pass  # Non-fatal: dashboard just won't show logs
+
+    return logger
+
+
+================================================================
+FILE: dashboard/server.py
+================================================================
+
+"""
+Polymarket Bot - Live Dashboard Server
+=======================================
+Einfacher HTTP-Server der per Browser (Safari/Chrome) erreichbar ist.
+Zeigt Echtzeit-Daten des laufenden Bots.
+
+Start: python3 dashboard/server.py
+Aufruf: http://<SERVER-IP>:8080
+"""
+
+import json
+import os
+import time
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
+
+DASHBOARD_DIR = Path(__file__).parent
+BOT_ROOT = DASHBOARD_DIR.parent
+STATE_FILE = BOT_ROOT / "bankroll_state.json"
+LOG_FILE = BOT_ROOT / "bot.log"
+TRADES_FILE = BOT_ROOT / "trades.json"
+
+PORT = 8080
+
+
+# ---------------------------------------------------------------------------
+# State helpers
+# ---------------------------------------------------------------------------
+
+def load_bankroll() -> float:
+    try:
+        data = json.loads(STATE_FILE.read_text())
+        return float(data.get("bankroll", 5.27))
+    except Exception:
+        return 5.27
+
+
+def load_trades() -> list:
+    try:
+        if TRADES_FILE.exists():
+            return json.loads(TRADES_FILE.read_text())
+        return []
+    except Exception:
+        return []
+
+
+def load_recent_logs(n: int = 60) -> list[str]:
+    """Read last n lines from bot.log."""
+    try:
+        if not LOG_FILE.exists():
+            return ["Keine Log-Datei gefunden. Starte den Bot mit: python3 main.py"]
+        lines = LOG_FILE.read_text().splitlines()
+        return lines[-n:]
+    except Exception:
+        return []
+
+
+def get_dashboard_state() -> dict:
+    bankroll = load_bankroll()
+    trades = load_trades()
+    logs = load_recent_logs(80)
+
+    # Compute stats from trades
+    total_trades = len(trades)
+    wins = [t for t in trades if t.get("pnl", 0) > 0]
+    losses = [t for t in trades if t.get("pnl", 0) < 0]
+    total_pnl = sum(t.get("pnl", 0) for t in trades)
+    win_rate = len(wins) / total_trades * 100 if total_trades > 0 else 0.0
+    biggest_win = max((t.get("pnl", 0) for t in trades), default=0)
+    biggest_loss = min((t.get("pnl", 0) for t in trades), default=0)
+
+    # Recent 20 trades for chart
+    recent = trades[-20:] if len(trades) >= 20 else trades
+    equity_curve = []
+    running = 5.27
+    for t in trades:
+        running += t.get("pnl", 0)
+        equity_curve.append(round(running, 4))
+
+    return {
+        "bankroll": round(bankroll, 2),
+        "total_trades": total_trades,
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate": round(win_rate, 1),
+        "total_pnl": round(total_pnl, 4),
+        "biggest_win": round(biggest_win, 4),
+        "biggest_loss": round(biggest_loss, 4),
+        "recent_trades": recent,
+        "equity_curve": equity_curve,
+        "logs": logs,
+        "timestamp": time.strftime("%H:%M:%S"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# HTTP Handler
+# ---------------------------------------------------------------------------
+
+HTML_PAGE = r"""<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Polymarket Bot Dashboard</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0d1117; color: #e6edf3; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px; }
+  .header { background: #161b22; border-bottom: 1px solid #30363d; padding: 16px 20px; display: flex; align-items: center; justify-content: space-between; }
+  .header h1 { font-size: 18px; color: #58a6ff; }
+  .header .status { display: flex; align-items: center; gap: 8px; font-size: 12px; color: #8b949e; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #3fb950; animation: pulse 2s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; padding: 16px; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 14px; }
+  .card .label { font-size: 11px; color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
+  .card .value { font-size: 24px; font-weight: 700; color: #e6edf3; }
+  .card .value.green { color: #3fb950; }
+  .card .value.red { color: #f85149; }
+  .card .value.blue { color: #58a6ff; }
+  .section { padding: 0 16px 16px; }
+  .section h2 { font-size: 13px; color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 10px; border-top: 1px solid #21262d; padding-top: 14px; }
+  .chart-wrap { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 12px; margin-bottom: 14px; }
+  canvas { width: 100% !important; }
+  .trades-table { width: 100%; border-collapse: collapse; }
+  .trades-table th { background: #21262d; color: #8b949e; font-size: 11px; text-transform: uppercase; padding: 8px 10px; text-align: left; }
+  .trades-table td { padding: 7px 10px; border-bottom: 1px solid #21262d; font-size: 12px; }
+  .trades-table tr:hover td { background: #1c2128; }
+  .pnl-pos { color: #3fb950; }
+  .pnl-neg { color: #f85149; }
+  .log-box { background: #0d1117; border: 1px solid #30363d; border-radius: 8px; padding: 12px; font-family: 'SF Mono', Menlo, monospace; font-size: 11px; height: 260px; overflow-y: auto; line-height: 1.6; }
+  .log-line { color: #8b949e; }
+  .log-line.opportunity { color: #f0883e; }
+  .log-line.live { color: #3fb950; }
+  .log-line.tier { color: #58a6ff; font-weight: 600; }
+  .log-line.warning { color: #d29922; }
+  .log-line.error { color: #f85149; }
+  .goal-bar-wrap { margin: 8px 0; }
+  .goal-label { display: flex; justify-content: space-between; font-size: 11px; color: #8b949e; margin-bottom: 4px; }
+  .goal-bar { height: 8px; background: #21262d; border-radius: 4px; overflow: hidden; }
+  .goal-fill { height: 100%; background: linear-gradient(90deg, #58a6ff, #3fb950); border-radius: 4px; transition: width 1s ease; }
+  @media (max-width: 600px) { .grid { grid-template-columns: repeat(2, 1fr); } }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>Polymarket Bot</h1>
+  <div class="status"><div class="dot"></div><span id="ts">--:--:--</span></div>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <div class="label">Kontostand</div>
+    <div class="value blue" id="bankroll">$0.00</div>
+  </div>
+  <div class="card">
+    <div class="label">Gesamt PnL</div>
+    <div class="value" id="total_pnl">$0.0000</div>
+  </div>
+  <div class="card">
+    <div class="label">Trades</div>
+    <div class="value" id="total_trades">0</div>
+  </div>
+  <div class="card">
+    <div class="label">Win Rate</div>
+    <div class="value" id="win_rate">0%</div>
+  </div>
+  <div class="card">
+    <div class="label">Beste Trade</div>
+    <div class="value green" id="biggest_win">$0</div>
+  </div>
+  <div class="card">
+    <div class="label">Schlechtester</div>
+    <div class="value red" id="biggest_loss">$0</div>
+  </div>
+</div>
+
+<div class="section">
+  <h2>Wachstumsziel</h2>
+  <div class="chart-wrap">
+    <div class="goal-bar-wrap">
+      <div class="goal-label"><span>$5.27</span><span id="goal1_label">Ziel: $100</span><span>$100</span></div>
+      <div class="goal-bar"><div class="goal-fill" id="goal1_bar" style="width:0%"></div></div>
+    </div>
+    <div class="goal-bar-wrap" style="margin-top:10px">
+      <div class="goal-label"><span>$100</span><span id="goal2_label">Ziel: $1.000</span><span>$1.000</span></div>
+      <div class="goal-bar"><div class="goal-fill" id="goal2_bar" style="width:0%"></div></div>
+    </div>
+    <div class="goal-bar-wrap" style="margin-top:10px">
+      <div class="goal-label"><span>$1.000</span><span id="goal3_label">Ziel: $10.000</span><span>$10.000</span></div>
+      <div class="goal-bar"><div class="goal-fill" id="goal3_bar" style="width:0%"></div></div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h2>Equity Kurve</h2>
+  <div class="chart-wrap"><canvas id="equityChart" height="120"></canvas></div>
+</div>
+
+<div class="section">
+  <h2>Letzte Trades</h2>
+  <div style="overflow-x:auto">
+  <table class="trades-table">
+    <thead><tr><th>Zeit</th><th>Markt</th><th>Seite</th><th>Größe</th><th>PnL</th></tr></thead>
+    <tbody id="trades_body"><tr><td colspan="5" style="color:#8b949e;text-align:center;padding:20px">Noch keine Trades</td></tr></tbody>
+  </table>
+  </div>
+</div>
+
+<div class="section">
+  <h2>Live Bot-Log</h2>
+  <div class="log-box" id="log_box"></div>
+</div>
+
+<script>
+// ── Mini chart library (canvas) ──────────────────────────────────────────
+function drawChart(canvasId, data) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const W = canvas.offsetWidth || 300;
+  const H = canvas.height;
+  canvas.width = W;
+  ctx.clearRect(0, 0, W, H);
+  if (!data || data.length < 2) {
+    ctx.fillStyle = '#8b949e';
+    ctx.font = '12px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('Noch keine Daten', W/2, H/2);
+    return;
+  }
+  const min = Math.min(...data);
+  const max = Math.max(...data);
+  const range = max - min || 1;
+  const pad = 16;
+  const xs = data.map((_, i) => pad + (i / (data.length-1)) * (W - pad*2));
+  const ys = data.map(v => H - pad - ((v - min) / range) * (H - pad*2));
+
+  // Gradient fill
+  const grad = ctx.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, 'rgba(88,166,255,0.3)');
+  grad.addColorStop(1, 'rgba(88,166,255,0.0)');
+  ctx.beginPath();
+  ctx.moveTo(xs[0], H);
+  xs.forEach((x, i) => ctx.lineTo(x, ys[i]));
+  ctx.lineTo(xs[xs.length-1], H);
+  ctx.closePath();
+  ctx.fillStyle = grad;
+  ctx.fill();
+
+  // Line
+  ctx.beginPath();
+  ctx.strokeStyle = data[data.length-1] >= data[0] ? '#3fb950' : '#f85149';
+  ctx.lineWidth = 2;
+  xs.forEach((x, i) => i === 0 ? ctx.moveTo(x, ys[i]) : ctx.lineTo(x, ys[i]));
+  ctx.stroke();
+
+  // Last value dot
+  const lx = xs[xs.length-1], ly = ys[ys.length-1];
+  ctx.beginPath();
+  ctx.arc(lx, ly, 3, 0, Math.PI*2);
+  ctx.fillStyle = '#58a6ff';
+  ctx.fill();
+}
+
+// ── Color helpers ─────────────────────────────────────────────────────────
+function colorPnl(v) {
+  return v > 0 ? 'pnl-pos' : v < 0 ? 'pnl-neg' : '';
+}
+
+function pct(val, from, to) {
+  const p = Math.min(100, Math.max(0, ((val - from) / (to - from)) * 100));
+  return p.toFixed(1);
+}
+
+// ── Render state ──────────────────────────────────────────────────────────
+function render(state) {
+  const br = state.bankroll;
+  document.getElementById('ts').textContent = state.timestamp;
+  document.getElementById('bankroll').textContent = '$' + br.toFixed(2);
+  document.getElementById('bankroll').className = 'value blue';
+
+  const pnl = state.total_pnl;
+  const pnlEl = document.getElementById('total_pnl');
+  pnlEl.textContent = (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(4);
+  pnlEl.className = 'value ' + (pnl >= 0 ? 'green' : 'red');
+
+  document.getElementById('total_trades').textContent = state.total_trades;
+
+  const wr = state.win_rate;
+  const wrEl = document.getElementById('win_rate');
+  wrEl.textContent = wr.toFixed(1) + '%';
+  wrEl.className = 'value ' + (wr >= 55 ? 'green' : wr >= 50 ? '' : 'red');
+
+  document.getElementById('biggest_win').textContent = '+$' + state.biggest_win.toFixed(4);
+  document.getElementById('biggest_loss').textContent = '$' + state.biggest_loss.toFixed(4);
+
+  // Growth goal bars
+  document.getElementById('goal1_bar').style.width = pct(br, 5.27, 100) + '%';
+  document.getElementById('goal1_label').textContent = br < 100 ? 'Ziel: $100 (' + pct(br, 5.27, 100) + '%)' : 'ERREICHT!';
+  document.getElementById('goal2_bar').style.width = pct(br, 100, 1000) + '%';
+  document.getElementById('goal2_label').textContent = br < 1000 ? 'Ziel: $1.000 (' + pct(br, 100, 1000) + '%)' : 'ERREICHT!';
+  document.getElementById('goal3_bar').style.width = pct(br, 1000, 10000) + '%';
+  document.getElementById('goal3_label').textContent = br < 10000 ? 'Ziel: $10.000 (' + pct(br, 1000, 10000) + '%)' : 'ERREICHT!';
+
+  // Equity curve
+  if (state.equity_curve && state.equity_curve.length > 0) {
+    drawChart('equityChart', state.equity_curve);
+  }
+
+  // Trades table
+  const tbody = document.getElementById('trades_body');
+  if (state.recent_trades && state.recent_trades.length > 0) {
+    tbody.innerHTML = state.recent_trades.slice().reverse().map(t => {
+      const p = t.pnl || 0;
+      return `<tr>
+        <td>${t.time || '--'}</td>
+        <td style="max-width:120px;overflow:hidden;text-overflow:ellipsis">${t.market || '--'}</td>
+        <td>${t.side || '--'}</td>
+        <td>$${(t.size || 0).toFixed(2)}</td>
+        <td class="${colorPnl(p)}">${p >= 0 ? '+' : ''}$${p.toFixed(4)}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  // Logs
+  const logBox = document.getElementById('log_box');
+  if (state.logs && state.logs.length > 0) {
+    logBox.innerHTML = state.logs.map(line => {
+      let cls = 'log-line';
+      if (line.includes('OPPORTUNITY')) cls += ' opportunity';
+      else if (line.includes('[LIVE]')) cls += ' live';
+      else if (line.includes('TIER CHANGE')) cls += ' tier';
+      else if (line.includes('[WARNING]')) cls += ' warning';
+      else if (line.includes('[ERROR]')) cls += ' error';
+      return `<div class="${cls}">${escapeHtml(line)}</div>`;
+    }).join('');
+    logBox.scrollTop = logBox.scrollHeight;
+  }
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// ── Poll every 2 seconds ──────────────────────────────────────────────────
+async function poll() {
+  try {
+    const r = await fetch('/api/state');
+    if (r.ok) render(await r.json());
+  } catch(e) {
+    document.getElementById('ts').textContent = 'Verbindung getrennt';
+  }
+}
+
+poll();
+setInterval(poll, 2000);
+</script>
+</body>
+</html>"""
+
+
+class DashboardHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass  # Suppress default HTTP logs
+
+    def do_GET(self):
+        if self.path == "/" or self.path == "/index.html":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(HTML_PAGE.encode())
+
+        elif self.path == "/api/state":
+            state = get_dashboard_state()
+            data = json.dumps(state).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(data)
+
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+
+def main():
+    server = HTTPServer(("0.0.0.0", PORT), DashboardHandler)
+    print(f"Dashboard läuft auf http://0.0.0.0:{PORT}")
+    print(f"Aufruf im Browser: http://<DEINE-SERVER-IP>:{PORT}")
+    print("Strg+C zum Stoppen")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("Dashboard gestoppt.")
+
+
+if __name__ == "__main__":
+    main()
+
