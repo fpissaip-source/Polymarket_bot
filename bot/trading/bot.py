@@ -714,9 +714,15 @@ class ArbitrageBot:
             # --- 7. Kelly position sizing + Regime multiplier ---
             is_passive = edge_result.is_passive
             exec_prob = 0.9 if is_passive else 0.7
+            if edge_result.side == "NO":
+                kelly_p = 1.0 - q
+                kelly_market = p_no if p_no else 1.0 - p_yes
+            else:
+                kelly_p = q
+                kelly_market = p_yes
             kelly_result = self.kelly.compute(
-                p_success=q,
-                market_price=p_yes,
+                p_success=kelly_p,
+                market_price=kelly_market,
                 exec_probability=exec_prob,
                 ob_depth_factor=ob_depth,
             )
