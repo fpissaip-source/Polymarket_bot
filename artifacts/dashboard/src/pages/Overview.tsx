@@ -39,6 +39,8 @@ type BotStatus = {
 
 type PriceMap = { prices: Record<string, number>; updatedAt: string };
 
+type RegimeInfo = { regime: string; vol: number; kelly_mult: number };
+
 type SimulationData = {
   totalTrades: number;
   resolvedTrades: number;
@@ -49,6 +51,8 @@ type SimulationData = {
   };
   adaptive: Record<string, unknown>;
   virtualBankroll: number;
+  regime: Record<string, RegimeInfo>;
+  gas: { gwei?: number; matic_usd?: number; gas_cost_usd?: number; veto_ratio?: number };
 };
 
 const SYMBOL_LABELS: Record<string, string> = {
@@ -245,6 +249,41 @@ export function Overview() {
               </div>
             </div>
           </div>
+        </div>
+      )}
+
+      {sim?.regime && Object.keys(sim.regime).length > 0 && (
+        <div>
+          <h3 className="text-sm font-semibold text-muted-foreground mb-3 uppercase tracking-wider">Regime-Detektor (Wetterfrosch)</h3>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+            {Object.entries(sim.regime).map(([asset, info]) => {
+              const r = info as RegimeInfo;
+              const isBreakout = r.regime === "HIGH_VOL_BREAKOUT";
+              const isTrending = r.regime === "TRENDING";
+              const color = isBreakout ? "text-red-400" : isTrending ? "text-yellow-400" : "text-green-400";
+              const emoji = isBreakout ? "⚡" : isTrending ? "📈" : "〰️";
+              return (
+                <div key={asset} className="bg-card border border-border rounded-lg p-3">
+                  <div className="flex justify-between items-center mb-2">
+                    <span className="font-bold text-sm">{asset}</span>
+                    <span className={`text-xs font-mono font-bold ${color}`}>{emoji} {r.regime.replace(/_/g, " ")}</span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-1 text-xs text-muted-foreground">
+                    <span>Vol: <span className="text-foreground font-mono">{r.vol.toFixed(5)}</span></span>
+                    <span>Kelly×: <span className={`font-mono font-bold ${color}`}>{r.kelly_mult.toFixed(2)}</span></span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          {sim.gas && sim.gas.gwei != null && (
+            <div className="mt-2 bg-card border border-border rounded-lg p-3 flex gap-6 text-xs text-muted-foreground">
+              <span>Gas: <span className="text-foreground font-mono">{sim.gas.gwei?.toFixed(1)} Gwei</span></span>
+              <span>MATIC: <span className="text-foreground font-mono">${sim.gas.matic_usd?.toFixed(4)}</span></span>
+              <span>Tx-Kosten: <span className="text-foreground font-mono">${sim.gas.gas_cost_usd?.toFixed(5)}</span></span>
+              <span>Veto bei: <span className="text-orange-400 font-mono">&gt;{((sim.gas.veto_ratio ?? 0.3) * 100).toFixed(0)}% Edge</span></span>
+            </div>
+          )}
         </div>
       )}
 

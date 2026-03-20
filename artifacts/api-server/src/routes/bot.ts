@@ -10,6 +10,7 @@ const BANKROLL_FILE = join(BOT_DIR, "bankroll_state.json");
 const TRADES_FILE = join(BOT_DIR, "trades.json");
 const DRY_RUN_LOG = join(BOT_DIR, "dry_run_log.json");
 const ADAPTIVE_STATE = join(BOT_DIR, "adaptive_state.json");
+const REGIME_STATE = join(BOT_DIR, "regime_state.json");
 const LOG_FILE = join(BOT_DIR, "bot.log");
 const DRY_RUN_BANKROLL = 25;
 
@@ -187,6 +188,8 @@ router.get("/bot/simulation", (req, res) => {
     decisionBreakdown[d].pnl += e.pnl || 0;
   }
 
+  const regimeState = readJson<Record<string, any>>(REGIME_STATE, {});
+
   res.json({
     totalTrades: dryRunLog.length,
     resolvedTrades: resolved.length,
@@ -194,7 +197,14 @@ router.get("/bot/simulation", (req, res) => {
     decisionBreakdown,
     adaptive,
     virtualBankroll: Math.round((getInitialBankroll() + runningPnl) * 100) / 100,
+    regime: regimeState.regimes ?? {},
+    gas: regimeState.gas ?? {},
   });
+});
+
+router.get("/bot/regime", (req, res) => {
+  const data = readJson<Record<string, any>>(REGIME_STATE, {});
+  res.json(data);
 });
 
 router.get("/bot/logs", (req, res) => {

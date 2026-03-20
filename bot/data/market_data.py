@@ -112,7 +112,13 @@ class PolymarketDataClient:
         imbalance = (bid_vol - ask_vol) / total if total > 1e-8 else 0.0
         depth = min(1.0, total / 1000.0)
 
-        return {"mid_price": mid_price, "imbalance": imbalance, "depth": depth}
+        return {
+            "mid_price": mid_price,
+            "imbalance": imbalance,
+            "depth": depth,
+            "bids": bids,
+            "asks": asks,
+        }
 
     def get_mid_price(self, token_id: str) -> float | None:
         return self.get_book_data(token_id)["mid_price"]

@@ -1,6 +1,6 @@
 =============================================
 POLYMARKET BOT - COMPLETE SOURCE CODE
-Generated: Fri Mar 20 10:51:17 PM UTC 2026
+Generated: Fri Mar 20 10:59:20 PM UTC 2026
 =============================================
 
 ================================================================
@@ -405,7 +405,13 @@ class PolymarketDataClient:
         imbalance = (bid_vol - ask_vol) / total if total > 1e-8 else 0.0
         depth = min(1.0, total / 1000.0)
 
-        return {"mid_price": mid_price, "imbalance": imbalance, "depth": depth}
+        return {
+            "mid_price": mid_price,
+            "imbalance": imbalance,
+            "depth": depth,
+            "bids": bids,
+            "asks": asks,
+        }
 
     def get_mid_price(self, token_id: str) -> float | None:
         return self.get_book_data(token_id)["mid_price"]
@@ -2829,6 +2835,500 @@ class AdaptiveLearner:
 
 
 ================================================================
+FILE: models/regime.py
+================================================================
+"""
+Regime Detection Model — "The Weather Frog"
+===========================================
+Uses rolling volatility and trend analysis to classify the current
+market into one of three regimes:
+
+  LOW_VOL_SIDEWAYS   → Mean-reversion strategies work. Kelly multiplier = 1.0
+  TRENDING           → Moderate vol, clear direction. Kelly multiplier = 0.75
+  HIGH_VOL_BREAKOUT  → Chaotic, unpredictable. Kelly multiplier = 0.50
+
+The regime multiplier is applied to Kelly position sizing:
+  final_size = kelly_size * regime.kelly_multiplier
+
+Uses pure numpy (no external ML libs required).
+Rolling window of spot price returns → vol + trend classification.
+"""
+
+import logging
+import numpy as np
+from collections import deque
+from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
+
+REGIME_LOW_VOL       = "LOW_VOL_SIDEWAYS"
+REGIME_TRENDING      = "TRENDING"
+REGIME_HIGH_VOL      = "HIGH_VOL_BREAKOUT"
+
+# Per-asset windows of log-returns (up to 60 ticks ~= 60 seconds)
+_WINDOW_SIZE = 60
+
+# Thresholds (annualised-style for 1s tick data; tuned empirically)
+VOL_LOW_THRESH  = 0.0008   # Below this → sideways
+VOL_HIGH_THRESH = 0.0025   # Above this → breakout
+TREND_THRESH    = 0.0004   # |mean return| above this → trending
+
+
+@dataclass
+class RegimeState:
+    regime: str
+    volatility: float          # rolling std of log-returns
+    trend_strength: float      # |mean return|
+    kelly_multiplier: float    # 0.50 / 0.75 / 1.00
+    description: str
+
+
+class RegimeModel:
+    """
+    One RegimeModel instance per asset (BTC, ETH, SOL …).
+    Call `update(price)` each tick; read `.state` for current regime.
+    """
+
+    def __init__(self, asset: str, window: int = _WINDOW_SIZE):
+        self.asset = asset
+        self.window = window
+        self._prices: deque = deque(maxlen=window + 1)
+        self.state = RegimeState(
+            regime=REGIME_LOW_VOL,
+            volatility=0.0,
+            trend_strength=0.0,
+            kelly_multiplier=1.0,
+            description="Initialising — defaulting to LOW_VOL",
+        )
+        # Simple state-machine: require N consecutive detections before switching
+        self._regime_buffer: deque = deque(maxlen=3)
+
+    def update(self, price: float) -> RegimeState:
+        """Feed the latest spot price. Returns the current RegimeState."""
+        if price <= 0:
+            return self.state
+
+        self._prices.append(price)
+        if len(self._prices) < 10:
+            return self.state
+
+        prices = np.array(self._prices)
+        log_returns = np.diff(np.log(prices))
+
+        vol = float(np.std(log_returns))
+        trend = float(np.mean(log_returns))
+        trend_strength = abs(trend)
+
+        # Classify this tick
+        if vol > VOL_HIGH_THRESH:
+            tick_regime = REGIME_HIGH_VOL
+        elif trend_strength > TREND_THRESH and vol > VOL_LOW_THRESH:
+            tick_regime = REGIME_TRENDING
+        else:
+            tick_regime = REGIME_LOW_VOL
+
+        self._regime_buffer.append(tick_regime)
+
+        # Only switch if the last 3 ticks agree (hysteresis)
+        if len(self._regime_buffer) == 3 and len(set(self._regime_buffer)) == 1:
+            confirmed_regime = tick_regime
+        else:
+            confirmed_regime = self.state.regime  # hold previous
+
+        kelly_mult = {
+            REGIME_LOW_VOL:      1.00,
+            REGIME_TRENDING:     0.75,
+            REGIME_HIGH_VOL:     0.50,
+        }[confirmed_regime]
+
+        desc = (
+            f"vol={vol:.5f}, trend={trend:+.5f} → "
+            f"{confirmed_regime} (Kelly×{kelly_mult:.2f})"
+        )
+
+        self.state = RegimeState(
+            regime=confirmed_regime,
+            volatility=vol,
+            trend_strength=trend_strength,
+            kelly_multiplier=kelly_mult,
+            description=desc,
+        )
+        return self.state
+
+
+class RegimeDetector:
+    """
+    Manages one RegimeModel per asset.
+    Entry point: `update(asset, price)` → `get_multiplier(asset)`.
+    """
+
+    def __init__(self):
+        self._models: dict[str, RegimeModel] = {}
+
+    def _get_model(self, asset: str) -> RegimeModel:
+        key = asset.upper()
+        if key not in self._models:
+            self._models[key] = RegimeModel(key)
+        return self._models[key]
+
+    def update(self, asset: str, price: float) -> RegimeState:
+        model = self._get_model(asset)
+        state = model.update(price)
+        if state.regime == REGIME_HIGH_VOL:
+            logger.info(
+                f"[REGIME:{asset}] HIGH-VOL BREAKOUT detected — "
+                f"Kelly reduced by 50%  |  {state.description}"
+            )
+        return state
+
+    def get_multiplier(self, asset: str) -> float:
+        """Return Kelly multiplier (0.5 / 0.75 / 1.0) for this asset."""
+        return self._get_model(asset).state.kelly_multiplier
+
+    def get_state(self, asset: str) -> RegimeState:
+        return self._get_model(asset).state
+
+    def summary(self) -> dict:
+        return {
+            asset: {
+                "regime": m.state.regime,
+                "vol": round(m.state.volatility, 6),
+                "kelly_mult": m.state.kelly_multiplier,
+            }
+            for asset, m in self._models.items()
+        }
+
+
+================================================================
+FILE: models/ofi.py
+================================================================
+"""
+Order Flow Imbalance (OFI) — "The Bloodhound"
+==============================================
+Analyses bid vs ask pressure from the Polymarket CLOB order book
+BEFORE the spot price reacts.
+
+Signal:
+  OFI = (weighted_bid_volume - weighted_ask_volume)
+        / (weighted_bid_volume + weighted_ask_volume)
+
+  OFI ∈ [-1.0, +1.0]
+  +1.0 = pure buy pressure  → bullish, raise q slightly
+  -1.0 = pure sell pressure → bearish, lower q slightly
+
+Integration with Stoikov:
+  When sellers are aggressive (OFI < -THRESH), shift reservation
+  price down so our limit-order is not overrun.
+
+Integration with Bayesian q:
+  OFI boost added to q (capped): q_adj = clip(q + ofi_boost, 0.01, 0.99)
+"""
+
+import logging
+from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
+
+# Top N levels to consider from the order book
+TOP_LEVELS = 5
+
+# How strongly OFI shifts q (max ±OFI_WEIGHT)
+OFI_WEIGHT = 0.04
+
+# Threshold below which we consider OFI negligible
+OFI_SIGNAL_THRESH = 0.15
+
+# Stoikov reservation price adjustment per unit OFI
+STOIKOV_OFI_SHIFT = 0.012
+
+
+@dataclass
+class OFIResult:
+    ofi: float              # [-1, +1]
+    bid_pressure: float     # weighted bid volume
+    ask_pressure: float     # weighted ask volume
+    q_adjustment: float     # suggested additive change to Bayesian q
+    stoikov_shift: float    # suggested shift to Stoikov reservation price
+    signal: str             # "BUY_PRESSURE" | "SELL_PRESSURE" | "NEUTRAL"
+    levels_used: int
+
+
+def _weighted_volume(levels: list[dict], price_key: str, size_key: str, top: int) -> float:
+    """
+    Compute price-weighted volume for top N levels.
+    Weight = price (bid) or (1 - price) for ask, to emphasise
+    aggressive orders closest to mid.
+    """
+    total = 0.0
+    for entry in levels[:top]:
+        try:
+            px = float(entry.get(price_key, 0) or 0)
+            sz = float(entry.get(size_key, 0) or 0)
+            if px > 0 and sz > 0:
+                total += px * sz
+        except (TypeError, ValueError):
+            continue
+    return total
+
+
+class OFIModel:
+    """
+    Stateless OFI calculator.
+    Call `evaluate(order_book_raw)` where order_book_raw is the dict
+    returned by PolymarketDataClient.get_order_book().
+
+    Expected structure:
+      {
+        "bids": [{"price": "0.52", "size": "120"}, ...],
+        "asks": [{"price": "0.55", "size": "80"},  ...],
+      }
+    Bids sorted descending, asks ascending (standard CLOB format).
+    """
+
+    def evaluate(self, order_book: dict) -> OFIResult:
+        bids = order_book.get("bids") or []
+        asks = order_book.get("asks") or []
+
+        if not bids and not asks:
+            return OFIResult(
+                ofi=0.0, bid_pressure=0.0, ask_pressure=0.0,
+                q_adjustment=0.0, stoikov_shift=0.0,
+                signal="NEUTRAL", levels_used=0,
+            )
+
+        bid_vol = _weighted_volume(bids, "price", "size", TOP_LEVELS)
+        ask_vol = _weighted_volume(asks, "price", "size", TOP_LEVELS)
+
+        total = bid_vol + ask_vol
+        if total == 0:
+            ofi = 0.0
+        else:
+            ofi = (bid_vol - ask_vol) / total
+
+        # Clamp to [-1, +1] in case of numerical edge cases
+        ofi = max(-1.0, min(1.0, ofi))
+
+        levels_used = min(TOP_LEVELS, max(len(bids), len(asks)))
+
+        if ofi > OFI_SIGNAL_THRESH:
+            signal = "BUY_PRESSURE"
+        elif ofi < -OFI_SIGNAL_THRESH:
+            signal = "SELL_PRESSURE"
+        else:
+            signal = "NEUTRAL"
+
+        # q adjustment: positive OFI → market more likely to go up
+        q_adjustment = ofi * OFI_WEIGHT
+
+        # Stoikov reservation price: shift DOWN when sellers dominate
+        # (we don't want our limit hit at a bad price)
+        stoikov_shift = ofi * STOIKOV_OFI_SHIFT
+
+        if abs(ofi) > OFI_SIGNAL_THRESH:
+            logger.debug(
+                f"[OFI] {signal}: ofi={ofi:+.3f} "
+                f"(bids={bid_vol:.1f} vs asks={ask_vol:.1f}) "
+                f"→ q_adj={q_adjustment:+.4f}, stoikov_shift={stoikov_shift:+.4f}"
+            )
+
+        return OFIResult(
+            ofi=ofi,
+            bid_pressure=bid_vol,
+            ask_pressure=ask_vol,
+            q_adjustment=q_adjustment,
+            stoikov_shift=stoikov_shift,
+            signal=signal,
+            levels_used=levels_used,
+        )
+
+
+================================================================
+FILE: models/gas_optimizer.py
+================================================================
+"""
+Gas & Latency Optimizer — "The Mechanic"
+=========================================
+On Polygon, gas price spikes can silently eat your edge.
+This module:
+
+  1. Fetches current Polygon gas price (Gwei) from a free public endpoint.
+  2. Estimates the USD cost of the on-chain settlement transaction.
+  3. Vetoes the trade if:
+       gas_cost_usd > GAS_VETO_RATIO * expected_pnl
+
+  expected_pnl = edge * stake
+
+In dry-run mode, uses a simulated MATIC price and median gas cost
+so the model exercises the logic without live network calls.
+
+Polygon gas API (free, no key required):
+  https://gasstation.polygon.technology/v2
+  Returns { safeLow: {maxFee, maxPriorityFee}, standard: {...}, fast: {...} }
+
+MATIC price: fetched from CoinGecko (same source as spot prices in price_feed.py).
+"""
+
+import logging
+import time
+import requests
+
+logger = logging.getLogger(__name__)
+
+# Veto threshold: gas_cost must be < this fraction of expected edge PnL
+GAS_VETO_RATIO = 0.30          # 30%
+
+# Estimated gas units for a Polymarket CLOB settlement tx
+GAS_UNITS_ESTIMATE = 120_000   # ~120k gas for ERC-20 + conditional token ops
+
+# Cache gas data for this many seconds before re-fetching
+GAS_CACHE_TTL = 60
+
+# Fallback values used when API is unreachable
+FALLBACK_GWEI   = 50.0         # 50 Gwei — conservative estimate
+FALLBACK_MATIC  = 0.80         # $0.80 per MATIC — recent average
+
+POLYGON_GAS_API = "https://gasstation.polygon.technology/v2"
+MATIC_PRICE_API = "https://api.coingecko.com/api/v3/simple/price?ids=matic-network&vs_currencies=usd"
+
+
+class GasOptimizer:
+    """
+    Singleton-style gas checker.
+    Call `should_trade(edge, stake, dry_run)` → (bool, reason_str).
+    """
+
+    def __init__(self):
+        self._cached_gwei: float = FALLBACK_GWEI
+        self._cached_matic_usd: float = FALLBACK_MATIC
+        self._last_fetch: float = 0.0
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def should_trade(
+        self,
+        edge: float,
+        stake: float,
+        dry_run: bool = False,
+    ) -> tuple[bool, str]:
+        """
+        Returns (True, "") if gas cost is acceptable.
+        Returns (False, reason) if gas would eat >30% of expected PnL.
+
+        edge  : expected EV fraction (e.g. 0.04 for 4%)
+        stake : USD size of the trade
+        """
+        if dry_run:
+            gas_usd, gwei, matic = self._simulate_gas()
+        else:
+            gas_usd, gwei, matic = self._fetch_gas_cost()
+
+        expected_pnl = edge * stake
+        if expected_pnl <= 0:
+            return True, ""   # No expected PnL → gas check irrelevant
+
+        ratio = gas_usd / expected_pnl
+        reason = (
+            f"gas={gas_usd:.4f}USD "
+            f"({gwei:.1f} Gwei, MATIC=${matic:.3f}) "
+            f"= {ratio:.1%} of expected PnL ${expected_pnl:.4f}"
+        )
+
+        if ratio > GAS_VETO_RATIO:
+            logger.warning(
+                f"[GAS VETO] Gas cost too high: {reason} "
+                f"(threshold {GAS_VETO_RATIO:.0%})"
+            )
+            return False, f"Gas veto: {reason}"
+
+        logger.debug(f"[GAS OK] {reason}")
+        return True, ""
+
+    def get_gas_info(self, dry_run: bool = False) -> dict:
+        """Return current gas info as a dict for dashboard/logging."""
+        if dry_run:
+            gas_usd, gwei, matic = self._simulate_gas()
+        else:
+            gas_usd, gwei, matic = self._fetch_gas_cost()
+        return {
+            "gwei": round(gwei, 2),
+            "matic_usd": round(matic, 4),
+            "gas_cost_usd": round(gas_usd, 6),
+            "gas_units": GAS_UNITS_ESTIMATE,
+            "veto_ratio": GAS_VETO_RATIO,
+        }
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _simulate_gas(self) -> tuple[float, float, float]:
+        """Dry-run: use fixed representative values."""
+        gwei = 35.0
+        matic = FALLBACK_MATIC
+        gas_usd = _gwei_to_usd(gwei, matic)
+        return gas_usd, gwei, matic
+
+    def _fetch_gas_cost(self) -> tuple[float, float, float]:
+        now = time.time()
+        if now - self._last_fetch < GAS_CACHE_TTL:
+            gas_usd = _gwei_to_usd(self._cached_gwei, self._cached_matic_usd)
+            return gas_usd, self._cached_gwei, self._cached_matic_usd
+
+        gwei = _fetch_polygon_gas()
+        matic = _fetch_matic_price()
+
+        self._cached_gwei = gwei
+        self._cached_matic_usd = matic
+        self._last_fetch = now
+
+        gas_usd = _gwei_to_usd(gwei, matic)
+        logger.debug(
+            f"[GAS] Fetched: {gwei:.1f} Gwei, MATIC=${matic:.4f} "
+            f"→ tx cost ≈ ${gas_usd:.5f}"
+        )
+        return gas_usd, gwei, matic
+
+
+# ------------------------------------------------------------------
+# Module-level helpers (pure functions)
+# ------------------------------------------------------------------
+
+def _gwei_to_usd(gwei: float, matic_usd: float) -> float:
+    """Convert gas usage to USD cost."""
+    matic_cost = (gwei * 1e-9) * GAS_UNITS_ESTIMATE   # in MATIC
+    return matic_cost * matic_usd
+
+
+def _fetch_polygon_gas() -> float:
+    """Fetch standard gas price in Gwei from Polygon Gas Station."""
+    try:
+        r = requests.get(POLYGON_GAS_API, timeout=5)
+        r.raise_for_status()
+        data = r.json()
+        standard = data.get("standard") or data.get("safeLow") or {}
+        gwei = float(standard.get("maxFee", FALLBACK_GWEI))
+        return gwei
+    except Exception as e:
+        logger.debug(f"[GAS] Gas API unavailable ({e}), using fallback {FALLBACK_GWEI} Gwei")
+        return FALLBACK_GWEI
+
+
+def _fetch_matic_price() -> float:
+    """Fetch MATIC/USD from CoinGecko."""
+    try:
+        r = requests.get(MATIC_PRICE_API, timeout=5)
+        r.raise_for_status()
+        data = r.json()
+        price = float(data["matic-network"]["usd"])
+        return price
+    except Exception as e:
+        logger.debug(f"[GAS] MATIC price fetch failed ({e}), using ${FALLBACK_MATIC}")
+        return FALLBACK_MATIC
+
+
+================================================================
 FILE: trading/__init__.py
 ================================================================
 
@@ -2858,7 +3358,7 @@ import json
 import os
 import time
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as dc_replace
 from pathlib import Path
 
 from models.bayesian import BayesianModel
@@ -2867,6 +3367,9 @@ from models.spread import SpreadMap, SpreadSignal
 from models.stoikov import StoikovModel, StoikovQuote
 from models.kelly import KellyModel, KellyResult
 from models.monte_carlo import MonteCarloSimulator
+from models.regime import RegimeDetector
+from models.ofi import OFIModel
+from models.gas_optimizer import GasOptimizer
 
 from data.price_feed import PriceFeed
 from data.market_data import PolymarketDataClient, GammaClient, extract_clob_tokens, extract_gamma_prices
@@ -2957,6 +3460,9 @@ class ArbitrageBot:
         self._last_wallet_update = 0.0
         self.event_sentiment = EventSentimentAnalyzer()
         self.adaptive = AdaptiveLearner()
+        self.regime = RegimeDetector()
+        self.ofi_model = OFIModel()
+        self.gas_optimizer = GasOptimizer()
 
         self._markets: dict[str, MarketState] = {}
         self._running = False
@@ -3407,11 +3913,20 @@ class ArbitrageBot:
                 continue
 
             ob_imbalance = yes_data["imbalance"] or 0.0
-            # Use CLOB depth if available; fall back to 0.5 for Gamma-only markets
             ob_depth = yes_data["depth"] if yes_data["depth"] else 0.5
+
+            # --- 2b. OFI analysis ---
+            ofi_result = self.ofi_model.evaluate({
+                "bids": yes_data.get("bids", []),
+                "asks": yes_data.get("asks", []),
+            })
 
             crypto_symbol = f"{state.asset}USDT"
             has_spot_price = crypto_symbol in new_prices
+
+            # Update regime model with latest spot price
+            if has_spot_price:
+                self.regime.update(state.asset, new_prices[crypto_symbol])
 
             # --- 3. Bayesian update ---
             volatility = self.price_feed.get_volatility(crypto_symbol) if has_spot_price else 0.0
@@ -3453,6 +3968,14 @@ class ArbitrageBot:
                     q = max(0.01, min(0.99, q + sentiment_boost))
                     logger.debug(f"[{market_id}] EventSentiment boost={sentiment_boost:+.3f} → q={q:.3f}")
 
+            # --- 3d. OFI signal: refine q with live order-flow pressure ---
+            if ofi_result.q_adjustment != 0.0:
+                q = max(0.01, min(0.99, q + ofi_result.q_adjustment))
+                logger.debug(
+                    f"[OFI:{state.asset}] {ofi_result.signal} "
+                    f"ofi={ofi_result.ofi:+.3f} → q_adj={ofi_result.q_adjustment:+.4f}"
+                )
+
             # --- 4. Edge check (uses dynamic MIN_EDGE from current tier) ---
             edge_result = self.edge_model.evaluate_directional(q=q, p=p_yes)
 
@@ -3483,15 +4006,16 @@ class ArbitrageBot:
                             if sig.is_signal:
                                 spread_signal = sig
 
-            # --- 6. Stoikov execution quote ---
+            # --- 6. Stoikov execution quote (OFI-adjusted) ---
             remaining_time = self._estimate_remaining_time(state)
+            # Shift mid-price by OFI signal so limit orders avoid aggressive sellers
+            ofi_adjusted_mid = max(0.01, min(0.99, p_yes + ofi_result.stoikov_shift))
             stoikov_quote = state.stoikov.quote(
-                mid_price=p_yes,
+                mid_price=ofi_adjusted_mid,
                 remaining_time=remaining_time,
             )
 
-            # --- 7. Kelly position sizing ---
-            # Maker edge → override stoikov to passive; edge model already decided
+            # --- 7. Kelly position sizing + Regime multiplier ---
             is_passive = edge_result.is_passive
             exec_prob = 0.9 if is_passive else 0.7
             kelly_result = self.kelly.compute(
@@ -3500,6 +4024,21 @@ class ArbitrageBot:
                 exec_probability=exec_prob,
                 ob_depth_factor=ob_depth,
             )
+
+            # Apply regime Kelly multiplier (1.0 / 0.75 / 0.50)
+            regime_mult = self.regime.get_multiplier(state.asset)
+            if regime_mult < 1.0:
+                original_size = kelly_result.position_size
+                kelly_result = dc_replace(
+                    kelly_result,
+                    position_size=kelly_result.position_size * regime_mult,
+                )
+                logger.debug(
+                    f"[REGIME:{state.asset}] "
+                    f"{self.regime.get_state(state.asset).regime} "
+                    f"→ size ${original_size:.3f} × {regime_mult:.2f} "
+                    f"= ${kelly_result.position_size:.3f}"
+                )
 
             if kelly_result.is_viable and kelly_result.position_size > 0:
                 opp = TradeOpportunity(
@@ -3538,14 +4077,33 @@ class ArbitrageBot:
                     f" | adaptive: kelly_adj={a_state['kelly_lambda_adj']:+.3f}, "
                     f"edge_adj={a_state['edge_threshold_adj']:+.4f}"
                 )
+            regime_summary = self.regime.summary()
+            regime_info = " | ".join(
+                f"{a}:{v['regime'].split('_')[0]}(×{v['kelly_mult']})"
+                for a, v in regime_summary.items()
+            )
             logger.info(
                 f"[HEARTBEAT] tick={self._tick_count} | markets={len(self._markets)} "
                 f"({no_data} no data, {len(active)} active) | "
                 f"bankroll=${self.kelly.bankroll:.2f}{adaptive_info} | "
                 f"{self.event_sentiment.summary()}"
             )
+            if regime_info:
+                logger.info(f"[HEARTBEAT] Regimes: {regime_info}")
             if active:
                 logger.info(f"[HEARTBEAT] Market status: {' | '.join(active)}")
+            # Persist regime + gas state for dashboard
+            try:
+                regime_file = Path(__file__).parent.parent / "regime_state.json"
+                gas_info = self.gas_optimizer.get_gas_info(dry_run=self.dry_run)
+                regime_file.write_text(json.dumps({
+                    "regimes": regime_summary,
+                    "gas": gas_info,
+                    "tick": self._tick_count,
+                    "ts": now,
+                }, indent=2))
+            except Exception:
+                pass
 
         if opportunities:
             self._execute_opportunities(opportunities)
@@ -3561,6 +4119,16 @@ class ArbitrageBot:
             side = opp.edge_result.side          # "YES", "NO", or "BOTH"
             is_passive = opp.edge_result.is_passive
             exec_type = "GTC/MAKER" if is_passive else "FOK/TAKER"
+
+            # --- Gas & Latency check: veto if gas > 30% of expected PnL ---
+            gas_ok, gas_reason = self.gas_optimizer.should_trade(
+                edge=opp.edge_result.ev_net,
+                stake=size,
+                dry_run=self.dry_run,
+            )
+            if not gas_ok:
+                logger.info(f"[GAS SKIP] {opp.market_id}: {gas_reason}")
+                continue
 
             if self.dry_run:
                 logger.info(

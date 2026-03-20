@@ -20,7 +20,7 @@ import json
 import os
 import time
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as dc_replace
 from pathlib import Path
 
 from models.bayesian import BayesianModel
@@ -29,6 +29,9 @@ from models.spread import SpreadMap, SpreadSignal
 from models.stoikov import StoikovModel, StoikovQuote
 from models.kelly import KellyModel, KellyResult
 from models.monte_carlo import MonteCarloSimulator
+from models.regime import RegimeDetector
+from models.ofi import OFIModel
+from models.gas_optimizer import GasOptimizer
 
 from data.price_feed import PriceFeed
 from data.market_data import PolymarketDataClient, GammaClient, extract_clob_tokens, extract_gamma_prices
@@ -119,6 +122,9 @@ class ArbitrageBot:
         self._last_wallet_update = 0.0
         self.event_sentiment = EventSentimentAnalyzer()
         self.adaptive = AdaptiveLearner()
+        self.regime = RegimeDetector()
+        self.ofi_model = OFIModel()
+        self.gas_optimizer = GasOptimizer()
 
         self._markets: dict[str, MarketState] = {}
         self._running = False
@@ -569,11 +575,20 @@ class ArbitrageBot:
                 continue
 
             ob_imbalance = yes_data["imbalance"] or 0.0
-            # Use CLOB depth if available; fall back to 0.5 for Gamma-only markets
             ob_depth = yes_data["depth"] if yes_data["depth"] else 0.5
+
+            # --- 2b. OFI analysis ---
+            ofi_result = self.ofi_model.evaluate({
+                "bids": yes_data.get("bids", []),
+                "asks": yes_data.get("asks", []),
+            })
 
             crypto_symbol = f"{state.asset}USDT"
             has_spot_price = crypto_symbol in new_prices
+
+            # Update regime model with latest spot price
+            if has_spot_price:
+                self.regime.update(state.asset, new_prices[crypto_symbol])
 
             # --- 3. Bayesian update ---
             volatility = self.price_feed.get_volatility(crypto_symbol) if has_spot_price else 0.0
@@ -615,6 +630,14 @@ class ArbitrageBot:
                     q = max(0.01, min(0.99, q + sentiment_boost))
                     logger.debug(f"[{market_id}] EventSentiment boost={sentiment_boost:+.3f} → q={q:.3f}")
 
+            # --- 3d. OFI signal: refine q with live order-flow pressure ---
+            if ofi_result.q_adjustment != 0.0:
+                q = max(0.01, min(0.99, q + ofi_result.q_adjustment))
+                logger.debug(
+                    f"[OFI:{state.asset}] {ofi_result.signal} "
+                    f"ofi={ofi_result.ofi:+.3f} → q_adj={ofi_result.q_adjustment:+.4f}"
+                )
+
             # --- 4. Edge check (uses dynamic MIN_EDGE from current tier) ---
             edge_result = self.edge_model.evaluate_directional(q=q, p=p_yes)
 
@@ -645,15 +668,16 @@ class ArbitrageBot:
                             if sig.is_signal:
                                 spread_signal = sig
 
-            # --- 6. Stoikov execution quote ---
+            # --- 6. Stoikov execution quote (OFI-adjusted) ---
             remaining_time = self._estimate_remaining_time(state)
+            # Shift mid-price by OFI signal so limit orders avoid aggressive sellers
+            ofi_adjusted_mid = max(0.01, min(0.99, p_yes + ofi_result.stoikov_shift))
             stoikov_quote = state.stoikov.quote(
-                mid_price=p_yes,
+                mid_price=ofi_adjusted_mid,
                 remaining_time=remaining_time,
             )
 
-            # --- 7. Kelly position sizing ---
-            # Maker edge → override stoikov to passive; edge model already decided
+            # --- 7. Kelly position sizing + Regime multiplier ---
             is_passive = edge_result.is_passive
             exec_prob = 0.9 if is_passive else 0.7
             kelly_result = self.kelly.compute(
@@ -662,6 +686,21 @@ class ArbitrageBot:
                 exec_probability=exec_prob,
                 ob_depth_factor=ob_depth,
             )
+
+            # Apply regime Kelly multiplier (1.0 / 0.75 / 0.50)
+            regime_mult = self.regime.get_multiplier(state.asset)
+            if regime_mult < 1.0:
+                original_size = kelly_result.position_size
+                kelly_result = dc_replace(
+                    kelly_result,
+                    position_size=kelly_result.position_size * regime_mult,
+                )
+                logger.debug(
+                    f"[REGIME:{state.asset}] "
+                    f"{self.regime.get_state(state.asset).regime} "
+                    f"→ size ${original_size:.3f} × {regime_mult:.2f} "
+                    f"= ${kelly_result.position_size:.3f}"
+                )
 
             if kelly_result.is_viable and kelly_result.position_size > 0:
                 opp = TradeOpportunity(
@@ -700,14 +739,33 @@ class ArbitrageBot:
                     f" | adaptive: kelly_adj={a_state['kelly_lambda_adj']:+.3f}, "
                     f"edge_adj={a_state['edge_threshold_adj']:+.4f}"
                 )
+            regime_summary = self.regime.summary()
+            regime_info = " | ".join(
+                f"{a}:{v['regime'].split('_')[0]}(×{v['kelly_mult']})"
+                for a, v in regime_summary.items()
+            )
             logger.info(
                 f"[HEARTBEAT] tick={self._tick_count} | markets={len(self._markets)} "
                 f"({no_data} no data, {len(active)} active) | "
                 f"bankroll=${self.kelly.bankroll:.2f}{adaptive_info} | "
                 f"{self.event_sentiment.summary()}"
             )
+            if regime_info:
+                logger.info(f"[HEARTBEAT] Regimes: {regime_info}")
             if active:
                 logger.info(f"[HEARTBEAT] Market status: {' | '.join(active)}")
+            # Persist regime + gas state for dashboard
+            try:
+                regime_file = Path(__file__).parent.parent / "regime_state.json"
+                gas_info = self.gas_optimizer.get_gas_info(dry_run=self.dry_run)
+                regime_file.write_text(json.dumps({
+                    "regimes": regime_summary,
+                    "gas": gas_info,
+                    "tick": self._tick_count,
+                    "ts": now,
+                }, indent=2))
+            except Exception:
+                pass
 
         if opportunities:
             self._execute_opportunities(opportunities)
@@ -723,6 +781,16 @@ class ArbitrageBot:
             side = opp.edge_result.side          # "YES", "NO", or "BOTH"
             is_passive = opp.edge_result.is_passive
             exec_type = "GTC/MAKER" if is_passive else "FOK/TAKER"
+
+            # --- Gas & Latency check: veto if gas > 30% of expected PnL ---
+            gas_ok, gas_reason = self.gas_optimizer.should_trade(
+                edge=opp.edge_result.ev_net,
+                stake=size,
+                dry_run=self.dry_run,
+            )
+            if not gas_ok:
+                logger.info(f"[GAS SKIP] {opp.market_id}: {gas_reason}")
+                continue
 
             if self.dry_run:
                 logger.info(
