@@ -35,6 +35,7 @@ type BotStatus = {
   pid: number | null;
   perAsset: Record<string, { wins: number; total: number; pnl: number }>;
   adaptive: Record<string, unknown>;
+  earlyExits: { tp: number; sl: number; total: number };
 };
 
 type PriceMap = { prices: Record<string, number>; updatedAt: string };
@@ -159,6 +160,28 @@ export function Overview() {
           color="text-yellow-400"
         />
       </div>
+
+      {status?.earlyExits && status.earlyExits.total > 0 && (
+        <div className="grid grid-cols-3 gap-4">
+          <StatCard
+            label="Take-Profit Exits"
+            value={`${status.earlyExits.tp}`}
+            sub="Gewinn mitgenommen"
+            color="text-green-400"
+          />
+          <StatCard
+            label="Stop-Loss Exits"
+            value={`${status.earlyExits.sl}`}
+            sub="Verlust begrenzt"
+            color="text-red-400"
+          />
+          <StatCard
+            label="Voller Ablauf"
+            value={`${status.resolvedTrades - status.earlyExits.total}`}
+            sub="bis Ende gehalten"
+          />
+        </div>
+      )}
 
       <div className="grid grid-cols-2 gap-4">
         <StatCard

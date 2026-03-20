@@ -52,6 +52,9 @@ from config import (
     POLYMARKET_ASSETS,
     GROWTH_TIERS,
     BANKROLL_STATE_FILE,
+    TP_RATIO,
+    SL_RATIO,
+    TP_SL_CHECK_INTERVAL,
 )
 
 TRADES_FILE = Path(__file__).parent.parent / "trades.json"
@@ -134,6 +137,7 @@ class ArbitrageBot:
         self._last_market_refresh = 0.0
         self._last_stats_log = 0.0
         self._last_adaptive_update = 0.0
+        self._last_tp_sl_check = 0.0
         self._tick_count = 0
         self.dry_run_tracker = DryRunTracker(virtual_bankroll=starting_bankroll)
         self._tier_base_lambda = self.kelly.lambda_fraction
@@ -380,6 +384,49 @@ class ArbitrageBot:
             logger.warning(f"Event market discovery failed: {e}")
         return registered
 
+    def _check_tp_sl(self, now: float):
+        if not self.dry_run:
+            return
+        open_entries = self.dry_run_tracker.get_open_entries()
+        if not open_entries:
+            return
+
+        for entry in open_entries:
+            market = self._markets.get(entry.market_id)
+            if not market:
+                continue
+
+            try:
+                yes_data = self.data_client.get_book_data(market.token_id_yes)
+                current_p_yes = yes_data["mid_price"]
+                if current_p_yes is None:
+                    continue
+            except Exception:
+                continue
+
+            if entry.side == "YES":
+                current_price = current_p_yes
+            else:
+                current_price = 1.0 - current_p_yes
+
+            shares = entry.size / entry.exec_price if entry.exec_price > 0 else 0
+            current_value = shares * current_price
+            unrealized_pnl = current_value - entry.size
+            pnl_ratio = unrealized_pnl / entry.size if entry.size > 0 else 0
+
+            if pnl_ratio >= TP_RATIO:
+                self.dry_run_tracker.early_exit(
+                    entry.trade_id, current_price,
+                    f"TAKE_PROFIT({pnl_ratio:+.1%})"
+                )
+                self.kelly.bankroll = self.dry_run_tracker.virtual_bankroll
+            elif pnl_ratio <= -SL_RATIO:
+                self.dry_run_tracker.early_exit(
+                    entry.trade_id, current_price,
+                    f"STOP_LOSS({pnl_ratio:+.1%})"
+                )
+                self.kelly.bankroll = self.dry_run_tracker.virtual_bankroll
+
     def _refresh_markets(self, now: float):
         """
         Re-discover active markets and remove expired ones.
@@ -556,6 +603,11 @@ class ArbitrageBot:
             self.kelly.lambda_fraction = self.adaptive.get_kelly_lambda(self._tier_base_lambda)
             self.edge_model.min_edge = self.adaptive.get_min_edge(self._tier_base_edge)
             self._current_min_edge = self.edge_model.min_edge
+
+        # --- 0. Check Take-Profit / Stop-Loss on open trades ---
+        if self.dry_run and now - self._last_tp_sl_check >= TP_SL_CHECK_INTERVAL:
+            self._last_tp_sl_check = now
+            self._check_tp_sl(now)
 
         # --- 1. Fetch crypto spot prices ---
         new_prices = self.price_feed.fetch()

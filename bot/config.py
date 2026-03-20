@@ -84,6 +84,11 @@ GROWTH_TIERS = [
 # State file for bankroll persistence across restarts
 BANKROLL_STATE_FILE = "bankroll_state.json"
 
+# Take-Profit / Stop-Loss (early exit)
+TP_RATIO = 0.15               # Take profit at 15% return on trade
+SL_RATIO = 0.25               # Stop loss at 25% loss on trade
+TP_SL_CHECK_INTERVAL = 10     # Check TP/SL every 10 seconds
+
 # Monte Carlo
 MC_SIMULATIONS = 600          # Number of simulation paths
 MC_TRADES = 200               # Number of trades per simulation

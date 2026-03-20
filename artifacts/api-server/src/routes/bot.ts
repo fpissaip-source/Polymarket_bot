@@ -48,7 +48,7 @@ type TradeRecord = {
   price: number; size: number; pnl: number; timestamp: string; status: string;
   question?: string; q?: number; edge?: number; confidence?: number;
   window_start?: string; window_end?: string;
-  outcome?: string; actual_outcome?: string;
+  outcome?: string; actual_outcome?: string; exit_reason?: string;
 };
 
 function getTrades(): TradeRecord[] {
@@ -61,7 +61,7 @@ type DryRunEntry = {
   outcome: string; pnl: number; question: string; timeframe: string;
   window_start: string; window_end: string; decision: string;
   confidence: number; bayesian_prior: number; kelly_lambda: number;
-  min_edge_used: number; actual_outcome: string;
+  min_edge_used: number; actual_outcome: string; exit_reason?: string;
 };
 
 function getDryRunLog(): DryRunEntry[] {
@@ -94,6 +94,9 @@ router.get("/bot/status", (req, res) => {
   const winRate = resolved.length > 0 ? wins / resolved.length : 0;
   const biggestWin = resolved.length > 0 ? Math.max(0, ...resolved.map(e => e.pnl || 0)) : 0;
   const biggestLoss = resolved.length > 0 ? Math.min(0, ...resolved.map(e => e.pnl || 0)) : 0;
+  const earlyExits = resolved.filter(e => e.exit_reason && e.exit_reason.length > 0);
+  const tpCount = earlyExits.filter(e => e.exit_reason!.startsWith("TAKE_PROFIT")).length;
+  const slCount = earlyExits.filter(e => e.exit_reason!.startsWith("STOP_LOSS")).length;
 
   const initialBk = getInitialBankroll();
   const virtualBankroll = initialBk + totalPnl;
@@ -133,6 +136,7 @@ router.get("/bot/status", (req, res) => {
     pid: botProcess?.pid ?? null,
     perAsset,
     adaptive,
+    earlyExits: { tp: tpCount, sl: slCount, total: earlyExits.length },
   });
 });
 
@@ -156,6 +160,7 @@ router.get("/bot/trades", (req, res) => {
     window_end: e.window_end || "",
     outcome: e.outcome || "",
     actual_outcome: e.actual_outcome || "",
+    exit_reason: e.exit_reason || "",
   }));
   res.json(trades);
 });

@@ -44,6 +44,7 @@ class DryRunEntry:
     min_edge_used: float = 0.01
     actual_outcome: str = ""
     trade_id: str = ""
+    exit_reason: str = ""
 
 
 class DryRunTracker:
@@ -122,6 +123,29 @@ class DryRunTracker:
             f"[DRY RUN TRADE] {asset} {decision} | q={q:.3f} p={p:.3f} edge={edge:.4f} "
             f"size=${capped_size:.2f} | bankroll=${self._virtual_bankroll:.2f} | {question[:60]}"
         )
+
+    def get_open_entries(self) -> list[DryRunEntry]:
+        return [e for e in self._entries if e.outcome == ""]
+
+    def early_exit(self, trade_id: str, exit_price: float, reason: str):
+        for e in self._entries:
+            if e.trade_id == trade_id and e.outcome == "":
+                shares = e.size / e.exec_price if e.exec_price > 0 else 0
+                sell_value = shares * exit_price
+                e.pnl = round(sell_value - e.size, 4)
+                e.outcome = "WIN" if e.pnl >= 0 else "LOSS"
+                e.exit_reason = reason
+                e.actual_outcome = reason
+                self._virtual_bankroll += e.pnl
+                self._save()
+                self._update_trades_file()
+                logger.info(
+                    f"[EARLY EXIT] {e.asset} {e.side} | {reason} | "
+                    f"entry={e.exec_price:.4f} exit={exit_price:.4f} | "
+                    f"P&L=${e.pnl:+.4f} | bankroll=${self._virtual_bankroll:.2f}"
+                )
+                return True
+        return False
 
     def resolve(self, market_id: str, winning_side: str):
         resolved = 0

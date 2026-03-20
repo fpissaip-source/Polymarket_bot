@@ -22,6 +22,7 @@ type Trade = {
   window_end?: string;
   outcome?: string;
   actual_outcome?: string;
+  exit_reason?: string;
 };
 
 export function Trades() {
@@ -123,14 +124,24 @@ export function Trades() {
                   <td className="py-2.5 px-2 text-right font-mono text-xs">${t.size.toFixed(2)}</td>
                   <td className="py-2.5 px-2 text-center">
                     {t.outcome === "WIN" && (
-                      <span className="px-2 py-0.5 rounded text-xs font-bold bg-green-500/20 text-green-400">
-                        GEWONNEN
-                      </span>
+                      <div>
+                        <span className="px-2 py-0.5 rounded text-xs font-bold bg-green-500/20 text-green-400">
+                          GEWONNEN
+                        </span>
+                        {t.exit_reason && t.exit_reason.startsWith("TAKE_PROFIT") && (
+                          <p className="text-[10px] text-green-400/70 mt-0.5">TP</p>
+                        )}
+                      </div>
                     )}
                     {t.outcome === "LOSS" && (
-                      <span className="px-2 py-0.5 rounded text-xs font-bold bg-red-500/20 text-red-400">
-                        VERLOREN
-                      </span>
+                      <div>
+                        <span className="px-2 py-0.5 rounded text-xs font-bold bg-red-500/20 text-red-400">
+                          VERLOREN
+                        </span>
+                        {t.exit_reason && t.exit_reason.startsWith("STOP_LOSS") && (
+                          <p className="text-[10px] text-red-400/70 mt-0.5">SL</p>
+                        )}
+                      </div>
                     )}
                     {(!t.outcome || t.outcome === "" || t.outcome === "OPEN") && (
                       <span className="px-2 py-0.5 rounded text-xs font-medium bg-yellow-500/20 text-yellow-400 animate-pulse">
