@@ -73,6 +73,7 @@ class MarketState:
     gamma_price_no: float | None = None
     question: str = ""      # Market question text (for event markets)
     is_event: bool = False  # True for politics/sports/etc. markets
+    spot_at_start: float = 0.0  # Crypto spot price when window opened
 
 
 @dataclass
@@ -204,6 +205,15 @@ class ArbitrageBot:
         gamma_price_yes: float | None = None,
         gamma_price_no: float | None = None,
     ):
+        spot = 0.0
+        if hasattr(self, '_last_prices') and asset.upper() in (self._last_prices or {}):
+            spot = self._last_prices[asset.upper()]
+        elif hasattr(self, 'price_feed'):
+            try:
+                prices = self.price_feed.fetch()
+                spot = prices.get(asset.upper(), 0.0)
+            except Exception:
+                pass
         state = MarketState(
             market_id=market_id,
             token_id_yes=token_id_yes,
@@ -215,6 +225,7 @@ class ArbitrageBot:
             end_time=end_time,
             gamma_price_yes=gamma_price_yes,
             gamma_price_no=gamma_price_no,
+            spot_at_start=spot,
         )
         # Auto-register spread pairs: any two markets with the same asset
         for existing_id, existing in self._markets.items():
@@ -356,19 +367,29 @@ class ArbitrageBot:
                    if s.end_time > 0 and (s.end_time - now) < 0 and not s.is_event]
         for mid in expired:
             state = self._markets[mid]
-            if self.dry_run and state.last_price > 0:
-                fresh_price = state.last_price
-                try:
-                    from data.market_data import ClobClient
-                    clob = ClobClient()
-                    mp = clob.get_midpoint(state.token_id_yes)
-                    if mp is not None and 0 < mp < 1:
-                        fresh_price = mp
-                except Exception:
-                    pass
-                winning_side = "YES" if fresh_price >= 0.5 else "NO"
-                self.dry_run_tracker.resolve(mid, winning_side)
-                self.kelly.bankroll = self.dry_run_tracker.virtual_bankroll
+            if self.dry_run and state.asset != "EVENT":
+                winning_side = None
+                if state.spot_at_start > 0:
+                    current_spot = 0.0
+                    if hasattr(self, '_last_prices') and state.asset.upper() in (self._last_prices or {}):
+                        current_spot = self._last_prices[state.asset.upper()]
+                    else:
+                        try:
+                            prices = self.price_feed.fetch()
+                            current_spot = prices.get(state.asset.upper(), 0.0)
+                        except Exception:
+                            pass
+                    if current_spot > 0:
+                        winning_side = "YES" if current_spot >= state.spot_at_start else "NO"
+                        logger.debug(
+                            f"[RESOLVE] {mid} spot: {state.spot_at_start:.2f} -> {current_spot:.2f} => {'UP' if winning_side == 'YES' else 'DOWN'}"
+                        )
+                if winning_side is None and state.last_price > 0:
+                    winning_side = "YES" if state.last_price >= 0.5 else "NO"
+                    logger.debug(f"[RESOLVE] {mid} fallback to market price: {state.last_price:.4f}")
+                if winning_side:
+                    self.dry_run_tracker.resolve(mid, winning_side)
+                    self.kelly.bankroll = self.dry_run_tracker.virtual_bankroll
             logger.debug(f"Removing expired market: {mid}")
             del self._markets[mid]
 
@@ -467,12 +488,11 @@ class ArbitrageBot:
 
         self._apply_growth_tier()
         if self.dry_run and hasattr(self, 'adaptive'):
-            adj_state = self.adaptive.get_state()
-            if adj_state.get("kelly_lambda_adj", 0) != 0:
-                self.kelly.lambda_fraction += adj_state["kelly_lambda_adj"]
-            if adj_state.get("edge_threshold_adj", 0) != 0:
-                self.edge_model.min_edge += adj_state["edge_threshold_adj"]
-                self._current_min_edge = self.edge_model.min_edge
+            base_lambda = self.kelly.lambda_fraction
+            base_edge = self.edge_model.min_edge
+            self.kelly.lambda_fraction = self.adaptive.get_kelly_lambda(base_lambda)
+            self.edge_model.min_edge = self.adaptive.get_min_edge(base_edge)
+            self._current_min_edge = self.edge_model.min_edge
 
         # --- 1. Fetch crypto spot prices ---
         new_prices = self.price_feed.fetch()

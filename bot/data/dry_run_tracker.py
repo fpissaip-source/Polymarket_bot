@@ -123,12 +123,13 @@ class DryRunTracker:
         for e in self._entries:
             if e.market_id == market_id and e.outcome == "":
                 e.actual_outcome = "UP" if winning_side in ("YES", "UP") else "DOWN"
+                shares = e.size / e.exec_price if e.exec_price > 0 else 0
                 if e.side == winning_side:
                     e.outcome = "WIN"
-                    e.pnl = round(e.size * (1.0 - e.exec_price), 4)
+                    e.pnl = round(shares * 1.0 - e.size, 4)
                 else:
                     e.outcome = "LOSS"
-                    e.pnl = round(-e.size * e.exec_price, 4)
+                    e.pnl = round(-e.size, 4)
                 self._virtual_bankroll += e.pnl
                 resolved += 1
         if resolved:
