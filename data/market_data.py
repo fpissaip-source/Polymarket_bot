@@ -30,9 +30,14 @@ class PolymarketDataClient:
         """Fetch list of active markets."""
         params = {"next_cursor": next_cursor} if next_cursor else {}
         try:
-            r = self._session.get(f"{self.host}/markets", params=params, timeout=10)
+            r = self._session.get("https://gamma-api.polymarket.com/events", params = {"active": "true", "closed": "false", "limit": 100})
             r.raise_for_status()
-            return r.json()
+            events = r.json()
+            markets = []
+            for e in events:
+                markets.extend(e.get("markets", []))
+            return markets
+
         except Exception as e:
             logger.error(f"Failed to fetch markets: {e}")
             return {}
@@ -119,40 +124,20 @@ class PolymarketDataClient:
     def get_order_book_depth(self, token_id: str, levels: int = 5) -> float:
         return self.get_book_data(token_id)["depth"]
 
-    def find_crypto_5min_markets(self, asset: str = "BTC") -> list[dict]:
-        """
-        Search for active crypto markets for the given asset via CLOB pagination.
-        First tries 5-minute markets; falls back to any active market for the asset.
-        """
-        five_min_kws = ("5-MINUTE", "5 MINUTE", "5 MINUTES", "5-MINUTES", "UP OR DOWN", "5MIN")
-        results_5m = []
-        results_any = []
-        cursor = ""
-        seen = 0
-        while seen < 800:  # limit search scope
-            data = self.get_markets(next_cursor=cursor)
-            markets = data.get("data", [])
-            if not markets:
-                break
-            for m in markets:
-                question = m.get("question", "").upper()
-                if asset.upper() not in question:
-                    continue
-                if any(kw in question for kw in five_min_kws):
-                    results_5m.append(m)
-                else:
-                    results_any.append(m)
-            cursor = data.get("next_cursor", "")
-            seen += len(markets)
-            if not cursor or cursor == "LTE=":
-                break
-
-        if results_5m:
-            logger.info(f"CLOB: found {len(results_5m)} 5-min markets for {asset}")
-            return results_5m
-        if results_any:
-            logger.info(f"CLOB: no 5-min markets for {asset}, using {len(results_any)} broader matches")
-        return results_any
+    def find_crypto_5min_markets(self, asset):
+        all_markets = self.get_markets()
+        # Sucht sowohl nach dem Kürzel (BTC) als auch dem Namen (Bitcoin)
+        aliases = {
+            "BTC": ["BTC", "BITCOIN"],
+            "ETH": ["ETH", "ETHEREUM"],
+            "SOL": ["SOL", "SOLANA"]
+        }
+        search_terms = aliases.get(asset.upper(), [asset.upper()])
+        filtered = [
+            m for m in all_markets 
+            if any(term in m.get("question", "").upper() for term in search_terms)
+        ]
+        return filtered
 
 
 def _get_with_retry(session: requests.Session, url: str, params: dict = None, timeout: int = 10) -> dict:
