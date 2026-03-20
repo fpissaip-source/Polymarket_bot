@@ -90,21 +90,123 @@ class PolymarketDataClient:
             logger.debug(f"Price fetch failed for {token_id[:16]}...: {e}")
         return None
 
-    def get_book_data(self, token_id: str, levels: int = 5) -> dict:
-        book = self.get_order_book(token_id)
-        if not book:
-            mid = self.get_midpoint(token_id)
-            return {"mid_price": mid, "imbalance": 0.0, "depth": 0.0}
+    def get_last_trade_price(self, token_id: str) -> float | None:
+        """
+        GET /last-trade-price — price of the most recent actual trade.
+        Per docs: used by Polymarket when spread > $0.10 (empty/illiquid book).
+        More reliable than midpoint for thin 5-minute markets.
+        """
+        try:
+            r = self._session.get(
+                f"{self.host}/last-trade-price",
+                params={"token_id": token_id},
+                timeout=10,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                price = data.get("price") or data.get("last_trade_price")
+                if price is not None:
+                    val = float(price)
+                    if 0.01 <= val <= 0.99:
+                        return val
+        except Exception as e:
+            logger.debug(f"Last trade price fetch failed for {token_id[:16]}...: {e}")
+        return None
 
-        bids = book.get("bids", [])
-        asks = book.get("asks", [])
+    def get_prices_batch(self, token_ids: list[str], side: str = "BUY") -> dict[str, float]:
+        """
+        POST /prices — batch fetch best price for multiple tokens.
+        Returns {token_id: price} dict.
+        """
+        try:
+            payload = [{"token_id": tid, "side": side} for tid in token_ids]
+            r = self._session.post(f"{self.host}/prices", json=payload, timeout=15)
+            if r.status_code == 200:
+                data = r.json()
+                result = {}
+                for tid, prices in data.items():
+                    p = prices.get(side) or prices.get("BUY") or prices.get("price")
+                    if p is not None:
+                        try:
+                            result[tid] = float(p)
+                        except (TypeError, ValueError):
+                            pass
+                return result
+        except Exception as e:
+            logger.debug(f"Batch price fetch failed: {e}")
+        return {}
+
+    def get_midpoints_batch(self, token_ids: list[str]) -> dict[str, float]:
+        """
+        POST /midpoints — batch fetch midpoint for multiple tokens.
+        Returns {token_id: midpoint} dict.
+        """
+        try:
+            payload = [{"token_id": tid} for tid in token_ids]
+            r = self._session.post(f"{self.host}/midpoints", json=payload, timeout=15)
+            if r.status_code == 200:
+                data = r.json()
+                result = {}
+                for tid, info in data.items():
+                    mid = info.get("mid") or info.get("midpoint") if isinstance(info, dict) else info
+                    if mid is not None:
+                        try:
+                            val = float(mid)
+                            if 0.01 <= val <= 0.99:
+                                result[tid] = val
+                        except (TypeError, ValueError):
+                            pass
+                return result
+        except Exception as e:
+            logger.debug(f"Batch midpoint fetch failed: {e}")
+        return {}
+
+    def get_book_data(self, token_id: str, levels: int = 5) -> dict:
+        """
+        Fetch price for a token using the correct Polymarket fallback chain:
+          1. Orderbook midpoint (best_bid + best_ask) / 2
+          2. If spread > 0.10 or book empty → use Last Trade Price
+          3. If no last trade → use /midpoint endpoint
+          4. Final fallback: None (caller handles)
+        """
+        book = self.get_order_book(token_id)
+        bids = book.get("bids", []) if book else []
+        asks = book.get("asks", []) if book else []
 
         best_bid = float(bids[0]["price"]) if bids else None
         best_ask = float(asks[0]["price"]) if asks else None
+
+        mid_price = None
+        spread = None
+
         if best_bid and best_ask:
-            mid_price = (best_bid + best_ask) / 2.0
-        else:
-            mid_price = best_bid or best_ask
+            spread = best_ask - best_bid
+            if spread <= 0.10:
+                # Tight spread → use midpoint (Polymarket standard behaviour)
+                mid_price = (best_bid + best_ask) / 2.0
+            else:
+                # Wide spread (>$0.10) → per docs, use last trade price
+                logger.debug(
+                    f"[BOOK] Wide spread {spread:.3f} for {token_id[:12]}... "
+                    f"→ falling back to last trade price"
+                )
+        elif best_bid:
+            mid_price = best_bid
+        elif best_ask:
+            mid_price = best_ask
+
+        # Fallback 2: Last trade price (for empty or wide-spread books)
+        if mid_price is None or (spread is not None and spread > 0.10):
+            last = self.get_last_trade_price(token_id)
+            if last is not None:
+                mid_price = last
+                logger.debug(f"[BOOK] Using last trade price {last:.4f} for {token_id[:12]}...")
+
+        # Fallback 3: /midpoint endpoint
+        if mid_price is None:
+            mid = self.get_midpoint(token_id)
+            if mid is not None and 0.01 <= mid <= 0.99:
+                mid_price = mid
 
         bid_vol = sum(float(b.get("size", 0)) for b in bids[:levels])
         ask_vol = sum(float(a.get("size", 0)) for a in asks[:levels])
@@ -118,6 +220,7 @@ class PolymarketDataClient:
             "depth": depth,
             "bids": bids,
             "asks": asks,
+            "spread": spread,
         }
 
     def get_mid_price(self, token_id: str) -> float | None:
