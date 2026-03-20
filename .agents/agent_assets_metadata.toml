@@ -1,0 +1,8 @@
+uploads = []
+generated = []
+
+[[outputs]]
+id = "k8gyZVD4F8mY_pyba8CIN"
+uri = "file://artifacts/api-server/public/bot_complete_code.txt"
+type = "text"
+title = "Polymarket Bot - Kompletter Code (3838 Zeilen)"
