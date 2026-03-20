@@ -67,7 +67,8 @@ STOIKOV_SIGMA_DEFAULT = 0.02  # Default variance estimate
 # Kelly model
 KELLY_FRACTION = 0.25         # Fractional Kelly (lambda), conservative
 KELLY_MAX_FRACTION = 0.5      # Maximum fraction of bankroll per trade
-BANKROLL = float(os.getenv("BANKROLL", "5.27"))  # Total capital in USD
+BANKROLL = float(os.getenv("BANKROLL", "2.00"))  # Total capital in USD (live trading)
+DRY_RUN_BANKROLL = float(os.getenv("DRY_RUN_BANKROLL", "25.00"))  # Virtual capital for dry-run simulation
 
 # Growth tiers: (min_balance, max_balance, kelly_lambda, min_edge)
 # Bot starts aggressive at $5 and scales down as bankroll grows.

@@ -94,3 +94,40 @@ Generated React Query hooks and fetch client from the OpenAPI spec (e.g. `useHea
 ### `scripts` (`@workspace/scripts`)
 
 Utility scripts package. Each script is a `.ts` file in `src/` with a corresponding npm script in `package.json`. Run scripts via `pnpm --filter @workspace/scripts run <script>`. Scripts can import any workspace package (e.g., `@workspace/db`) by adding it as a dependency in `scripts/package.json`.
+
+## Polymarket Trading Bot
+
+### Architecture
+Python-based trading bot in `bot/` directory. Uses 6 mathematical models:
+1. **Bayesian** — estimates true probability q from crypto spot prices and order book data
+2. **Edge** — filters: EV_net = q - p - c > MIN_EDGE (maker/taker cost distinction)
+3. **Spread** — cross-market z-score dislocation detection
+4. **Stoikov** — optimal execution price and passive/aggressive mode
+5. **Kelly** — position sizing: fractional Kelly with growth tiers
+6. **Monte Carlo** — strategy validation via simulation
+7. **Adaptive** — learns from dry-run results to adjust Kelly lambda, edge thresholds, and Bayesian priors
+
+### Key Configuration
+- Live bankroll: $2 (in config.py)
+- Dry-run virtual bankroll: $25
+- Market discovery: Gamma API events endpoint with slug-based 5-minute market discovery (`{asset}-updown-5m-{timestamp}`)
+- CLOB API used only for live data (book, midpoint, price)
+- Crypto prices from CoinGecko (Binance region-blocked)
+
+### Bot Files
+- `bot/main.py` — entry point (`--dry-run` default, `--live` for real trading)
+- `bot/config.py` — all constants and env vars
+- `bot/trading/bot.py` — main orchestration loop
+- `bot/data/market_data.py` — Gamma/CLOB API clients
+- `bot/data/dry_run_tracker.py` — extended dry-run trade recording with virtual bankroll
+- `bot/models/adaptive.py` — learning module that optimizes parameters from results
+- `bot/data/price_feed.py` — CoinGecko price feed
+- `bot/trading/order_executor.py` — Polymarket order placement
+
+### Dashboard
+- `artifacts/dashboard/` — React dashboard showing simulation results
+- `artifacts/api-server/src/routes/bot.ts` — API endpoints for bot status, trades, simulation data
+- `artifacts/api-server/src/routes/markets.ts` — Gamma API events-based market listing
+
+### VPS Deployment
+User's VPS "Traderbass" at `/root/Polymarket_bot/`. GitHub OAuth expired — code delivered as TXT download.

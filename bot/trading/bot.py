@@ -36,11 +36,13 @@ from data.wallet_tracker import WalletTracker
 from data.sentiment_analyzer import EventSentimentAnalyzer
 from data.dry_run_tracker import DryRunTracker
 from trading.order_executor import OrderExecutor
+from models.adaptive import AdaptiveLearner
 
 from config import (
     POLL_INTERVAL_SECONDS,
     RELATED_MARKETS,
     BANKROLL,
+    DRY_RUN_BANKROLL,
     MIN_EDGE,
     TOTAL_COST,
     CRYPTO_SYMBOLS,
@@ -100,11 +102,10 @@ class ArbitrageBot:
         self.edge_model = EdgeModel()
         self.spread_map = SpreadMap()
 
-        # Load persisted bankroll or use config default
-        starting_bankroll = self._load_bankroll()
+        starting_bankroll = DRY_RUN_BANKROLL if dry_run else self._load_bankroll()
         kelly_lambda, self._current_min_edge = _get_tier(starting_bankroll)
         logger.info(
-            f"Starting bankroll: ${starting_bankroll:.2f} | "
+            f"Starting bankroll: ${starting_bankroll:.2f} ({'VIRTUAL' if dry_run else 'LIVE'}) | "
             f"Tier: Kelly λ={kelly_lambda:.2f}, MIN_EDGE={self._current_min_edge:.1%}"
         )
 
@@ -115,6 +116,7 @@ class ArbitrageBot:
         self.wallet_tracker = WalletTracker()
         self._last_wallet_update = 0.0
         self.event_sentiment = EventSentimentAnalyzer()
+        self.adaptive = AdaptiveLearner()
 
         self._markets: dict[str, MarketState] = {}
         self._running = False
@@ -123,13 +125,13 @@ class ArbitrageBot:
         self._last_heartbeat = 0.0
         self._last_market_refresh = 0.0
         self._last_stats_log = 0.0
+        self._last_adaptive_update = 0.0
         self._tick_count = 0
-        self.dry_run_tracker = DryRunTracker()
-        self._MARKET_REFRESH_INTERVAL = 30  # re-discover markets every 30s
-        self._MARKET_WINDOW_MIN = 90        # skip if <90s remaining
-        self._MARKET_WINDOW_MAX = 360       # skip if >6min remaining (not open yet)
+        self.dry_run_tracker = DryRunTracker(virtual_bankroll=starting_bankroll)
+        self._MARKET_REFRESH_INTERVAL = 30
+        self._MARKET_WINDOW_MIN = 90
+        self._MARKET_WINDOW_MAX = 360
 
-        # Register known related pairs
         for m1, m2 in RELATED_MARKETS:
             self.spread_map.register_pair(m1, m2)
 
@@ -348,6 +350,7 @@ class ArbitrageBot:
         """
         Re-discover active markets and remove expired ones.
         Uses ONLY Gamma API for discovery.
+        Resolves expired markets and triggers adaptive learning.
         """
         expired = [mid for mid, s in self._markets.items()
                    if s.end_time > 0 and (s.end_time - now) < 0 and not s.is_event]
@@ -356,12 +359,28 @@ class ArbitrageBot:
             if self.dry_run and state.last_price > 0:
                 winning_side = "YES" if state.last_price >= 0.5 else "NO"
                 self.dry_run_tracker.resolve(mid, winning_side)
+                self.kelly.bankroll = self.dry_run_tracker.virtual_bankroll
             logger.debug(f"Removing expired market: {mid}")
             del self._markets[mid]
 
-        if self.dry_run and now - self._last_stats_log >= 300:
+        if self.dry_run and now - self._last_stats_log >= 120:
             self._last_stats_log = now
             self.dry_run_tracker.log_stats()
+
+        if self.dry_run and now - self._last_adaptive_update >= 180:
+            self._last_adaptive_update = now
+            resolved = self.dry_run_tracker.get_resolved_entries(last_n=50)
+            if len(resolved) >= 5:
+                result = self.adaptive.analyze_and_adapt(resolved)
+                if result.get("status") == "adapted":
+                    new_lambda = self.adaptive.get_kelly_lambda(self.kelly.lambda_fraction)
+                    new_edge = self.adaptive.get_min_edge(self._current_min_edge)
+                    self.kelly.lambda_fraction = new_lambda
+                    self.edge_model.min_edge = new_edge
+                    logger.info(
+                        f"[ADAPTIVE] Applied: Kelly λ={new_lambda:.3f}, "
+                        f"MIN_EDGE={new_edge:.4f}"
+                    )
 
         gamma = GammaClient()
         new_count = 0
@@ -437,8 +456,14 @@ class ArbitrageBot:
         elapsed = now - self._last_price_fetch if self._last_price_fetch else 1.0
         self._tick_count += 1
 
-        # Apply growth tier (adjusts Kelly λ and MIN_EDGE based on bankroll)
         self._apply_growth_tier()
+        if self.dry_run and hasattr(self, 'adaptive'):
+            adj_state = self.adaptive.get_state()
+            if adj_state.get("kelly_lambda_adj", 0) != 0:
+                self.kelly.lambda_fraction += adj_state["kelly_lambda_adj"]
+            if adj_state.get("edge_threshold_adj", 0) != 0:
+                self.edge_model.min_edge += adj_state["edge_threshold_adj"]
+                self._current_min_edge = self.edge_model.min_edge
 
         # --- 1. Fetch crypto spot prices ---
         new_prices = self.price_feed.fetch()
@@ -506,6 +531,10 @@ class ArbitrageBot:
                 ob_imbalance=ob_imbalance,
             )
             q = state.bayesian.update(bayesian_data)
+
+            asset_bias = self.adaptive.get_asset_bias(state.asset)
+            if asset_bias != 0.0:
+                q = max(0.01, min(0.99, q + asset_bias))
 
             # --- 3b. Wallet signal adjustment ---
             wallet_signal = self.wallet_tracker.get_signal(
@@ -604,10 +633,18 @@ class ArbitrageBot:
             self._last_heartbeat = now
             no_data = sum(1 for s in market_stats if "NO_DATA" in s)
             active = [s for s in market_stats if "NO_DATA" not in s]
+            adaptive_info = ""
+            if self.dry_run:
+                a_state = self.adaptive.get_state()
+                adaptive_info = (
+                    f" | adaptive: kelly_adj={a_state['kelly_lambda_adj']:+.3f}, "
+                    f"edge_adj={a_state['edge_threshold_adj']:+.4f}"
+                )
             logger.info(
                 f"[HEARTBEAT] tick={self._tick_count} | markets={len(self._markets)} "
                 f"({no_data} no data, {len(active)} active) | "
-                f"bankroll=${self.kelly.bankroll:.2f} | {self.event_sentiment.summary()}"
+                f"bankroll=${self.kelly.bankroll:.2f}{adaptive_info} | "
+                f"{self.event_sentiment.summary()}"
             )
             if active:
                 logger.info(f"[HEARTBEAT] Market status: {' | '.join(active)}")
@@ -633,8 +670,15 @@ class ArbitrageBot:
                     f"| EV={opp.edge_result.ev_net:.4f} | Kelly f={opp.kelly_result.f_kelly:.4f} "
                     f"| exec={exec_type}"
                 )
-                # Record opportunity for later analysis
                 record_side = side if side != "BOTH" else "YES"
+                window_start = ""
+                window_end = ""
+                if market.end_time > 0:
+                    import datetime
+                    end_dt = datetime.datetime.utcfromtimestamp(market.end_time)
+                    start_dt = end_dt - datetime.timedelta(minutes=5)
+                    window_start = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                    window_end = end_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
                 self.dry_run_tracker.record(
                     market_id=opp.market_id,
                     asset=market.asset,
@@ -644,6 +688,14 @@ class ArbitrageBot:
                     edge=opp.edge_result.ev_net,
                     size=size,
                     exec_price=price,
+                    question=market.question,
+                    timeframe=market.timeframe,
+                    window_start=window_start,
+                    window_end=window_end,
+                    confidence=market.bayesian.confidence,
+                    bayesian_prior=market.bayesian.prior,
+                    kelly_lambda=self.kelly.lambda_fraction,
+                    min_edge_used=self._current_min_edge,
                 )
                 continue
 
