@@ -130,6 +130,8 @@ class ArbitrageBot:
         self._last_adaptive_update = 0.0
         self._tick_count = 0
         self.dry_run_tracker = DryRunTracker(virtual_bankroll=starting_bankroll)
+        self._tier_base_lambda = self.kelly.lambda_fraction
+        self._tier_base_edge = self._current_min_edge
         self._MARKET_REFRESH_INTERVAL = 30
         self._MARKET_WINDOW_MIN = 90
         self._MARKET_WINDOW_MAX = 360
@@ -165,17 +167,17 @@ class ArbitrageBot:
     # Dynamic tier adjustment
     # ------------------------------------------------------------------
     def _apply_growth_tier(self):
-        """Adjust Kelly lambda and MIN_EDGE based on current bankroll."""
+        """Adjust Kelly lambda and MIN_EDGE based on current bankroll.
+        Always stores the tier base values for adaptive to build on."""
         kelly_lambda, min_edge = _get_tier(self.kelly.bankroll)
-        changed = False
-        if abs(kelly_lambda - self.kelly.lambda_fraction) > 0.001:
-            self.kelly.lambda_fraction = kelly_lambda
-            changed = True
-        if abs(min_edge - self._current_min_edge) > 0.0001:
-            self._current_min_edge = min_edge
-            self.edge_model.min_edge = min_edge
-            changed = True
-        if changed:
+        old_lambda = self._tier_base_lambda
+        old_edge = self._tier_base_edge
+        self._tier_base_lambda = kelly_lambda
+        self._tier_base_edge = min_edge
+        self.kelly.lambda_fraction = kelly_lambda
+        self._current_min_edge = min_edge
+        self.edge_model.min_edge = min_edge
+        if abs(kelly_lambda - old_lambda) > 0.001 or abs(min_edge - old_edge) > 0.0001:
             logger.info(
                 f"TIER CHANGE | Bankroll=${self.kelly.bankroll:.2f} | "
                 f"Kelly λ={kelly_lambda:.2f} | MIN_EDGE={min_edge:.1%}"
@@ -374,14 +376,25 @@ class ArbitrageBot:
             if self.dry_run and state.asset != "EVENT":
                 winning_side = None
                 cond_id = state.condition_id or ""
+                resolve_source = ""
                 try:
                     gamma = GammaClient()
                     resolved = gamma.get_resolved_outcome(cond_id) if cond_id else None
                     if resolved:
                         winning_side = resolved
-                        logger.debug(f"[RESOLVE] {mid} from Gamma API: {winning_side}")
+                        resolve_source = "gamma_settlement"
                 except Exception:
                     pass
+                if winning_side is None:
+                    try:
+                        from data.market_data import ClobClient
+                        clob = ClobClient()
+                        mp = clob.get_midpoint(state.token_id_yes)
+                        if mp is not None and 0 < mp < 1:
+                            winning_side = "YES" if mp >= 0.5 else "NO"
+                            resolve_source = f"clob_midpoint={mp:.4f}"
+                    except Exception:
+                        pass
                 if winning_side is None and state.spot_at_start > 0:
                     current_spot = 0.0
                     if hasattr(self, '_last_prices') and state.asset.upper() in (self._last_prices or {}):
@@ -394,12 +407,12 @@ class ArbitrageBot:
                             pass
                     if current_spot > 0:
                         winning_side = "YES" if current_spot >= state.spot_at_start else "NO"
-                        logger.debug(
-                            f"[RESOLVE] {mid} spot: {state.spot_at_start:.2f} -> {current_spot:.2f} => {'UP' if winning_side == 'YES' else 'DOWN'}"
-                        )
+                        resolve_source = f"spot={state.spot_at_start:.2f}->{current_spot:.2f}"
                 if winning_side is None and state.last_price > 0:
                     winning_side = "YES" if state.last_price >= 0.5 else "NO"
-                    logger.debug(f"[RESOLVE] {mid} last-resort market price: {state.last_price:.4f}")
+                    resolve_source = f"last_price={state.last_price:.4f}"
+                if resolve_source:
+                    logger.debug(f"[RESOLVE] {mid} via {resolve_source} => {winning_side}")
                 if winning_side:
                     self.dry_run_tracker.resolve(mid, winning_side)
                     self.kelly.bankroll = self.dry_run_tracker.virtual_bankroll
@@ -502,10 +515,8 @@ class ArbitrageBot:
 
         self._apply_growth_tier()
         if self.dry_run and hasattr(self, 'adaptive'):
-            base_lambda = self.kelly.lambda_fraction
-            base_edge = self.edge_model.min_edge
-            self.kelly.lambda_fraction = self.adaptive.get_kelly_lambda(base_lambda)
-            self.edge_model.min_edge = self.adaptive.get_min_edge(base_edge)
+            self.kelly.lambda_fraction = self.adaptive.get_kelly_lambda(self._tier_base_lambda)
+            self.edge_model.min_edge = self.adaptive.get_min_edge(self._tier_base_edge)
             self._current_min_edge = self.edge_model.min_edge
 
         # --- 1. Fetch crypto spot prices ---
