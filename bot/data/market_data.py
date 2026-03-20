@@ -163,15 +163,26 @@ class PolymarketDataClient:
 
     def get_book_data(self, token_id: str, levels: int = 5) -> dict:
         """
-        Fetch price for a token using the correct Polymarket fallback chain:
-          1. Orderbook midpoint (best_bid + best_ask) / 2
-          2. If spread > 0.10 or book empty → use Last Trade Price
-          3. If no last trade → use /midpoint endpoint
-          4. Final fallback: None (caller handles)
+        Fetch price for a token per Polymarket docs:
+        /book response includes: market, asset_id, bids[], asks[],
+        last_trade_price, tick_size, min_order_size, neg_risk, hash.
+
+        Price logic (per docs):
+          1. Compute midpoint = (best_bid + best_ask) / 2
+          2. If spread > $0.10 → use last_trade_price from book response
+          3. If no bids/asks → use last_trade_price or /midpoint endpoint
         """
         book = self.get_order_book(token_id)
         bids = book.get("bids", []) if book else []
         asks = book.get("asks", []) if book else []
+        book_last_trade = None
+        if book:
+            ltp = book.get("last_trade_price")
+            if ltp is not None:
+                try:
+                    book_last_trade = float(ltp)
+                except (TypeError, ValueError):
+                    pass
 
         best_bid = float(bids[0]["price"]) if bids else None
         best_ask = float(asks[0]["price"]) if asks else None
@@ -179,30 +190,23 @@ class PolymarketDataClient:
         mid_price = None
         spread = None
 
-        if best_bid and best_ask:
+        if best_bid is not None and best_ask is not None:
             spread = best_ask - best_bid
             if spread <= 0.10:
-                # Tight spread → use midpoint (Polymarket standard behaviour)
                 mid_price = (best_bid + best_ask) / 2.0
             else:
-                # Wide spread (>$0.10) → per docs, use last trade price
-                logger.debug(
-                    f"[BOOK] Wide spread {spread:.3f} for {token_id[:12]}... "
-                    f"→ falling back to last trade price"
-                )
-        elif best_bid:
+                if book_last_trade and 0.01 <= book_last_trade <= 0.99:
+                    mid_price = book_last_trade
+                else:
+                    mid_price = (best_bid + best_ask) / 2.0
+        elif best_bid is not None:
             mid_price = best_bid
-        elif best_ask:
+        elif best_ask is not None:
             mid_price = best_ask
 
-        # Fallback 2: Last trade price (for empty or wide-spread books)
-        if mid_price is None or (spread is not None and spread > 0.10):
-            last = self.get_last_trade_price(token_id)
-            if last is not None:
-                mid_price = last
-                logger.debug(f"[BOOK] Using last trade price {last:.4f} for {token_id[:12]}...")
+        if mid_price is None and book_last_trade and 0.01 <= book_last_trade <= 0.99:
+            mid_price = book_last_trade
 
-        # Fallback 3: /midpoint endpoint
         if mid_price is None:
             mid = self.get_midpoint(token_id)
             if mid is not None and 0.01 <= mid <= 0.99:
