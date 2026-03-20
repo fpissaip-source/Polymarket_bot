@@ -76,12 +76,16 @@ class BayesianModel:
 
         return max(0.05, min(0.95, score))
 
+    def set_alpha(self, alpha: float):
+        self._alpha_override = max(0.05, min(0.5, alpha))
+
     def _bayes_update(self, prior: float, likelihood: float) -> float:
         """
         P(H|D) = P(D|H) * P(H) / P(D)
         P(D) = P(D|H)*P(H) + P(D|~H)*(1-P(H))
         Uses exponential smoothing with BAYESIAN_ALPHA to avoid overreacting.
         """
+        alpha = getattr(self, '_alpha_override', BAYESIAN_ALPHA)
         p_d_given_h = likelihood
         p_d_given_not_h = 1.0 - likelihood
         p_d = p_d_given_h * prior + p_d_given_not_h * (1.0 - prior)
@@ -90,8 +94,7 @@ class BayesianModel:
             return prior
 
         raw_posterior = (p_d_given_h * prior) / p_d
-        # Exponential smoothing: don't jump too fast
-        smoothed = (1 - BAYESIAN_ALPHA) * prior + BAYESIAN_ALPHA * raw_posterior
+        smoothed = (1 - alpha) * prior + alpha * raw_posterior
         return smoothed
 
     @property

@@ -213,6 +213,35 @@ class GammaClient:
         self._session = requests.Session()
         self._session.headers.update({"Content-Type": "application/json"})
 
+    def get_market_by_condition(self, condition_id: str) -> dict | None:
+        try:
+            data = _get_with_retry(
+                self._session,
+                f"{self.host}/markets",
+                params={"condition_id": condition_id, "limit": 1},
+            )
+            markets = data if isinstance(data, list) else data.get("data", [])
+            if markets:
+                return markets[0]
+        except Exception as e:
+            logger.debug(f"GammaClient.get_market_by_condition failed: {e}")
+        return None
+
+    def get_resolved_outcome(self, condition_id: str) -> str | None:
+        m = self.get_market_by_condition(condition_id)
+        if not m:
+            return None
+        if m.get("closed") or not m.get("active", True):
+            outcome_prices = m.get("outcomePrices")
+            if outcome_prices:
+                try:
+                    prices = json.loads(outcome_prices) if isinstance(outcome_prices, str) else outcome_prices
+                    if len(prices) >= 2:
+                        return "YES" if float(prices[0]) > float(prices[1]) else "NO"
+                except Exception:
+                    pass
+        return None
+
     def get_markets(
         self,
         active: bool = True,

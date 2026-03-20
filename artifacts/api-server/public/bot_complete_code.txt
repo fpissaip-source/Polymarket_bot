@@ -1,7 +1,6 @@
 =============================================
 POLYMARKET BOT - COMPLETE SOURCE CODE
-Generated: Fri Mar 20 10:37:39 PM UTC 2026
-VERSION: Dry-Run Simulation + Adaptive Learning
+Generated: Fri Mar 20 10:43:06 PM UTC 2026
 =============================================
 
 ================================================================
@@ -506,6 +505,35 @@ class GammaClient:
         self.host = host.rstrip("/")
         self._session = requests.Session()
         self._session.headers.update({"Content-Type": "application/json"})
+
+    def get_market_by_condition(self, condition_id: str) -> dict | None:
+        try:
+            data = _get_with_retry(
+                self._session,
+                f"{self.host}/markets",
+                params={"condition_id": condition_id, "limit": 1},
+            )
+            markets = data if isinstance(data, list) else data.get("data", [])
+            if markets:
+                return markets[0]
+        except Exception as e:
+            logger.debug(f"GammaClient.get_market_by_condition failed: {e}")
+        return None
+
+    def get_resolved_outcome(self, condition_id: str) -> str | None:
+        m = self.get_market_by_condition(condition_id)
+        if not m:
+            return None
+        if m.get("closed") or not m.get("active", True):
+            outcome_prices = m.get("outcomePrices")
+            if outcome_prices:
+                try:
+                    prices = json.loads(outcome_prices) if isinstance(outcome_prices, str) else outcome_prices
+                    if len(prices) >= 2:
+                        return "YES" if float(prices[0]) > float(prices[1]) else "NO"
+                except Exception:
+                    pass
+        return None
 
     def get_markets(
         self,
@@ -1780,12 +1808,16 @@ class BayesianModel:
 
         return max(0.05, min(0.95, score))
 
+    def set_alpha(self, alpha: float):
+        self._alpha_override = max(0.05, min(0.5, alpha))
+
     def _bayes_update(self, prior: float, likelihood: float) -> float:
         """
         P(H|D) = P(D|H) * P(H) / P(D)
         P(D) = P(D|H)*P(H) + P(D|~H)*(1-P(H))
         Uses exponential smoothing with BAYESIAN_ALPHA to avoid overreacting.
         """
+        alpha = getattr(self, '_alpha_override', BAYESIAN_ALPHA)
         p_d_given_h = likelihood
         p_d_given_not_h = 1.0 - likelihood
         p_d = p_d_given_h * prior + p_d_given_not_h * (1.0 - prior)
@@ -1794,8 +1826,7 @@ class BayesianModel:
             return prior
 
         raw_posterior = (p_d_given_h * prior) / p_d
-        # Exponential smoothing: don't jump too fast
-        smoothed = (1 - BAYESIAN_ALPHA) * prior + BAYESIAN_ALPHA * raw_posterior
+        smoothed = (1 - alpha) * prior + alpha * raw_posterior
         return smoothed
 
     @property
@@ -2651,6 +2682,15 @@ class AdaptiveLearner:
         except Exception as e:
             logger.warning(f"AdaptiveLearner: could not save state: {e}")
 
+    def _compute_sharpe(self, entries: list) -> float:
+        if len(entries) < 2:
+            return 0.0
+        pnls = [e.pnl for e in entries]
+        mean = sum(pnls) / len(pnls)
+        variance = sum((p - mean) ** 2 for p in pnls) / len(pnls)
+        std = variance ** 0.5
+        return mean / std if std > 1e-8 else 0.0
+
     def analyze_and_adapt(self, resolved_entries: list) -> dict:
         import time
         if len(resolved_entries) < 5:
@@ -2664,6 +2704,7 @@ class AdaptiveLearner:
         win_rate = wins / n if n > 0 else 0.5
         total_pnl = sum(e.pnl for e in recent)
         avg_pnl = total_pnl / n
+        sharpe = self._compute_sharpe(recent)
 
         high_q_trades = [e for e in recent if e.q > 0.6 or e.q < 0.4]
         high_q_wins = sum(1 for e in high_q_trades if e.outcome == "WIN")
@@ -2673,35 +2714,34 @@ class AdaptiveLearner:
         low_q_wins = sum(1 for e in low_q_trades if e.outcome == "WIN")
         low_q_wr = low_q_wins / len(low_q_trades) if low_q_trades else 0.5
 
-        if win_rate > 0.6:
+        if sharpe > 0.5 and win_rate > 0.55:
             self.params.kelly_lambda_adj = min(0.15, self.params.kelly_lambda_adj + 0.02)
             self.params.edge_threshold_adj = max(-0.005, self.params.edge_threshold_adj - 0.001)
-        elif win_rate < 0.4:
+        elif sharpe < -0.3 or win_rate < 0.4:
             self.params.kelly_lambda_adj = max(-0.15, self.params.kelly_lambda_adj - 0.03)
             self.params.edge_threshold_adj = min(0.01, self.params.edge_threshold_adj + 0.002)
+        elif sharpe > 0.2 and win_rate > 0.5:
+            self.params.kelly_lambda_adj = min(0.15, self.params.kelly_lambda_adj + 0.01)
+            self.params.edge_threshold_adj *= 0.95
         else:
             self.params.kelly_lambda_adj *= 0.9
             self.params.edge_threshold_adj *= 0.9
-
-        if high_q_wr > 0.55:
-            alpha_boost = 0.02
-        elif high_q_wr < 0.45:
-            alpha_boost = -0.03
-        else:
-            alpha_boost = 0.0
 
         asset_stats = {}
         for e in recent:
             a = e.asset
             if a not in asset_stats:
-                asset_stats[a] = {"wins": 0, "total": 0, "pnl": 0.0}
+                asset_stats[a] = {"wins": 0, "total": 0, "pnl": 0.0, "entries": []}
             asset_stats[a]["total"] += 1
             if e.outcome == "WIN":
                 asset_stats[a]["wins"] += 1
             asset_stats[a]["pnl"] += e.pnl
+            asset_stats[a]["entries"].append(e)
 
         for asset, s in asset_stats.items():
             wr = s["wins"] / s["total"] if s["total"] > 0 else 0.5
+            asset_sharpe = self._compute_sharpe(s["entries"])
+
             if wr > 0.55:
                 self.params.asset_bias[asset] = min(0.05, self.params.asset_bias.get(asset, 0) + 0.01)
             elif wr < 0.45:
@@ -2709,7 +2749,12 @@ class AdaptiveLearner:
             else:
                 self.params.asset_bias[asset] = self.params.asset_bias.get(asset, 0) * 0.8
 
-            self.params.bayesian_alpha_adj[asset] = alpha_boost
+            if high_q_wr > 0.55 and asset_sharpe > 0.2:
+                self.params.bayesian_alpha_adj[asset] = min(0.10, self.params.bayesian_alpha_adj.get(asset, 0) + 0.02)
+            elif high_q_wr < 0.45 or asset_sharpe < -0.2:
+                self.params.bayesian_alpha_adj[asset] = max(-0.10, self.params.bayesian_alpha_adj.get(asset, 0) - 0.03)
+            else:
+                self.params.bayesian_alpha_adj[asset] = self.params.bayesian_alpha_adj.get(asset, 0) * 0.9
 
         self.params.total_analyzed = len(resolved_entries)
         self.params.last_update = time.time()
@@ -2720,6 +2765,7 @@ class AdaptiveLearner:
             "trades_analyzed": n,
             "win_rate": round(win_rate, 3),
             "avg_pnl": round(avg_pnl, 4),
+            "sharpe": round(sharpe, 3),
             "high_q_win_rate": round(high_q_wr, 3),
             "low_q_win_rate": round(low_q_wr, 3),
             "kelly_lambda_adj": round(self.params.kelly_lambda_adj, 4),
@@ -2728,7 +2774,7 @@ class AdaptiveLearner:
         }
 
         logger.info(
-            f"[ADAPTIVE] win_rate={win_rate:.1%} | avg_pnl=${avg_pnl:+.4f} | "
+            f"[ADAPTIVE] win_rate={win_rate:.1%} | sharpe={sharpe:.2f} | avg_pnl=${avg_pnl:+.4f} | "
             f"kelly_adj={self.params.kelly_lambda_adj:+.3f} | "
             f"edge_adj={self.params.edge_threshold_adj:+.4f} | "
             f"high_q_wr={high_q_wr:.1%} | low_q_wr={low_q_wr:.1%}"
@@ -2845,6 +2891,7 @@ class MarketState:
     question: str = ""      # Market question text (for event markets)
     is_event: bool = False  # True for politics/sports/etc. markets
     spot_at_start: float = 0.0  # Crypto spot price when window opened
+    condition_id: str = ""  # Full conditionId for Gamma API resolution
 
 
 @dataclass
@@ -2975,6 +3022,7 @@ class ArbitrageBot:
         end_time: float = 0.0,
         gamma_price_yes: float | None = None,
         gamma_price_no: float | None = None,
+        condition_id: str = "",
     ):
         spot = 0.0
         if hasattr(self, '_last_prices') and asset.upper() in (self._last_prices or {}):
@@ -2997,6 +3045,7 @@ class ArbitrageBot:
             gamma_price_yes=gamma_price_yes,
             gamma_price_no=gamma_price_no,
             spot_at_start=spot,
+            condition_id=condition_id,
         )
         # Auto-register spread pairs: any two markets with the same asset
         for existing_id, existing in self._markets.items():
@@ -3072,6 +3121,7 @@ class ArbitrageBot:
                     end_time=end_time,
                     gamma_price_yes=gamma_price_yes,
                     gamma_price_no=gamma_price_no,
+                    condition_id=str(condition_id),
                 )
                 registered += 1
                 registered_for_asset += 1
@@ -3140,7 +3190,16 @@ class ArbitrageBot:
             state = self._markets[mid]
             if self.dry_run and state.asset != "EVENT":
                 winning_side = None
-                if state.spot_at_start > 0:
+                cond_id = state.condition_id or ""
+                try:
+                    gamma = GammaClient()
+                    resolved = gamma.get_resolved_outcome(cond_id) if cond_id else None
+                    if resolved:
+                        winning_side = resolved
+                        logger.debug(f"[RESOLVE] {mid} from Gamma API: {winning_side}")
+                except Exception:
+                    pass
+                if winning_side is None and state.spot_at_start > 0:
                     current_spot = 0.0
                     if hasattr(self, '_last_prices') and state.asset.upper() in (self._last_prices or {}):
                         current_spot = self._last_prices[state.asset.upper()]
@@ -3157,7 +3216,7 @@ class ArbitrageBot:
                         )
                 if winning_side is None and state.last_price > 0:
                     winning_side = "YES" if state.last_price >= 0.5 else "NO"
-                    logger.debug(f"[RESOLVE] {mid} fallback to market price: {state.last_price:.4f}")
+                    logger.debug(f"[RESOLVE] {mid} last-resort market price: {state.last_price:.4f}")
                 if winning_side:
                     self.dry_run_tracker.resolve(mid, winning_side)
                     self.kelly.bankroll = self.dry_run_tracker.virtual_bankroll
@@ -3228,6 +3287,7 @@ class ArbitrageBot:
                     end_time=end_time,
                     gamma_price_yes=gamma_price_yes,
                     gamma_price_no=gamma_price_no,
+                    condition_id=str(condition_id),
                 )
                 new_count += 1
 
@@ -3330,6 +3390,10 @@ class ArbitrageBot:
                 volatility=volatility,
                 ob_imbalance=ob_imbalance,
             )
+            if self.dry_run and hasattr(self, 'adaptive'):
+                from config import BAYESIAN_ALPHA
+                adapted_alpha = self.adaptive.get_bayesian_alpha(state.asset, BAYESIAN_ALPHA)
+                state.bayesian.set_alpha(adapted_alpha)
             q = state.bayesian.update(bayesian_data)
 
             asset_bias = self.adaptive.get_asset_bias(state.asset)

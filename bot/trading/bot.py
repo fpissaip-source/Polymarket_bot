@@ -74,6 +74,7 @@ class MarketState:
     question: str = ""      # Market question text (for event markets)
     is_event: bool = False  # True for politics/sports/etc. markets
     spot_at_start: float = 0.0  # Crypto spot price when window opened
+    condition_id: str = ""  # Full conditionId for Gamma API resolution
 
 
 @dataclass
@@ -204,6 +205,7 @@ class ArbitrageBot:
         end_time: float = 0.0,
         gamma_price_yes: float | None = None,
         gamma_price_no: float | None = None,
+        condition_id: str = "",
     ):
         spot = 0.0
         if hasattr(self, '_last_prices') and asset.upper() in (self._last_prices or {}):
@@ -226,6 +228,7 @@ class ArbitrageBot:
             gamma_price_yes=gamma_price_yes,
             gamma_price_no=gamma_price_no,
             spot_at_start=spot,
+            condition_id=condition_id,
         )
         # Auto-register spread pairs: any two markets with the same asset
         for existing_id, existing in self._markets.items():
@@ -301,6 +304,7 @@ class ArbitrageBot:
                     end_time=end_time,
                     gamma_price_yes=gamma_price_yes,
                     gamma_price_no=gamma_price_no,
+                    condition_id=str(condition_id),
                 )
                 registered += 1
                 registered_for_asset += 1
@@ -369,7 +373,16 @@ class ArbitrageBot:
             state = self._markets[mid]
             if self.dry_run and state.asset != "EVENT":
                 winning_side = None
-                if state.spot_at_start > 0:
+                cond_id = state.condition_id or ""
+                try:
+                    gamma = GammaClient()
+                    resolved = gamma.get_resolved_outcome(cond_id) if cond_id else None
+                    if resolved:
+                        winning_side = resolved
+                        logger.debug(f"[RESOLVE] {mid} from Gamma API: {winning_side}")
+                except Exception:
+                    pass
+                if winning_side is None and state.spot_at_start > 0:
                     current_spot = 0.0
                     if hasattr(self, '_last_prices') and state.asset.upper() in (self._last_prices or {}):
                         current_spot = self._last_prices[state.asset.upper()]
@@ -386,7 +399,7 @@ class ArbitrageBot:
                         )
                 if winning_side is None and state.last_price > 0:
                     winning_side = "YES" if state.last_price >= 0.5 else "NO"
-                    logger.debug(f"[RESOLVE] {mid} fallback to market price: {state.last_price:.4f}")
+                    logger.debug(f"[RESOLVE] {mid} last-resort market price: {state.last_price:.4f}")
                 if winning_side:
                     self.dry_run_tracker.resolve(mid, winning_side)
                     self.kelly.bankroll = self.dry_run_tracker.virtual_bankroll
@@ -457,6 +470,7 @@ class ArbitrageBot:
                     end_time=end_time,
                     gamma_price_yes=gamma_price_yes,
                     gamma_price_no=gamma_price_no,
+                    condition_id=str(condition_id),
                 )
                 new_count += 1
 
@@ -559,6 +573,10 @@ class ArbitrageBot:
                 volatility=volatility,
                 ob_imbalance=ob_imbalance,
             )
+            if self.dry_run and hasattr(self, 'adaptive'):
+                from config import BAYESIAN_ALPHA
+                adapted_alpha = self.adaptive.get_bayesian_alpha(state.asset, BAYESIAN_ALPHA)
+                state.bayesian.set_alpha(adapted_alpha)
             q = state.bayesian.update(bayesian_data)
 
             asset_bias = self.adaptive.get_asset_bias(state.asset)

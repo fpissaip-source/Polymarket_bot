@@ -63,6 +63,15 @@ class AdaptiveLearner:
         except Exception as e:
             logger.warning(f"AdaptiveLearner: could not save state: {e}")
 
+    def _compute_sharpe(self, entries: list) -> float:
+        if len(entries) < 2:
+            return 0.0
+        pnls = [e.pnl for e in entries]
+        mean = sum(pnls) / len(pnls)
+        variance = sum((p - mean) ** 2 for p in pnls) / len(pnls)
+        std = variance ** 0.5
+        return mean / std if std > 1e-8 else 0.0
+
     def analyze_and_adapt(self, resolved_entries: list) -> dict:
         import time
         if len(resolved_entries) < 5:
@@ -76,6 +85,7 @@ class AdaptiveLearner:
         win_rate = wins / n if n > 0 else 0.5
         total_pnl = sum(e.pnl for e in recent)
         avg_pnl = total_pnl / n
+        sharpe = self._compute_sharpe(recent)
 
         high_q_trades = [e for e in recent if e.q > 0.6 or e.q < 0.4]
         high_q_wins = sum(1 for e in high_q_trades if e.outcome == "WIN")
@@ -85,35 +95,34 @@ class AdaptiveLearner:
         low_q_wins = sum(1 for e in low_q_trades if e.outcome == "WIN")
         low_q_wr = low_q_wins / len(low_q_trades) if low_q_trades else 0.5
 
-        if win_rate > 0.6:
+        if sharpe > 0.5 and win_rate > 0.55:
             self.params.kelly_lambda_adj = min(0.15, self.params.kelly_lambda_adj + 0.02)
             self.params.edge_threshold_adj = max(-0.005, self.params.edge_threshold_adj - 0.001)
-        elif win_rate < 0.4:
+        elif sharpe < -0.3 or win_rate < 0.4:
             self.params.kelly_lambda_adj = max(-0.15, self.params.kelly_lambda_adj - 0.03)
             self.params.edge_threshold_adj = min(0.01, self.params.edge_threshold_adj + 0.002)
+        elif sharpe > 0.2 and win_rate > 0.5:
+            self.params.kelly_lambda_adj = min(0.15, self.params.kelly_lambda_adj + 0.01)
+            self.params.edge_threshold_adj *= 0.95
         else:
             self.params.kelly_lambda_adj *= 0.9
             self.params.edge_threshold_adj *= 0.9
-
-        if high_q_wr > 0.55:
-            alpha_boost = 0.02
-        elif high_q_wr < 0.45:
-            alpha_boost = -0.03
-        else:
-            alpha_boost = 0.0
 
         asset_stats = {}
         for e in recent:
             a = e.asset
             if a not in asset_stats:
-                asset_stats[a] = {"wins": 0, "total": 0, "pnl": 0.0}
+                asset_stats[a] = {"wins": 0, "total": 0, "pnl": 0.0, "entries": []}
             asset_stats[a]["total"] += 1
             if e.outcome == "WIN":
                 asset_stats[a]["wins"] += 1
             asset_stats[a]["pnl"] += e.pnl
+            asset_stats[a]["entries"].append(e)
 
         for asset, s in asset_stats.items():
             wr = s["wins"] / s["total"] if s["total"] > 0 else 0.5
+            asset_sharpe = self._compute_sharpe(s["entries"])
+
             if wr > 0.55:
                 self.params.asset_bias[asset] = min(0.05, self.params.asset_bias.get(asset, 0) + 0.01)
             elif wr < 0.45:
@@ -121,7 +130,12 @@ class AdaptiveLearner:
             else:
                 self.params.asset_bias[asset] = self.params.asset_bias.get(asset, 0) * 0.8
 
-            self.params.bayesian_alpha_adj[asset] = alpha_boost
+            if high_q_wr > 0.55 and asset_sharpe > 0.2:
+                self.params.bayesian_alpha_adj[asset] = min(0.10, self.params.bayesian_alpha_adj.get(asset, 0) + 0.02)
+            elif high_q_wr < 0.45 or asset_sharpe < -0.2:
+                self.params.bayesian_alpha_adj[asset] = max(-0.10, self.params.bayesian_alpha_adj.get(asset, 0) - 0.03)
+            else:
+                self.params.bayesian_alpha_adj[asset] = self.params.bayesian_alpha_adj.get(asset, 0) * 0.9
 
         self.params.total_analyzed = len(resolved_entries)
         self.params.last_update = time.time()
@@ -132,6 +146,7 @@ class AdaptiveLearner:
             "trades_analyzed": n,
             "win_rate": round(win_rate, 3),
             "avg_pnl": round(avg_pnl, 4),
+            "sharpe": round(sharpe, 3),
             "high_q_win_rate": round(high_q_wr, 3),
             "low_q_win_rate": round(low_q_wr, 3),
             "kelly_lambda_adj": round(self.params.kelly_lambda_adj, 4),
@@ -140,7 +155,7 @@ class AdaptiveLearner:
         }
 
         logger.info(
-            f"[ADAPTIVE] win_rate={win_rate:.1%} | avg_pnl=${avg_pnl:+.4f} | "
+            f"[ADAPTIVE] win_rate={win_rate:.1%} | sharpe={sharpe:.2f} | avg_pnl=${avg_pnl:+.4f} | "
             f"kelly_adj={self.params.kelly_lambda_adj:+.3f} | "
             f"edge_adj={self.params.edge_threshold_adj:+.4f} | "
             f"high_q_wr={high_q_wr:.1%} | low_q_wr={low_q_wr:.1%}"
