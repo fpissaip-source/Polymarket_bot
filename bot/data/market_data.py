@@ -1,10 +1,17 @@
 """
 Polymarket Market Data
 ======================
-Fetches market prices, order books, and related market info
-from the Polymarket CLOB API and Gamma API.
+- Discovery: Gamma API only (events → markets → clobTokenIds)
+- Live data: CLOB API only (book, midpoint, price)
+
+Per Polymarket docs:
+  "Use the events endpoint and work backwards — events contain
+   their associated markets, reducing API calls."
+  "Save a token ID from clobTokenIds — the first ID is the Yes token,
+   the second is the No token."
 """
 
+import json
 import time
 import logging
 import requests
@@ -12,13 +19,35 @@ from config import POLYMARKET_HOST, GAMMA_API_HOST, DATA_API_HOST
 
 logger = logging.getLogger(__name__)
 
-_SENTINEL = object()   # used to distinguish "not passed" from None/[]
+
+def _get_with_retry(session: requests.Session, url: str, params: dict = None, timeout: int = 10) -> dict | list:
+    for attempt in range(4):
+        try:
+            r = session.get(url, params=params, timeout=timeout)
+            if r.status_code == 429:
+                wait = 2 ** attempt
+                logger.warning(f"Rate limited (429), retrying in {wait}s...")
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            return r.json()
+        except requests.exceptions.HTTPError:
+            raise
+        except Exception as e:
+            logger.error(f"Request failed ({url}): {e}")
+            return {}
+    return {}
 
 
 class PolymarketDataClient:
     """
-    Lightweight client for Polymarket's CLOB REST API.
-    Handles market discovery and price fetching.
+    CLOB API client — used ONLY for live market data.
+    NOT for market discovery (use GammaClient for that).
+    
+    Endpoints used:
+      GET /book?token_id=...    → order book
+      GET /midpoint?token_id=... → midpoint price  
+      GET /price?token_id=...   → last trade price
     """
 
     def __init__(self, host: str = POLYMARKET_HOST):
@@ -26,51 +55,20 @@ class PolymarketDataClient:
         self._session = requests.Session()
         self._session.headers.update({"Content-Type": "application/json"})
 
-    def get_markets(self, next_cursor: str = "") -> dict:
-        """Fetch list of active markets."""
-        params = {"next_cursor": next_cursor} if next_cursor else {}
-        try:
-            r = self._session.get(f"{self.host}/markets", params=params, timeout=10)
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            logger.error(f"Failed to fetch markets: {e}")
-            return {}
-
-    def get_market(self, condition_id: str) -> dict:
-        """Fetch a single market by condition ID."""
-        try:
-            r = self._session.get(f"{self.host}/markets/{condition_id}", timeout=10)
-            if r.status_code == 404:
-                logger.debug(f"Market {condition_id[:16]}... not on CLOB (404)")
-                return {}
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            logger.debug(f"Failed to fetch market {condition_id[:16]}...: {e}")
-            return {}
-
     def get_order_book(self, token_id: str) -> dict:
-        """Fetch order book for a token. Returns {} on 404 (token not on CLOB)."""
         try:
             r = self._session.get(f"{self.host}/book", params={"token_id": token_id}, timeout=10)
             if r.status_code == 404:
-                logger.debug(f"Order book not found for token {token_id[:16]}... (404)")
                 return {}
             r.raise_for_status()
             return r.json()
         except Exception as e:
-            logger.error(f"Failed to fetch order book for {token_id}: {e}")
+            logger.debug(f"Order book fetch failed for {token_id[:16]}...: {e}")
             return {}
 
     def get_midpoint(self, token_id: str) -> float | None:
-        """Fetch midpoint price directly from CLOB (works even with empty order book)."""
         try:
-            r = self._session.get(
-                f"{self.host}/midpoint",
-                params={"token_id": token_id},
-                timeout=10,
-            )
+            r = self._session.get(f"{self.host}/midpoint", params={"token_id": token_id}, timeout=10)
             if r.status_code == 200:
                 data = r.json()
                 mid = data.get("mid") or data.get("midpoint") or data.get("price")
@@ -80,12 +78,19 @@ class PolymarketDataClient:
             logger.debug(f"Midpoint fetch failed for {token_id[:16]}...: {e}")
         return None
 
+    def get_price(self, token_id: str) -> float | None:
+        try:
+            r = self._session.get(f"{self.host}/price", params={"token_id": token_id}, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                price = data.get("price") or data.get("last")
+                if price is not None:
+                    return float(price)
+        except Exception as e:
+            logger.debug(f"Price fetch failed for {token_id[:16]}...: {e}")
+        return None
+
     def get_book_data(self, token_id: str, levels: int = 5) -> dict:
-        """
-        Fetch the order book once and return mid_price, imbalance, and depth.
-        Falls back to CLOB /midpoint if order book is empty.
-        Returns: {"mid_price": float|None, "imbalance": float, "depth": float}
-        """
         book = self.get_order_book(token_id)
         if not book:
             mid = self.get_midpoint(token_id)
@@ -110,7 +115,6 @@ class PolymarketDataClient:
         return {"mid_price": mid_price, "imbalance": imbalance, "depth": depth}
 
     def get_mid_price(self, token_id: str) -> float | None:
-        """Compute mid price from order book."""
         return self.get_book_data(token_id)["mid_price"]
 
     def get_order_book_imbalance(self, token_id: str) -> float:
@@ -119,66 +123,89 @@ class PolymarketDataClient:
     def get_order_book_depth(self, token_id: str, levels: int = 5) -> float:
         return self.get_book_data(token_id)["depth"]
 
-    def find_crypto_5min_markets(self, asset: str = "BTC") -> list[dict]:
-        """
-        Search for active crypto markets for the given asset via CLOB pagination.
-        First tries 5-minute markets; falls back to any active market for the asset.
-        """
-        five_min_kws = ("5-MINUTE", "5 MINUTE", "5 MINUTES", "5-MINUTES", "UP OR DOWN", "5MIN")
-        results_5m = []
-        results_any = []
-        cursor = ""
-        seen = 0
-        while seen < 800:  # limit search scope
-            data = self.get_markets(next_cursor=cursor)
-            markets = data.get("data", [])
-            if not markets:
-                break
-            for m in markets:
-                question = m.get("question", "").upper()
-                if asset.upper() not in question:
-                    continue
-                if any(kw in question for kw in five_min_kws):
-                    results_5m.append(m)
-                else:
-                    results_any.append(m)
-            cursor = data.get("next_cursor", "")
-            seen += len(markets)
-            if not cursor or cursor == "LTE=":
-                break
 
-        if results_5m:
-            logger.info(f"CLOB: found {len(results_5m)} 5-min markets for {asset}")
-            return results_5m
-        if results_any:
-            logger.info(f"CLOB: no 5-min markets for {asset}, using {len(results_any)} broader matches")
-        return results_any
-
-
-def _get_with_retry(session: requests.Session, url: str, params: dict = None, timeout: int = 10) -> dict:
-    """GET with automatic 429 backoff."""
-    for attempt in range(4):
+def _parse_json_field(val) -> list:
+    if isinstance(val, list):
+        return val
+    if isinstance(val, str):
         try:
-            r = session.get(url, params=params, timeout=timeout)
-            if r.status_code == 429:
-                wait = 2 ** attempt
-                logger.warning(f"Rate limited (429), retrying in {wait}s...")
-                time.sleep(wait)
-                continue
-            r.raise_for_status()
-            return r.json()
-        except requests.exceptions.HTTPError:
-            raise
-        except Exception as e:
-            logger.error(f"Request failed ({url}): {e}")
-            return {}
-    return {}
+            parsed = json.loads(val)
+            if isinstance(parsed, list):
+                return parsed
+        except Exception:
+            pass
+    return []
+
+
+def extract_clob_tokens(m: dict) -> tuple[str | None, str | None]:
+    """
+    Extract YES and NO clobTokenIds from a Gamma market dict.
+    Per docs: "first ID is the Yes token, second is the No token."
+    
+    Priority:
+      1. clobTokenIds field (Gamma's canonical source)
+      2. tokens list with outcome field
+      3. Direct token_id_yes / token_id_no fields
+    """
+    YES_OUTCOMES = {"YES", "1", "UP", "HOCH", "HIGH", "OVER", "ABOVE", "TRUE"}
+    NO_OUTCOMES = {"NO", "0", "DOWN", "RUNTER", "LOW", "UNDER", "BELOW", "FALSE"}
+
+    clob_ids = _parse_json_field(m.get("clobTokenIds", []))
+    outcomes = _parse_json_field(m.get("outcomes", []))
+
+    if clob_ids and len(clob_ids) >= 2:
+        if outcomes and len(outcomes) >= 2:
+            yes = no = None
+            for i, outcome in enumerate(outcomes):
+                if str(outcome).upper() in YES_OUTCOMES and i < len(clob_ids):
+                    yes = clob_ids[i]
+                elif str(outcome).upper() in NO_OUTCOMES and i < len(clob_ids):
+                    no = clob_ids[i]
+            if yes and no:
+                return str(yes), str(no)
+        return str(clob_ids[0]), str(clob_ids[1])
+
+    tokens = _parse_json_field(m.get("tokens", []))
+    if tokens and isinstance(tokens[0], dict):
+        def _tid(t):
+            return t.get("token_id") or t.get("tokenId")
+
+        yes = next((_tid(t) for t in tokens
+                    if t.get("outcome", "").upper() in YES_OUTCOMES), None)
+        no = next((_tid(t) for t in tokens
+                   if t.get("outcome", "").upper() in NO_OUTCOMES), None)
+        if yes and no:
+            return str(yes), str(no)
+        if len(tokens) >= 2 and _tid(tokens[0]) and _tid(tokens[1]):
+            return str(_tid(tokens[0])), str(_tid(tokens[1]))
+
+    yes = m.get("token_id_yes") or m.get("tokenIdYes")
+    no = m.get("token_id_no") or m.get("tokenIdNo")
+    if yes and no:
+        return str(yes), str(no)
+
+    return None, None
+
+
+def extract_gamma_prices(m: dict) -> tuple[float | None, float | None]:
+    raw = _parse_json_field(m.get("outcomePrices", []))
+    if len(raw) >= 2:
+        try:
+            return float(raw[0]), float(raw[1])
+        except (ValueError, TypeError):
+            pass
+    return None, None
 
 
 class GammaClient:
     """
-    Client for the Gamma API (Market Discovery & Metadata).
-    Level 0 – no authentication required.
+    Gamma API client — used for ALL market discovery.
+    
+    Per docs, Gamma is the source of truth for:
+      - Market metadata (question, outcomes, endDate)
+      - clobTokenIds (YES/NO token IDs for CLOB endpoints)
+      - outcomePrices (current prices)
+      - Events (groups of related markets)
     """
 
     def __init__(self, host: str = GAMMA_API_HOST):
@@ -189,93 +216,183 @@ class GammaClient:
     def get_markets(
         self,
         active: bool = True,
+        closed: bool = False,
         limit: int = 100,
         offset: int = 0,
         tag_slug: str = "",
         keyword: str = "",
+        order: str = "",
+        ascending: str = "",
     ) -> list[dict]:
-        """
-        Fetch markets from Gamma API.
-        Uses 'tag_slug' for category filtering and 'keyword' for text search.
-        No 'category' param — Gamma uses tag slugs (e.g. 'crypto').
-        """
-        params: dict = {"active": "true" if active else "false", "limit": limit, "offset": offset}
+        params: dict = {
+            "active": "true" if active else "false",
+            "closed": "true" if closed else "false",
+            "limit": limit,
+            "offset": offset,
+        }
         if tag_slug:
             params["tag_slug"] = tag_slug
         if keyword:
             params["keyword"] = keyword
+        if order:
+            params["order"] = order
+        if ascending:
+            params["ascending"] = ascending
+
         data = _get_with_retry(self._session, f"{self.host}/markets", params=params)
         if isinstance(data, list):
             return data
         return data.get("data", data.get("markets", []))
 
-    def find_crypto_markets(self, asset: str, keywords: list[str] | None = _SENTINEL) -> list[dict]:
+    def get_events(
+        self,
+        active: bool = True,
+        closed: bool = False,
+        limit: int = 50,
+        offset: int = 0,
+        tag: str = "",
+        keyword: str = "",
+        order: str = "",
+    ) -> list[dict]:
         """
-        Search active crypto markets matching an asset and optional keywords.
-
-        keywords=None (default sentinel) → searches for 5-minute variants first,
-                                           falls back to any match if none found.
-        keywords=[]                      → no keyword filter (return all with asset name).
-        keywords=[...]                   → filter by those keywords.
+        Fetch events from Gamma. Each event contains a 'markets' list.
+        Per docs: "Use the events endpoint and work backwards."
         """
-        # Resolve keywords default
-        no_keyword_filter = (keywords is None)
-        if keywords is _SENTINEL:
-            keywords = ["5 minutes", "5-minutes", "5 minute", "5-minute", "up or down", "5min"]
+        params: dict = {
+            "active": "true" if active else "false",
+            "closed": "true" if closed else "false",
+            "limit": limit,
+            "offset": offset,
+        }
+        if tag:
+            params["tag"] = tag
+        if keyword:
+            params["keyword"] = keyword
+        if order:
+            params["order"] = order
 
-        matched = []
-
-        for offset in range(0, 500, 100):
-            # Try keyword+crypto tag first, then keyword only, then crypto tag only
-            markets = self.get_markets(active=True, keyword=asset, tag_slug="crypto", limit=100, offset=offset)
-            if not markets:
-                markets = self.get_markets(active=True, keyword=asset, limit=100, offset=offset)
-            if not markets:
-                markets = self.get_markets(active=True, tag_slug="crypto", limit=100, offset=offset)
-            if not markets:
-                break
-
-            for m in markets:
-                question = m.get("question", "").upper()
-                if asset.upper() not in question:
-                    continue
-
-                # Skip resolved markets — outcomePrices near 0 or 1 means decided
-                import json as _j
-                raw = m.get("outcomePrices", [])
-                if isinstance(raw, str):
-                    try:
-                        raw = _j.loads(raw)
-                    except Exception:
-                        raw = []
-                if isinstance(raw, list) and len(raw) >= 2:
-                    try:
-                        p0, p1 = float(raw[0]), float(raw[1])
-                        if not (0.05 <= p0 <= 0.95) or not (0.05 <= p1 <= 0.95):
-                            continue  # already resolved
-                    except Exception:
-                        pass
-
-                if no_keyword_filter or not keywords:
-                    matched.append(m)
-                elif any(kw.upper() in question for kw in keywords):
-                    matched.append(m)
-
-            if len(markets) < 100:
-                break
-
-        if matched:
-            logger.info(f"Gamma: found {len(matched)} markets for {asset}")
-        else:
-            logger.info(f"Gamma: no active 5-min markets found for {asset}")
-        return matched
-
-    def get_events(self, limit: int = 50) -> list[dict]:
-        """Fetch event groups (e.g. 'US Election')."""
-        data = _get_with_retry(self._session, f"{self.host}/events", params={"limit": limit})
+        data = _get_with_retry(self._session, f"{self.host}/events", params=params)
         if isinstance(data, list):
             return data
-        return data.get("data", [])
+        return data.get("data", data.get("events", []))
+
+    def discover_crypto_markets(self, asset: str) -> list[dict]:
+        """
+        Discover active crypto markets for an asset.
+        Strategy: events endpoint first (per docs), then markets endpoint fallback.
+        Accepts ALL active crypto markets (5-min, hourly, daily, event-based).
+        Returns list of Gamma market dicts with clobTokenIds.
+        """
+        matched = []
+        seen_ids = set()
+
+        asset_variants = [asset.upper()]
+        name_map = {
+            "BTC": ["BTC", "BITCOIN"],
+            "ETH": ["ETH", "ETHEREUM"],
+            "SOL": ["SOL", "SOLANA"],
+            "XRP": ["XRP", "RIPPLE"],
+            "DOGE": ["DOGE", "DOGECOIN"],
+            "BNB": ["BNB", "BINANCE"],
+            "HYPE": ["HYPE", "HYPERLIQUID"],
+        }
+        if asset.upper() in name_map:
+            asset_variants = name_map[asset.upper()]
+
+        def _matches_asset(question: str) -> bool:
+            q = question.upper()
+            return any(v in q for v in asset_variants)
+
+        def _try_add(m: dict):
+            if not m.get("active", True) or m.get("closed", False):
+                return
+            question = m.get("question", "")
+            if not _matches_asset(question):
+                return
+            clob_ids = _parse_json_field(m.get("clobTokenIds", []))
+            if len(clob_ids) < 2:
+                return
+            mid = m.get("conditionId") or m.get("id", "")
+            if mid in seen_ids:
+                return
+            p_yes, _ = extract_gamma_prices(m)
+            if p_yes is not None and not (0.05 <= p_yes <= 0.95):
+                return
+            seen_ids.add(mid)
+            matched.append(m)
+
+        for variant in asset_variants:
+            events = self.get_events(active=True, keyword=variant, tag="crypto", limit=50)
+            for event in events:
+                for m in event.get("markets", []):
+                    _try_add(m)
+
+        if not matched:
+            for variant in asset_variants:
+                events = self.get_events(active=True, keyword=variant, limit=50)
+                for event in events:
+                    for m in event.get("markets", []):
+                        _try_add(m)
+
+        if not matched:
+            for variant in asset_variants:
+                for offset in range(0, 300, 100):
+                    markets = self.get_markets(
+                        active=True, keyword=variant, tag_slug="crypto",
+                        limit=100, offset=offset,
+                    )
+                    if not markets:
+                        markets = self.get_markets(
+                            active=True, keyword=variant, limit=100, offset=offset,
+                        )
+                    if not markets:
+                        break
+                    for m in markets:
+                        _try_add(m)
+                    if len(markets) < 100:
+                        break
+
+        five_min_kws = ("5-MINUTE", "5 MINUTE", "5 MINUTES", "UP OR DOWN", "5MIN")
+        five_min = [m for m in matched if any(kw in m.get("question", "").upper() for kw in five_min_kws)]
+
+        if five_min:
+            logger.info(f"Gamma: found {len(five_min)} 5-min markets for {asset}")
+            return five_min
+        if matched:
+            logger.info(f"Gamma: found {len(matched)} markets for {asset} (no 5-min available)")
+            return matched
+
+        logger.info(f"Gamma: no active markets found for {asset}")
+        return []
+
+    def discover_event_markets(self, limit: int = 50, exclude_assets: list[str] = None) -> list[dict]:
+        """
+        Discover high-volume non-crypto event markets (politics, sports, etc.)
+        using the events endpoint.
+        """
+        exclude = [a.lower() for a in (exclude_assets or [])]
+        crypto_words = ["bitcoin", "ethereum", "solana", "btc", "eth", "sol", "xrp", "doge", "bnb", "hype", "crypto"]
+
+        matched = []
+        events = self.get_events(active=True, limit=limit, order="volume")
+        for event in events:
+            event_markets = event.get("markets", [])
+            for m in event_markets:
+                question = m.get("question", "").lower()
+                if any(cw in question for cw in crypto_words):
+                    continue
+                if not m.get("active", True) or m.get("closed", False):
+                    continue
+                clob_ids = _parse_json_field(m.get("clobTokenIds", []))
+                if len(clob_ids) < 2:
+                    continue
+                p_yes, _ = extract_gamma_prices(m)
+                if p_yes is not None and not (0.05 <= p_yes <= 0.95):
+                    continue
+                matched.append(m)
+
+        logger.info(f"Gamma: found {len(matched)} event markets")
+        return matched
 
 
 class DataApiClient:
@@ -290,7 +407,6 @@ class DataApiClient:
         self._session.headers.update({"Content-Type": "application/json"})
 
     def get_positions(self, user_address: str) -> list[dict]:
-        """Fetch open positions for a wallet address."""
         data = _get_with_retry(
             self._session,
             f"{self.host}/positions",
@@ -301,7 +417,6 @@ class DataApiClient:
         return data.get("data", [])
 
     def get_activity(self, user_address: str, limit: int = 100) -> list[dict]:
-        """Fetch trade history / PnL for a wallet address."""
         data = _get_with_retry(
             self._session,
             f"{self.host}/activity",

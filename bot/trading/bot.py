@@ -31,7 +31,7 @@ from models.kelly import KellyModel, KellyResult
 from models.monte_carlo import MonteCarloSimulator
 
 from data.price_feed import PriceFeed
-from data.market_data import PolymarketDataClient, GammaClient
+from data.market_data import PolymarketDataClient, GammaClient, extract_clob_tokens, extract_gamma_prices
 from data.wallet_tracker import WalletTracker
 from data.sentiment_analyzer import EventSentimentAnalyzer
 from data.dry_run_tracker import DryRunTracker
@@ -222,121 +222,42 @@ class ArbitrageBot:
         self._markets[market_id] = state
         logger.info(f"Registered market: {market_id} ({asset} {timeframe})")
 
-    @staticmethod
-    def _extract_tokens(m: dict) -> tuple[str | None, str | None]:
-        """
-        Extract YES and NO token IDs from a market dict.
-        Handles multiple Gamma/CLOB API response formats including
-        cases where list fields are returned as JSON strings.
-        """
-        import json as _json
-
-        def _parse_list(val):
-            """Parse value to list – handles both actual lists and JSON strings."""
-            if isinstance(val, list):
-                return val
-            if isinstance(val, str):
-                try:
-                    parsed = _json.loads(val)
-                    if isinstance(parsed, list):
-                        return parsed
-                except Exception:
-                    pass
-            return []
-
-        # Outcomes that map to YES (Up/High side)
-        YES_OUTCOMES = {"YES", "1", "UP", "HOCH", "HIGH", "OVER", "ABOVE", "TRUE"}
-        # Outcomes that map to NO (Down/Low side)
-        NO_OUTCOMES = {"NO", "0", "DOWN", "RUNTER", "LOW", "UNDER", "BELOW", "FALSE"}
-
-        # Format 1: tokens list with outcome field (CLOB/Gamma format)
-        # Gamma uses camelCase "tokenId"; CLOB uses snake_case "token_id"
-        tokens = _parse_list(m.get("tokens", []))
-        if tokens and isinstance(tokens[0], dict):
-            def _tid(t):
-                return t.get("token_id") or t.get("tokenId")
-
-            yes = next((_tid(t) for t in tokens
-                        if t.get("outcome", "").upper() in YES_OUTCOMES), None)
-            no = next((_tid(t) for t in tokens
-                       if t.get("outcome", "").upper() in NO_OUTCOMES), None)
-            if yes and no:
-                return yes, no
-
-            # Gamma tokens may have no "outcome" field — use positional (first=YES, second=NO)
-            if len(tokens) >= 2 and _tid(tokens[0]) and _tid(tokens[1]):
-                return _tid(tokens[0]), _tid(tokens[1])
-
-        # Format 2: clobTokenIds list + outcomes list (Gamma format)
-        # NOTE: Gamma often returns these as JSON strings, not real lists!
-        clob_ids = _parse_list(m.get("clobTokenIds", []))
-        outcomes = _parse_list(m.get("outcomes", []))
-        if clob_ids and len(clob_ids) >= 2:
-            if outcomes and len(outcomes) >= 2:
-                yes = no = None
-                for i, outcome in enumerate(outcomes):
-                    if str(outcome).upper() in YES_OUTCOMES and i < len(clob_ids):
-                        yes = clob_ids[i]
-                    elif str(outcome).upper() in NO_OUTCOMES and i < len(clob_ids):
-                        no = clob_ids[i]
-                if yes and no:
-                    return yes, no
-            # Fallback: first = YES, second = NO
-            return str(clob_ids[0]), str(clob_ids[1])
-
-        # Format 3: token_id_yes / token_id_no directly
-        yes = m.get("token_id_yes") or m.get("tokenIdYes")
-        no = m.get("token_id_no") or m.get("tokenIdNo")
-        if yes and no:
-            return str(yes), str(no)
-
-        return None, None
-
     def auto_discover_markets(self):
         """
-        Fetch active crypto markets via CLOB API (primary) with Gamma as fallback.
-        CLOB indexes live 5-minute markets directly; Gamma often misses them.
-        Handles multiple CLOB/Gamma API response formats robustly.
+        Discover active markets using ONLY Gamma API.
+        Per docs: Use events endpoint → extract markets → get clobTokenIds.
+        CLOB is used only for live data (book, midpoint, price).
         """
         import datetime
         gamma = GammaClient()
-        assets = POLYMARKET_ASSETS  # BTC, ETH, SOL, XRP, DOGE, BNB, HYPE
+        assets = POLYMARKET_ASSETS
         registered = 0
 
         for asset in assets:
-            logger.info(f"Discovering {asset} markets via CLOB API (primary)...")
-            markets = self.data_client.find_crypto_5min_markets(asset)
+            logger.info(f"Discovering {asset} markets via Gamma API...")
+            markets = gamma.discover_crypto_markets(asset)
             if not markets:
-                logger.info(f"CLOB empty, falling back to Gamma for {asset}...")
-                markets = gamma.find_crypto_markets(asset)
-            if not markets:
-                logger.warning(f"No 5-min markets found for {asset} — skipping")
+                logger.warning(f"No markets found for {asset} on Gamma — skipping")
                 continue
-
-            logger.debug(f"{asset}: {len(markets)} candidates, first keys: {list(markets[0].keys())}")
 
             registered_for_asset = 0
             for m in markets:
-                if registered_for_asset >= 3:  # max 3 per asset
+                if registered_for_asset >= 3:
                     break
 
-                # Condition ID from various field names
                 condition_id = (m.get("conditionId") or m.get("condition_id") or
                                 m.get("id") or "unknown")
 
-                # Extract token IDs from Gamma response (tokenId field)
-                # Do NOT call CLOB /markets/{id} — it returns 404 for Gamma condition IDs
-                yes_token, no_token = self._extract_tokens(m)
-
+                yes_token, no_token = extract_clob_tokens(m)
                 if not yes_token or not no_token:
                     logger.warning(
-                        f"{asset}: Could not extract tokens from market. "
-                        f"Keys available: {list(m.keys())}"
+                        f"{asset}: Could not extract clobTokenIds from Gamma market. "
+                        f"Keys: {list(m.keys())}"
                     )
                     continue
+
                 market_id = f"{asset}_5m_{str(condition_id)[:8]}"
 
-                # End time — ignore clearly invalid dates (more than a day in the past)
                 end_time = 0.0
                 now_ts = time.time()
                 end_date = (m.get("endDate") or m.get("end_date_iso") or
@@ -346,34 +267,16 @@ class ArbitrageBot:
                     try:
                         dt = datetime.datetime.fromisoformat(str(end_date).replace("Z", "+00:00"))
                         ts = dt.timestamp()
-                        if ts > now_ts - 86400:  # only accept if not more than 1 day in the past
+                        if ts > now_ts - 86400:
                             end_time = ts
                     except Exception:
                         pass
 
-                # Skip already-expired markets
                 if end_time > 0 and end_time < now_ts:
                     continue
 
-                # Extract Gamma prices as CLOB fallback
-                gamma_price_yes, gamma_price_no = None, None
-                import json as _json
-                raw_prices = m.get("outcomePrices", [])
-                if isinstance(raw_prices, str):
-                    try:
-                        raw_prices = _json.loads(raw_prices)
-                    except Exception:
-                        raw_prices = []
-                if isinstance(raw_prices, list) and len(raw_prices) >= 2:
-                    try:
-                        gamma_price_yes = float(raw_prices[0])
-                        gamma_price_no = float(raw_prices[1])
-                    except Exception:
-                        pass
-
-                # Skip markets where Gamma prices are near 0 or 1 — already resolved
+                gamma_price_yes, gamma_price_no = extract_gamma_prices(m)
                 if gamma_price_yes is not None and not (0.05 <= gamma_price_yes <= 0.95):
-                    logger.debug(f"{asset}: skipping resolved market (p_yes={gamma_price_yes:.3f})")
                     continue
 
                 self.register_market(
@@ -391,54 +294,25 @@ class ArbitrageBot:
 
         logger.info(f"Auto-discovery complete: {registered} crypto markets registered")
 
-        # --- Discover event markets (politics, geopolitics, sports) ---
         event_count = self._discover_event_markets(gamma)
         logger.info(f"Event markets discovered: {event_count}")
 
-        # Reset refresh timer so the first tick doesn't immediately re-run discovery
         self._last_market_refresh = time.time()
-
         return registered + event_count
 
     def _discover_event_markets(self, gamma: GammaClient) -> int:
         """
-        Fetch top active non-crypto event markets (politics, elections, sports).
-        Registered with is_event=True for Gemini sentiment analysis (active >= $100).
+        Discover non-crypto event markets via Gamma events endpoint.
+        Per docs: "Use the events endpoint and work backwards."
         """
-        from config import EVENT_MARKET_TAGS
         registered = 0
         try:
-            # Search for active event markets via Gamma
-            import requests as _req
-            from config import GAMMA_API_HOST
-            resp = _req.get(
-                f"{GAMMA_API_HOST}/markets",
-                params={
-                    "active": "true",
-                    "closed": "false",
-                    "limit": 50,
-                    "order": "volume",
-                    "ascending": "false",
-                },
-                timeout=10,
+            event_markets = gamma.discover_event_markets(
+                limit=50, exclude_assets=POLYMARKET_ASSETS,
             )
-            if resp.status_code != 200:
-                return 0
-            markets = resp.json() if isinstance(resp.json(), list) else resp.json().get("markets", [])
-
-            for m in markets:
+            for m in event_markets:
                 question = m.get("question", "")
-                tags = [str(t).lower() for t in (m.get("tags") or [])]
-                # Skip crypto markets (already handled above)
-                if any(a.lower() in question.lower() for a in ["BTC", "ETH", "SOL", "XRP", "DOGE", "BNB", "HYPE",
-                                                                 "Bitcoin", "Ethereum", "Solana"]):
-                    continue
-                # Only take markets with event-related tags or by volume
-                tag_match = any(tag in " ".join(tags) for tag in EVENT_MARKET_TAGS)
-                if not tag_match and not tags:
-                    continue  # Skip untagged markets
-
-                yes_token, no_token = self._extract_tokens(m)
+                yes_token, no_token = extract_clob_tokens(m)
                 if not yes_token or not no_token:
                     continue
 
@@ -446,21 +320,7 @@ class ArbitrageBot:
                 if not market_id or market_id in self._markets:
                     continue
 
-                # Gamma prices as fallback
-                gamma_price_yes, gamma_price_no = None, None
-                import json as _json
-                raw_prices = m.get("outcomePrices", [])
-                if isinstance(raw_prices, str):
-                    try:
-                        raw_prices = _json.loads(raw_prices)
-                    except Exception:
-                        raw_prices = []
-                if isinstance(raw_prices, list) and len(raw_prices) >= 2:
-                    try:
-                        gamma_price_yes = float(raw_prices[0])
-                        gamma_price_no = float(raw_prices[1])
-                    except Exception:
-                        pass
+                gamma_price_yes, gamma_price_no = extract_gamma_prices(m)
 
                 state = MarketState(
                     market_id=market_id,
@@ -478,7 +338,7 @@ class ArbitrageBot:
                 self._markets[market_id] = state
                 logger.info(f"Event market registered: {question[:60]}")
                 registered += 1
-                if registered >= 10:  # Cap at 10 event markets
+                if registered >= 10:
                     break
         except Exception as e:
             logger.warning(f"Event market discovery failed: {e}")
@@ -486,45 +346,36 @@ class ArbitrageBot:
 
     def _refresh_markets(self, now: float):
         """
-        Re-discover active 5-minute markets and remove expired ones.
-        Called every 30 seconds. New market windows open every 5 minutes,
-        so we need to pick them up quickly.
+        Re-discover active markets and remove expired ones.
+        Uses ONLY Gamma API for discovery.
         """
-        # Remove expired markets + resolve dry-run outcomes
         expired = [mid for mid, s in self._markets.items()
                    if s.end_time > 0 and (s.end_time - now) < 0 and not s.is_event]
         for mid in expired:
             state = self._markets[mid]
-            # Resolve outcome: last known price determines winner
             if self.dry_run and state.last_price > 0:
                 winning_side = "YES" if state.last_price >= 0.5 else "NO"
                 self.dry_run_tracker.resolve(mid, winning_side)
             logger.debug(f"Removing expired market: {mid}")
             del self._markets[mid]
 
-        # Log dry-run stats every 5 minutes
         if self.dry_run and now - self._last_stats_log >= 300:
             self._last_stats_log = now
             self.dry_run_tracker.log_stats()
 
-        # Discover new crypto markets — CLOB first (indexes live 5-min markets),
-        # Gamma as fallback (often misses live 5-min markets).
         gamma = GammaClient()
         new_count = 0
         for asset in POLYMARKET_ASSETS:
-            markets = self.data_client.find_crypto_5min_markets(asset)
-            if not markets:
-                markets = gamma.find_crypto_markets(asset)
+            markets = gamma.discover_crypto_markets(asset)
             for m in markets:
-                import datetime, json as _json
+                import datetime
                 condition_id = m.get("conditionId") or m.get("id", "")
                 if not condition_id:
                     continue
                 market_id = f"{asset}_5m_{str(condition_id)[:8]}"
                 if market_id in self._markets:
-                    continue  # already known
+                    continue
 
-                # Parse end time; ignore clearly invalid dates (more than a day in the past)
                 end_time = 0.0
                 end_date = (m.get("endDate") or m.get("end_date_iso") or
                             m.get("closeTime") or m.get("expirationTime"))
@@ -532,34 +383,19 @@ class ArbitrageBot:
                     try:
                         dt = datetime.datetime.fromisoformat(str(end_date).replace("Z", "+00:00"))
                         ts = dt.timestamp()
-                        if ts > now - 86400:  # only accept if not more than 1 day in the past
+                        if ts > now - 86400:
                             end_time = ts
                     except Exception:
                         pass
 
-                # Skip markets that are already expired (end_time known and in the past)
                 if end_time > 0 and end_time < now:
                     continue
 
-                yes_token, no_token = self._extract_tokens(m)
+                yes_token, no_token = extract_clob_tokens(m)
                 if not yes_token or not no_token:
                     continue
 
-                # Gamma prices
-                gamma_price_yes, gamma_price_no = None, None
-                raw_prices = m.get("outcomePrices", [])
-                if isinstance(raw_prices, str):
-                    try:
-                        raw_prices = _json.loads(raw_prices)
-                    except Exception:
-                        raw_prices = []
-                if isinstance(raw_prices, list) and len(raw_prices) >= 2:
-                    try:
-                        gamma_price_yes = float(raw_prices[0])
-                        gamma_price_no = float(raw_prices[1])
-                    except Exception:
-                        pass
-
+                gamma_price_yes, gamma_price_no = extract_gamma_prices(m)
                 if gamma_price_yes is not None and not (0.05 <= gamma_price_yes <= 0.95):
                     continue
 

@@ -33,19 +33,24 @@ router.get("/markets", async (req, res) => {
   try {
     const markets: unknown[] = [];
 
-    const data = await fetchJson(`${GAMMA_HOST}/markets`, {
+    const eventsData = await fetchJson(`${GAMMA_HOST}/events`, {
       active: "true",
       closed: "false",
-      limit: "50",
+      limit: "30",
       order: "volume",
-      ascending: "false",
-    }) as Record<string, unknown>;
+    }) as unknown;
+    const events = Array.isArray(eventsData) ? eventsData : [];
 
-    const rawMarkets = Array.isArray(data) ? data : (data.markets as unknown[] ?? data.data as unknown[] ?? []);
+    const allMarkets: Record<string, unknown>[] = [];
+    for (const event of events as Record<string, unknown>[]) {
+      const subMarkets = (event.markets ?? []) as Record<string, unknown>[];
+      for (const m of subMarkets) {
+        if (m.active !== false && !m.closed) allMarkets.push(m);
+      }
+    }
 
-    for (const m of rawMarkets as Record<string, unknown>[]) {
+    for (const m of allMarkets.slice(0, 100)) {
       const question = String(m.question ?? "");
-      const isAsset = POLYMARKET_ASSETS.some(a => question.toUpperCase().includes(a));
 
       let yesPrice: number | null = null;
       let noPrice: number | null = null;
@@ -66,6 +71,10 @@ router.get("/markets", async (req, res) => {
         if (question.toUpperCase().includes(a)) { asset = a; break; }
       }
 
+      const clobIds = typeof m.clobTokenIds === "string"
+        ? JSON.parse(m.clobTokenIds)
+        : (m.clobTokenIds ?? []);
+
       markets.push({
         id: m.conditionId ?? m.id ?? "",
         question,
@@ -75,6 +84,7 @@ router.get("/markets", async (req, res) => {
         volume: m.volume ? parseFloat(String(m.volume)) : null,
         endDate: m.endDate ?? m.closeTime ?? null,
         active: true,
+        hasClob: Array.isArray(clobIds) && clobIds.length >= 2,
       });
     }
 
