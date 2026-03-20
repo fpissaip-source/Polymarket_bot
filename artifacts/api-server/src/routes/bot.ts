@@ -5,7 +5,7 @@ import { resolve, join } from "path";
 
 const router: IRouter = Router();
 
-const BOT_DIR = resolve(process.cwd(), "bot");
+const BOT_DIR = resolve(process.cwd(), "../../bot");
 const BANKROLL_FILE = join(BOT_DIR, "bankroll_state.json");
 const TRADES_FILE = join(BOT_DIR, "trades.json");
 const LOG_FILE = join(BOT_DIR, "bot.log");

@@ -126,14 +126,14 @@ export function Overview() {
       </div>
 
       <div>
-        <h3 className="text-sm font-semibold text-muted-foreground mb-3 uppercase tracking-wider">Spot Preise (CoinGecko)</h3>
+        <h3 className="text-sm font-semibold text-muted-foreground mb-3 uppercase tracking-wider">Spot Preise (Binance)</h3>
         <div className="grid grid-cols-3 md:grid-cols-6 gap-3">
           {priceData &&
             Object.entries(priceData.prices).map(([symbol, price]) => (
               <div key={symbol} className="bg-card border border-border rounded-lg p-3 text-center">
                 <p className="text-xs text-muted-foreground mb-1">{SYMBOL_LABELS[symbol] ?? symbol}</p>
                 <p className="text-sm font-bold font-mono text-foreground">
-                  ${price > 100 ? price.toLocaleString("en-US", { maximumFractionDigits: 0 }) : price.toFixed(4)}
+                  ${price > 100 ? price.toLocaleString("de-DE", { maximumFractionDigits: 0 }) : price.toFixed(4)}
                 </p>
               </div>
             ))}

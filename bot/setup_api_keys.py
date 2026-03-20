@@ -21,6 +21,7 @@ CLOB_HOST = "https://clob.polymarket.com"
 CHAIN_ID = 137
 
 private_key = os.getenv("POLYMARKET_PRIVATE_KEY", "").strip()
+private_key = "".join(private_key.split())
 proxy_address = os.getenv("POLYMARKET_PROXY_ADDRESS", "").strip()
 
 if not private_key:

@@ -108,7 +108,7 @@ export function Markets() {
                     </td>
                     <td className="py-3 px-3 text-right font-mono text-foreground">
                       {spotPrice
-                        ? `$${spotPrice > 100 ? spotPrice.toLocaleString("en-US", { maximumFractionDigits: 0 }) : spotPrice.toFixed(4)}`
+                        ? `$${spotPrice > 100 ? spotPrice.toLocaleString("de-DE", { maximumFractionDigits: 0 }) : spotPrice.toFixed(4)}`
                         : "—"}
                     </td>
                     <td className="py-3 px-3 text-right font-mono text-muted-foreground">
