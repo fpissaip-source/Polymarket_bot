@@ -138,7 +138,7 @@ router.get("/bot/status", (req, res) => {
 router.get("/bot/trades", (req, res) => {
   const dryRunLog = getDryRunLog();
   const trades: TradeRecord[] = dryRunLog.map((e, i) => ({
-    id: `dry_${i}_${Math.round(e.timestamp)}`,
+    id: e.trade_id || `dry_${i}_${Math.round(e.timestamp)}`,
     marketId: e.market_id,
     asset: e.asset,
     side: e.decision || e.side,

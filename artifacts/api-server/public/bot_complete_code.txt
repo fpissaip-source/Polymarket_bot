@@ -1,6 +1,6 @@
 =============================================
 POLYMARKET BOT - COMPLETE SOURCE CODE
-Generated: Fri Mar 20 10:49:03 PM UTC 2026
+Generated: Fri Mar 20 10:51:17 PM UTC 2026
 =============================================
 
 ================================================================
@@ -3223,16 +3223,6 @@ class ArbitrageBot:
                         resolve_source = "gamma_settlement"
                 except Exception:
                     pass
-                if winning_side is None:
-                    try:
-                        from data.market_data import ClobClient
-                        clob = ClobClient()
-                        mp = clob.get_midpoint(state.token_id_yes)
-                        if mp is not None and 0 < mp < 1:
-                            winning_side = "YES" if mp >= 0.5 else "NO"
-                            resolve_source = f"clob_midpoint={mp:.4f}"
-                    except Exception:
-                        pass
                 if winning_side is None and state.spot_at_start > 0:
                     current_spot = 0.0
                     if hasattr(self, '_last_prices') and state.asset.upper() in (self._last_prices or {}):
@@ -3246,6 +3236,16 @@ class ArbitrageBot:
                     if current_spot > 0:
                         winning_side = "YES" if current_spot >= state.spot_at_start else "NO"
                         resolve_source = f"spot={state.spot_at_start:.2f}->{current_spot:.2f}"
+                if winning_side is None:
+                    try:
+                        from data.market_data import ClobClient
+                        clob = ClobClient()
+                        mp = clob.get_midpoint(state.token_id_yes)
+                        if mp is not None and 0 < mp < 1:
+                            winning_side = "YES" if mp >= 0.5 else "NO"
+                            resolve_source = f"clob_midpoint={mp:.4f}"
+                    except Exception:
+                        pass
                 if winning_side is None and state.last_price > 0:
                     winning_side = "YES" if state.last_price >= 0.5 else "NO"
                     resolve_source = f"last_price={state.last_price:.4f}"
