@@ -590,13 +590,12 @@ class ArbitrageBot:
             no_data = self.data_client.get_book_data(state.token_id_no)
             p_yes = yes_data["mid_price"]
             p_no = no_data["mid_price"]
-            # Fallback: use Gamma API prices if CLOB has no data
-            # Note: Gamma prices are static (from discovery), so only use as last resort
             if p_yes is None and state.gamma_price_yes is not None:
-                p_yes = state.gamma_price_yes
-                # Mark as stale — Bayesian should not over-react to static prices
+                if abs(state.gamma_price_yes - 0.5) > 0.01:
+                    p_yes = state.gamma_price_yes
             if p_no is None and state.gamma_price_no is not None:
-                p_no = state.gamma_price_no
+                if abs(state.gamma_price_no - 0.5) > 0.01:
+                    p_no = state.gamma_price_no
             if p_yes is not None and not (0.01 <= p_yes <= 0.99):
                 p_yes = None
             if p_no is not None and not (0.01 <= p_no <= 0.99):
@@ -822,15 +821,15 @@ class ArbitrageBot:
             is_passive = opp.edge_result.is_passive
             exec_type = "GTC/MAKER" if is_passive else "FOK/TAKER"
 
-            # --- Gas & Latency check: veto if gas > 30% of expected PnL ---
-            gas_ok, gas_reason = self.gas_optimizer.should_trade(
-                edge=opp.edge_result.ev_net,
-                stake=size,
-                dry_run=self.dry_run,
-            )
-            if not gas_ok:
-                logger.info(f"[GAS SKIP] {opp.market_id}: {gas_reason}")
-                continue
+            if not self.dry_run:
+                gas_ok, gas_reason = self.gas_optimizer.should_trade(
+                    edge=opp.edge_result.ev_net,
+                    stake=size,
+                    dry_run=False,
+                )
+                if not gas_ok:
+                    logger.info(f"[GAS SKIP] {opp.market_id}: {gas_reason}")
+                    continue
 
             if self.dry_run:
                 logger.info(
