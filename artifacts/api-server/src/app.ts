@@ -29,6 +29,9 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+import path from "path";
+
 app.use("/api", router);
+app.use("/api/downloads", express.static(path.resolve(process.cwd(), "public")));
 
 export default app;
