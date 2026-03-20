@@ -28,6 +28,7 @@ ADAPTIVE_STATE_FILE = Path(__file__).parent.parent / "adaptive_state.json"
 @dataclass
 class AdaptiveParams:
     bayesian_alpha_adj: dict = field(default_factory=dict)
+    bayesian_prior_adj: dict = field(default_factory=dict)
     edge_threshold_adj: float = 0.0
     kelly_lambda_adj: float = 0.0
     asset_bias: dict = field(default_factory=dict)
@@ -54,6 +55,7 @@ class AdaptiveLearner:
         try:
             ADAPTIVE_STATE_FILE.write_text(json.dumps({
                 "bayesian_alpha_adj": self.params.bayesian_alpha_adj,
+                "bayesian_prior_adj": self.params.bayesian_prior_adj,
                 "edge_threshold_adj": self.params.edge_threshold_adj,
                 "kelly_lambda_adj": self.params.kelly_lambda_adj,
                 "asset_bias": self.params.asset_bias,
@@ -137,6 +139,15 @@ class AdaptiveLearner:
             else:
                 self.params.bayesian_alpha_adj[asset] = self.params.bayesian_alpha_adj.get(asset, 0) * 0.9
 
+            up_wins = sum(1 for e in s["entries"] if e.outcome == "WIN" and e.decision == "UP")
+            down_wins = sum(1 for e in s["entries"] if e.outcome == "WIN" and e.decision == "DOWN")
+            up_total = sum(1 for e in s["entries"] if e.decision == "UP")
+            down_total = sum(1 for e in s["entries"] if e.decision == "DOWN")
+            up_rate = up_wins / up_total if up_total >= 3 else 0.5
+            down_rate = down_wins / down_total if down_total >= 3 else 0.5
+            prior_shift = (up_rate - down_rate) * 0.05
+            self.params.bayesian_prior_adj[asset] = max(-0.10, min(0.10, prior_shift))
+
         self.params.total_analyzed = len(resolved_entries)
         self.params.last_update = time.time()
         self._save()
@@ -175,6 +186,10 @@ class AdaptiveLearner:
         adjusted = base_alpha + adj
         return max(0.1, min(0.5, adjusted))
 
+    def get_bayesian_prior(self, asset: str, base_prior: float) -> float:
+        adj = self.params.bayesian_prior_adj.get(asset, 0.0)
+        return max(0.30, min(0.70, base_prior + adj))
+
     def get_asset_bias(self, asset: str) -> float:
         return self.params.asset_bias.get(asset, 0.0)
 
@@ -184,5 +199,6 @@ class AdaptiveLearner:
             "edge_threshold_adj": round(self.params.edge_threshold_adj, 4),
             "asset_bias": {k: round(v, 4) for k, v in self.params.asset_bias.items()},
             "bayesian_alpha_adj": {k: round(v, 4) for k, v in self.params.bayesian_alpha_adj.items()},
+            "bayesian_prior_adj": {k: round(v, 4) for k, v in self.params.bayesian_prior_adj.items()},
             "total_analyzed": self.params.total_analyzed,
         }

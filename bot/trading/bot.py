@@ -585,9 +585,11 @@ class ArbitrageBot:
                 ob_imbalance=ob_imbalance,
             )
             if self.dry_run and hasattr(self, 'adaptive'):
-                from config import BAYESIAN_ALPHA
+                from config import BAYESIAN_ALPHA, BAYESIAN_PRIOR
                 adapted_alpha = self.adaptive.get_bayesian_alpha(state.asset, BAYESIAN_ALPHA)
                 state.bayesian.set_alpha(adapted_alpha)
+                adapted_prior = self.adaptive.get_bayesian_prior(state.asset, BAYESIAN_PRIOR)
+                state.bayesian.prior = adapted_prior
             q = state.bayesian.update(bayesian_data)
 
             asset_bias = self.adaptive.get_asset_bias(state.asset)

@@ -1,6 +1,6 @@
 =============================================
 POLYMARKET BOT - COMPLETE SOURCE CODE
-Generated: Fri Mar 20 10:45:53 PM UTC 2026
+Generated: Fri Mar 20 10:49:03 PM UTC 2026
 =============================================
 
 ================================================================
@@ -968,6 +968,7 @@ class DryRunEntry:
     kelly_lambda: float = 0.25
     min_edge_used: float = 0.01
     actual_outcome: str = ""
+    trade_id: str = ""
 
 
 class DryRunTracker:
@@ -1015,8 +1016,11 @@ class DryRunTracker:
             logger.warning(f"DryRunTracker: insufficient virtual bankroll (${self._virtual_bankroll:.2f}), skipping")
             return
 
+        ts = time.time()
+        trade_id = f"dry_{int(ts * 1000)}_{market_id[-6:]}"
+
         entry = DryRunEntry(
-            timestamp=time.time(),
+            timestamp=ts,
             market_id=market_id,
             asset=asset,
             side=side,
@@ -1034,6 +1038,7 @@ class DryRunTracker:
             bayesian_prior=bayesian_prior,
             kelly_lambda=kelly_lambda,
             min_edge_used=min_edge_used,
+            trade_id=trade_id,
         )
         self._entries.append(entry)
         self._save()
@@ -1074,7 +1079,7 @@ class DryRunTracker:
                 except Exception:
                     pass
             trades.append({
-                "id": f"dry_{int(entry.timestamp * 1000)}",
+                "id": entry.trade_id,
                 "marketId": entry.market_id,
                 "asset": entry.asset,
                 "side": entry.decision,
@@ -1104,14 +1109,14 @@ class DryRunTracker:
 
             entry_map = {}
             for e in self._entries:
-                if e.outcome in ("WIN", "LOSS"):
-                    entry_map[e.market_id] = e
+                if e.outcome in ("WIN", "LOSS") and e.trade_id:
+                    entry_map[e.trade_id] = e
 
             updated = 0
             for t in trades:
-                mid = t.get("marketId", "")
-                if mid in entry_map and t.get("status") == "OPEN":
-                    e = entry_map[mid]
+                tid = t.get("id", "")
+                if tid in entry_map and t.get("status") == "OPEN":
+                    e = entry_map[tid]
                     t["pnl"] = e.pnl
                     t["status"] = e.outcome
                     t["outcome"] = e.outcome
@@ -2647,6 +2652,7 @@ ADAPTIVE_STATE_FILE = Path(__file__).parent.parent / "adaptive_state.json"
 @dataclass
 class AdaptiveParams:
     bayesian_alpha_adj: dict = field(default_factory=dict)
+    bayesian_prior_adj: dict = field(default_factory=dict)
     edge_threshold_adj: float = 0.0
     kelly_lambda_adj: float = 0.0
     asset_bias: dict = field(default_factory=dict)
@@ -2673,6 +2679,7 @@ class AdaptiveLearner:
         try:
             ADAPTIVE_STATE_FILE.write_text(json.dumps({
                 "bayesian_alpha_adj": self.params.bayesian_alpha_adj,
+                "bayesian_prior_adj": self.params.bayesian_prior_adj,
                 "edge_threshold_adj": self.params.edge_threshold_adj,
                 "kelly_lambda_adj": self.params.kelly_lambda_adj,
                 "asset_bias": self.params.asset_bias,
@@ -2756,6 +2763,15 @@ class AdaptiveLearner:
             else:
                 self.params.bayesian_alpha_adj[asset] = self.params.bayesian_alpha_adj.get(asset, 0) * 0.9
 
+            up_wins = sum(1 for e in s["entries"] if e.outcome == "WIN" and e.decision == "UP")
+            down_wins = sum(1 for e in s["entries"] if e.outcome == "WIN" and e.decision == "DOWN")
+            up_total = sum(1 for e in s["entries"] if e.decision == "UP")
+            down_total = sum(1 for e in s["entries"] if e.decision == "DOWN")
+            up_rate = up_wins / up_total if up_total >= 3 else 0.5
+            down_rate = down_wins / down_total if down_total >= 3 else 0.5
+            prior_shift = (up_rate - down_rate) * 0.05
+            self.params.bayesian_prior_adj[asset] = max(-0.10, min(0.10, prior_shift))
+
         self.params.total_analyzed = len(resolved_entries)
         self.params.last_update = time.time()
         self._save()
@@ -2794,6 +2810,10 @@ class AdaptiveLearner:
         adjusted = base_alpha + adj
         return max(0.1, min(0.5, adjusted))
 
+    def get_bayesian_prior(self, asset: str, base_prior: float) -> float:
+        adj = self.params.bayesian_prior_adj.get(asset, 0.0)
+        return max(0.30, min(0.70, base_prior + adj))
+
     def get_asset_bias(self, asset: str) -> float:
         return self.params.asset_bias.get(asset, 0.0)
 
@@ -2803,6 +2823,7 @@ class AdaptiveLearner:
             "edge_threshold_adj": round(self.params.edge_threshold_adj, 4),
             "asset_bias": {k: round(v, 4) for k, v in self.params.asset_bias.items()},
             "bayesian_alpha_adj": {k: round(v, 4) for k, v in self.params.bayesian_alpha_adj.items()},
+            "bayesian_prior_adj": {k: round(v, 4) for k, v in self.params.bayesian_prior_adj.items()},
             "total_analyzed": self.params.total_analyzed,
         }
 
@@ -3402,9 +3423,11 @@ class ArbitrageBot:
                 ob_imbalance=ob_imbalance,
             )
             if self.dry_run and hasattr(self, 'adaptive'):
-                from config import BAYESIAN_ALPHA
+                from config import BAYESIAN_ALPHA, BAYESIAN_PRIOR
                 adapted_alpha = self.adaptive.get_bayesian_alpha(state.asset, BAYESIAN_ALPHA)
                 state.bayesian.set_alpha(adapted_alpha)
+                adapted_prior = self.adaptive.get_bayesian_prior(state.asset, BAYESIAN_PRIOR)
+                state.bayesian.prior = adapted_prior
             q = state.bayesian.update(bayesian_data)
 
             asset_bias = self.adaptive.get_asset_bias(state.asset)

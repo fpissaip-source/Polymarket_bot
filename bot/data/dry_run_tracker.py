@@ -43,6 +43,7 @@ class DryRunEntry:
     kelly_lambda: float = 0.25
     min_edge_used: float = 0.01
     actual_outcome: str = ""
+    trade_id: str = ""
 
 
 class DryRunTracker:
@@ -90,8 +91,11 @@ class DryRunTracker:
             logger.warning(f"DryRunTracker: insufficient virtual bankroll (${self._virtual_bankroll:.2f}), skipping")
             return
 
+        ts = time.time()
+        trade_id = f"dry_{int(ts * 1000)}_{market_id[-6:]}"
+
         entry = DryRunEntry(
-            timestamp=time.time(),
+            timestamp=ts,
             market_id=market_id,
             asset=asset,
             side=side,
@@ -109,6 +113,7 @@ class DryRunTracker:
             bayesian_prior=bayesian_prior,
             kelly_lambda=kelly_lambda,
             min_edge_used=min_edge_used,
+            trade_id=trade_id,
         )
         self._entries.append(entry)
         self._save()
@@ -149,7 +154,7 @@ class DryRunTracker:
                 except Exception:
                     pass
             trades.append({
-                "id": f"dry_{int(entry.timestamp * 1000)}",
+                "id": entry.trade_id,
                 "marketId": entry.market_id,
                 "asset": entry.asset,
                 "side": entry.decision,
@@ -179,14 +184,14 @@ class DryRunTracker:
 
             entry_map = {}
             for e in self._entries:
-                if e.outcome in ("WIN", "LOSS"):
-                    entry_map[e.market_id] = e
+                if e.outcome in ("WIN", "LOSS") and e.trade_id:
+                    entry_map[e.trade_id] = e
 
             updated = 0
             for t in trades:
-                mid = t.get("marketId", "")
-                if mid in entry_map and t.get("status") == "OPEN":
-                    e = entry_map[mid]
+                tid = t.get("id", "")
+                if tid in entry_map and t.get("status") == "OPEN":
+                    e = entry_map[tid]
                     t["pnl"] = e.pnl
                     t["status"] = e.outcome
                     t["outcome"] = e.outcome
