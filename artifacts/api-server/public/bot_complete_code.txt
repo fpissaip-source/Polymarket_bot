@@ -1,6 +1,6 @@
 =============================================
 POLYMARKET BOT - COMPLETE SOURCE CODE
-Generated: Fri Mar 20 10:30:52 PM UTC 2026
+Generated: Fri Mar 20 10:34:23 PM UTC 2026
 VERSION: Dry-Run Simulation + Adaptive Learning
 - Bankroll: $2 (live), $25 (dry-run virtual)
 - 5-min Up/Down slug discovery + adaptive optimization
@@ -1892,14 +1892,16 @@ class EdgeModel:
             return EdgeResult(False, 0.0, "directional", "NONE", False,
                               "No directional signal (q == p)")
 
-        # Prefer maker (passive) — lower cost, lower required edge
-        if ev_maker > MIN_EDGE_MAKER:
+        maker_threshold = max(self.min_edge, MIN_EDGE_MAKER)
+        taker_threshold = max(self.min_edge, MIN_EDGE_TAKER)
+
+        if ev_maker > maker_threshold:
             return EdgeResult(
                 has_edge=True, ev_net=ev_maker, edge_type="directional",
                 side=side, is_passive=True,
                 description=f"MAKER {side}: EV={ev_maker:.4f} (q={q:.3f}, p={p:.3f})"
             )
-        if ev_taker > MIN_EDGE_TAKER:
+        if ev_taker > taker_threshold:
             return EdgeResult(
                 has_edge=True, ev_net=ev_taker, edge_type="directional",
                 side=side, is_passive=False,
@@ -3149,7 +3151,16 @@ class ArbitrageBot:
         for mid in expired:
             state = self._markets[mid]
             if self.dry_run and state.last_price > 0:
-                winning_side = "YES" if state.last_price >= 0.5 else "NO"
+                fresh_price = state.last_price
+                try:
+                    from data.market_data import ClobClient
+                    clob = ClobClient()
+                    mp = clob.get_midpoint(state.token_id_yes)
+                    if mp is not None and 0 < mp < 1:
+                        fresh_price = mp
+                except Exception:
+                    pass
+                winning_side = "YES" if fresh_price >= 0.5 else "NO"
                 self.dry_run_tracker.resolve(mid, winning_side)
                 self.kelly.bankroll = self.dry_run_tracker.virtual_bankroll
             logger.debug(f"Removing expired market: {mid}")
@@ -3248,8 +3259,14 @@ class ArbitrageBot:
         elapsed = now - self._last_price_fetch if self._last_price_fetch else 1.0
         self._tick_count += 1
 
-        # Apply growth tier (adjusts Kelly λ and MIN_EDGE based on bankroll)
         self._apply_growth_tier()
+        if self.dry_run and hasattr(self, 'adaptive'):
+            adj_state = self.adaptive.get_state()
+            if adj_state.get("kelly_lambda_adj", 0) != 0:
+                self.kelly.lambda_fraction += adj_state["kelly_lambda_adj"]
+            if adj_state.get("edge_threshold_adj", 0) != 0:
+                self.edge_model.min_edge += adj_state["edge_threshold_adj"]
+                self._current_min_edge = self.edge_model.min_edge
 
         # --- 1. Fetch crypto spot prices ---
         new_prices = self.price_feed.fetch()

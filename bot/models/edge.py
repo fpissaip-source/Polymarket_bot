@@ -56,14 +56,16 @@ class EdgeModel:
             return EdgeResult(False, 0.0, "directional", "NONE", False,
                               "No directional signal (q == p)")
 
-        # Prefer maker (passive) — lower cost, lower required edge
-        if ev_maker > MIN_EDGE_MAKER:
+        maker_threshold = max(self.min_edge, MIN_EDGE_MAKER)
+        taker_threshold = max(self.min_edge, MIN_EDGE_TAKER)
+
+        if ev_maker > maker_threshold:
             return EdgeResult(
                 has_edge=True, ev_net=ev_maker, edge_type="directional",
                 side=side, is_passive=True,
                 description=f"MAKER {side}: EV={ev_maker:.4f} (q={q:.3f}, p={p:.3f})"
             )
-        if ev_taker > MIN_EDGE_TAKER:
+        if ev_taker > taker_threshold:
             return EdgeResult(
                 has_edge=True, ev_net=ev_taker, edge_type="directional",
                 side=side, is_passive=False,

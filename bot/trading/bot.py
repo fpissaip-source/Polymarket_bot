@@ -357,7 +357,16 @@ class ArbitrageBot:
         for mid in expired:
             state = self._markets[mid]
             if self.dry_run and state.last_price > 0:
-                winning_side = "YES" if state.last_price >= 0.5 else "NO"
+                fresh_price = state.last_price
+                try:
+                    from data.market_data import ClobClient
+                    clob = ClobClient()
+                    mp = clob.get_midpoint(state.token_id_yes)
+                    if mp is not None and 0 < mp < 1:
+                        fresh_price = mp
+                except Exception:
+                    pass
+                winning_side = "YES" if fresh_price >= 0.5 else "NO"
                 self.dry_run_tracker.resolve(mid, winning_side)
                 self.kelly.bankroll = self.dry_run_tracker.virtual_bankroll
             logger.debug(f"Removing expired market: {mid}")

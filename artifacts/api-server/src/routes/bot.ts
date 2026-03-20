@@ -11,6 +11,18 @@ const TRADES_FILE = join(BOT_DIR, "trades.json");
 const DRY_RUN_LOG = join(BOT_DIR, "dry_run_log.json");
 const ADAPTIVE_STATE = join(BOT_DIR, "adaptive_state.json");
 const LOG_FILE = join(BOT_DIR, "bot.log");
+const DRY_RUN_BANKROLL = 25;
+
+function getInitialBankroll(): number {
+  try {
+    if (existsSync(join(BOT_DIR, "config.py"))) {
+      const cfg = readFileSync(join(BOT_DIR, "config.py"), "utf-8");
+      const match = cfg.match(/DRY_RUN_BANKROLL\s*=\s*float\([^"]*"([\d.]+)"/);
+      if (match) return parseFloat(match[1]);
+    }
+  } catch { /* fallback */ }
+  return DRY_RUN_BANKROLL;
+}
 
 let botProcess: ChildProcess | null = null;
 let botMode: "dry_run" | "live" | "stopped" = "stopped";
@@ -82,7 +94,8 @@ router.get("/bot/status", (req, res) => {
   const biggestWin = resolved.length > 0 ? Math.max(0, ...resolved.map(e => e.pnl || 0)) : 0;
   const biggestLoss = resolved.length > 0 ? Math.min(0, ...resolved.map(e => e.pnl || 0)) : 0;
 
-  const virtualBankroll = 25 + totalPnl;
+  const initialBk = getInitialBankroll();
+  const virtualBankroll = initialBk + totalPnl;
 
   let uptime: string | null = null;
   if (botStartTime && botProcess) {
@@ -106,7 +119,7 @@ router.get("/bot/status", (req, res) => {
     mode: botProcess && botProcess.exitCode === null ? botMode : "stopped",
     bankroll: getBankroll(),
     virtualBankroll: Math.round(virtualBankroll * 100) / 100,
-    initialBankroll: 25,
+    initialBankroll: initialBk,
     totalTrades: dryRunLog.length,
     resolvedTrades: resolved.length,
     openTrades: dryRunLog.length - resolved.length,
@@ -159,7 +172,7 @@ router.get("/bot/simulation", (req, res) => {
     pnlCurve.push({
       time: new Date(e.timestamp * 1000).toISOString(),
       pnl: Math.round(runningPnl * 10000) / 10000,
-      bankroll: Math.round((25 + runningPnl) * 100) / 100,
+      bankroll: Math.round((getInitialBankroll() + runningPnl) * 100) / 100,
     });
   }
 
@@ -180,7 +193,7 @@ router.get("/bot/simulation", (req, res) => {
     pnlCurve,
     decisionBreakdown,
     adaptive,
-    virtualBankroll: Math.round((25 + runningPnl) * 100) / 100,
+    virtualBankroll: Math.round((getInitialBankroll() + runningPnl) * 100) / 100,
   });
 });
 
