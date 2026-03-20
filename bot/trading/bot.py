@@ -139,8 +139,8 @@ class ArbitrageBot:
         self._tier_base_lambda = self.kelly.lambda_fraction
         self._tier_base_edge = self._current_min_edge
         self._MARKET_REFRESH_INTERVAL = 30
-        self._MARKET_WINDOW_MIN = 90
-        self._MARKET_WINDOW_MAX = 360
+        self._MARKET_WINDOW_MIN = 30
+        self._MARKET_WINDOW_MAX = 330
 
         for m1, m2 in RELATED_MARKETS:
             self.spread_map.register_pair(m1, m2)
@@ -326,10 +326,6 @@ class ArbitrageBot:
         return registered + event_count
 
     def _discover_event_markets(self, gamma: GammaClient) -> int:
-        """
-        Discover non-crypto event markets via Gamma events endpoint.
-        Per docs: "Use the events endpoint and work backwards."
-        """
         registered = 0
         try:
             event_markets = gamma.discover_event_markets(
@@ -346,6 +342,19 @@ class ArbitrageBot:
                     continue
 
                 gamma_price_yes, gamma_price_no = extract_gamma_prices(m)
+                if gamma_price_yes is not None and not (0.10 <= gamma_price_yes <= 0.90):
+                    continue
+
+                import datetime
+                end_time = 0.0
+                end_date = (m.get("endDate") or m.get("end_date_iso") or
+                            m.get("closeTime") or m.get("expirationTime"))
+                if end_date:
+                    try:
+                        dt = datetime.datetime.fromisoformat(str(end_date).replace("Z", "+00:00"))
+                        end_time = dt.timestamp()
+                    except Exception:
+                        pass
 
                 state = MarketState(
                     market_id=market_id,
@@ -359,11 +368,13 @@ class ArbitrageBot:
                     is_event=True,
                     gamma_price_yes=gamma_price_yes,
                     gamma_price_no=gamma_price_no,
+                    end_time=end_time,
+                    condition_id=str(market_id),
                 )
                 self._markets[market_id] = state
                 logger.info(f"Event market registered: {question[:60]}")
                 registered += 1
-                if registered >= 10:
+                if registered >= 5:
                     break
         except Exception as e:
             logger.warning(f"Event market discovery failed: {e}")
@@ -447,7 +458,17 @@ class ArbitrageBot:
         gamma = GammaClient()
         new_count = 0
         for asset in POLYMARKET_ASSETS:
+            has_active = any(
+                s.asset == asset and s.end_time > 0 and
+                self._MARKET_WINDOW_MIN <= (s.end_time - now) <= self._MARKET_WINDOW_MAX
+                for s in self._markets.values()
+            )
+            if has_active:
+                continue
+
             markets = gamma.discover_crypto_markets(asset)
+            best_market = None
+            best_end = 0.0
             for m in markets:
                 import datetime
                 condition_id = m.get("conditionId") or m.get("id", "")
@@ -472,6 +493,10 @@ class ArbitrageBot:
                 if end_time > 0 and end_time < now:
                     continue
 
+                remaining = end_time - now if end_time > 0 else 999
+                if remaining > self._MARKET_WINDOW_MAX:
+                    continue
+
                 yes_token, no_token = extract_clob_tokens(m)
                 if not yes_token or not no_token:
                     continue
@@ -480,16 +505,23 @@ class ArbitrageBot:
                 if gamma_price_yes is not None and not (0.05 <= gamma_price_yes <= 0.95):
                     continue
 
+                if best_market is None or (end_time > 0 and end_time > best_end):
+                    best_market = (market_id, yes_token, no_token, end_time,
+                                   gamma_price_yes, gamma_price_no, str(condition_id))
+                    best_end = end_time
+
+            if best_market:
+                mid, yt, nt, et, gpy, gpn, cid = best_market
                 self.register_market(
-                    market_id=market_id,
-                    token_id_yes=yes_token,
-                    token_id_no=no_token,
+                    market_id=mid,
+                    token_id_yes=yt,
+                    token_id_no=nt,
                     asset=asset,
                     timeframe="5m",
-                    end_time=end_time,
-                    gamma_price_yes=gamma_price_yes,
-                    gamma_price_no=gamma_price_no,
-                    condition_id=str(condition_id),
+                    end_time=et,
+                    gamma_price_yes=gpy,
+                    gamma_price_no=gpn,
+                    condition_id=cid,
                 )
                 new_count += 1
 
@@ -565,13 +597,15 @@ class ArbitrageBot:
                 # Mark as stale — Bayesian should not over-react to static prices
             if p_no is None and state.gamma_price_no is not None:
                 p_no = state.gamma_price_no
-            # Reject obviously invalid prices (0 or 1 are not real market prices)
             if p_yes is not None and not (0.01 <= p_yes <= 0.99):
                 p_yes = None
             if p_no is not None and not (0.01 <= p_no <= 0.99):
                 p_no = None
             if p_yes is None or p_no is None:
                 market_stats.append(f"{state.asset}({state.timeframe}):NO_DATA")
+                continue
+            if p_yes > 0.95 or p_yes < 0.05:
+                market_stats.append(f"{state.asset}({state.timeframe}):RESOLVED(p={p_yes:.2f})")
                 continue
 
             ob_imbalance = yes_data["imbalance"] or 0.0
