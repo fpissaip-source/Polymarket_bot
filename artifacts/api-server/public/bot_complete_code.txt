@@ -1,10 +1,11 @@
 =============================================
 POLYMARKET BOT - COMPLETE SOURCE CODE
-Generated: Fri Mar 20 10:13:02 PM UTC 2026
-CHANGES: Gamma-only discovery (per Polymarket docs)
-- Discovery: Gamma events endpoint first, then markets fallback
-- clobTokenIds from Gamma (first=YES, second=NO)
-- CLOB only for live data: /book, /midpoint, /price
+Generated: Fri Mar 20 10:22:04 PM UTC 2026
+CHANGES: 5-Min Up/Down slug-based discovery
+- NEW: discover_5min_markets() finds BTC/ETH/SOL 5-min Up/Down events
+- Slug pattern: {asset}-updown-5m-{unix_timestamp}
+- Token mapping: clobTokenIds[0]=Up, clobTokenIds[1]=Down
+- Fallback to keyword search for non-5min markets
 =============================================
 
 
@@ -579,13 +580,76 @@ class GammaClient:
             return data
         return data.get("data", data.get("events", []))
 
+    def discover_5min_markets(self, asset: str) -> list[dict]:
+        """
+        Discover active 5-minute Up/Down markets for a crypto asset.
+        These are series-based events with slug: {asset}-updown-5m-{unix_timestamp}.
+        New markets open every 5 minutes. We check the current and next window.
+        """
+        import time as _time
+
+        slug_prefix = asset.lower() + "-updown-5m"
+        now = int(_time.time())
+        current_window = (now // 300) * 300
+        windows = [current_window, current_window + 300, current_window - 300]
+
+        matched = []
+        seen_ids = set()
+
+        for window_ts in windows:
+            slug = f"{slug_prefix}-{window_ts}"
+            event_data = self._fetch_event_by_slug(slug)
+            if not event_data:
+                continue
+
+            for m in event_data.get("markets", []):
+                if not m.get("active", True) or m.get("closed", False):
+                    continue
+                clob_ids = _parse_json_field(m.get("clobTokenIds", []))
+                if len(clob_ids) < 2:
+                    continue
+                mid = m.get("conditionId") or m.get("id", "")
+                if mid in seen_ids:
+                    continue
+                p_yes, _ = extract_gamma_prices(m)
+                if p_yes is not None and not (0.05 <= p_yes <= 0.95):
+                    continue
+                seen_ids.add(mid)
+                matched.append(m)
+
+        if matched:
+            logger.info(f"Gamma: found {len(matched)} active 5-min markets for {asset}")
+        else:
+            logger.debug(f"Gamma: no active 5-min markets for {asset}")
+        return matched
+
+    def _fetch_event_by_slug(self, slug: str) -> dict | None:
+        """Fetch a single event by its exact slug."""
+        try:
+            data = _get_with_retry(
+                self._session,
+                f"{self.host}/events",
+                params={"slug": slug},
+            )
+            events = data if isinstance(data, list) else []
+            return events[0] if events else None
+        except Exception as e:
+            logger.debug(f"Event fetch failed for slug {slug}: {e}")
+            return None
+
     def discover_crypto_markets(self, asset: str) -> list[dict]:
         """
         Discover active crypto markets for an asset.
-        Strategy: events endpoint first (per docs), then markets endpoint fallback.
-        Accepts ALL active crypto markets (5-min, hourly, daily, event-based).
+        Strategy:
+          1. Try 5-min Up/Down series events (slug-based, most common)
+          2. Fall back to events endpoint keyword search
+          3. Fall back to markets endpoint
         Returns list of Gamma market dicts with clobTokenIds.
         """
+        five_min = self.discover_5min_markets(asset)
+        if five_min:
+            return five_min
+
         matched = []
         seen_ids = set()
 
@@ -632,22 +696,11 @@ class GammaClient:
 
         if not matched:
             for variant in asset_variants:
-                events = self.get_events(active=True, keyword=variant, limit=50)
-                for event in events:
-                    for m in event.get("markets", []):
-                        _try_add(m)
-
-        if not matched:
-            for variant in asset_variants:
                 for offset in range(0, 300, 100):
                     markets = self.get_markets(
                         active=True, keyword=variant, tag_slug="crypto",
                         limit=100, offset=offset,
                     )
-                    if not markets:
-                        markets = self.get_markets(
-                            active=True, keyword=variant, limit=100, offset=offset,
-                        )
                     if not markets:
                         break
                     for m in markets:
@@ -655,18 +708,11 @@ class GammaClient:
                     if len(markets) < 100:
                         break
 
-        five_min_kws = ("5-MINUTE", "5 MINUTE", "5 MINUTES", "UP OR DOWN", "5MIN")
-        five_min = [m for m in matched if any(kw in m.get("question", "").upper() for kw in five_min_kws)]
-
-        if five_min:
-            logger.info(f"Gamma: found {len(five_min)} 5-min markets for {asset}")
-            return five_min
         if matched:
-            logger.info(f"Gamma: found {len(matched)} markets for {asset} (no 5-min available)")
-            return matched
-
-        logger.info(f"Gamma: no active markets found for {asset}")
-        return []
+            logger.info(f"Gamma: found {len(matched)} markets for {asset}")
+        else:
+            logger.info(f"Gamma: no active markets found for {asset}")
+        return matched
 
     def discover_event_markets(self, limit: int = 50, exclude_assets: list[str] = None) -> list[dict]:
         """
