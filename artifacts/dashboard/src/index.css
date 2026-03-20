@@ -1,0 +1,92 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap');
+@import "tailwindcss";
+
+@theme inline {
+  --font-sans: 'Inter', sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+
+  /* Dark Trading Terminal Palette */
+  --color-background: hsl(224, 71%, 4%);
+  --color-foreground: hsl(213, 31%, 91%);
+  
+  --color-card: hsl(222, 47%, 11%);
+  --color-card-foreground: hsl(213, 31%, 91%);
+  --color-card-border: hsl(216, 34%, 17%);
+
+  --color-popover: hsl(224, 71%, 4%);
+  --color-popover-foreground: hsl(215, 20.2%, 65.1%);
+  --color-popover-border: hsl(216, 34%, 17%);
+
+  --color-primary: hsl(210, 100%, 50%);
+  --color-primary-foreground: hsl(0, 0%, 100%);
+  
+  --color-secondary: hsl(222, 47%, 11%);
+  --color-secondary-foreground: hsl(210, 40%, 98%);
+  
+  --color-muted: hsl(223, 47%, 11%);
+  --color-muted-foreground: hsl(215.4, 16.3%, 56.9%);
+  
+  --color-accent: hsl(216, 34%, 17%);
+  --color-accent-foreground: hsl(210, 40%, 98%);
+
+  /* Trading specific colors */
+  --color-success: hsl(142, 71%, 45%);       /* Neon Green for Bids/Profit */
+  --color-success-foreground: hsl(144, 100%, 11%);
+  --color-success-muted: hsl(142, 71%, 45%, 0.15);
+  
+  --color-destructive: hsl(348, 100%, 61%);  /* Bright Red for Asks/Loss */
+  --color-destructive-foreground: hsl(0, 0%, 100%);
+  --color-destructive-muted: hsl(348, 100%, 61%, 0.15);
+  
+  --color-warning: hsl(38, 92%, 50%);        /* Orange for warnings/dry run */
+  --color-warning-foreground: hsl(48, 96%, 11%);
+
+  --color-border: hsl(216, 34%, 17%);
+  --color-input: hsl(216, 34%, 17%);
+  --color-ring: hsl(212.7, 26.8%, 83.9%);
+
+  --radius-sm: 0.25rem;
+  --radius-md: 0.375rem;
+  --radius-lg: 0.5rem;
+  --radius-xl: 0.75rem;
+}
+
+@layer base {
+  body {
+    @apply bg-background text-foreground font-sans antialiased min-h-screen selection:bg-primary/30 selection:text-primary-foreground;
+    background-image: radial-gradient(circle at 50% 0%, hsl(220, 40%, 15%), transparent 70%);
+  }
+
+  /* Custom scrollbar for terminal feel */
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-track {
+    @apply bg-background;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply bg-accent rounded-full border-2 border-background;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-muted-foreground;
+  }
+}
+
+@layer utilities {
+  .glass-panel {
+    @apply bg-card/80 backdrop-blur-xl border border-card-border shadow-2xl shadow-black/50;
+  }
+  
+  .text-glow-success {
+    text-shadow: 0 0 10px var(--color-success);
+  }
+  
+  .text-glow-destructive {
+    text-shadow: 0 0 10px var(--color-destructive);
+  }
+
+  .terminal-text {
+    @apply font-mono text-sm tracking-tight;
+  }
+}

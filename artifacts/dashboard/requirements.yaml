@@ -1,0 +1,18 @@
+packages:
+  "recharts": "Dashboard analytics charts and PnL visualization"
+  "framer-motion": "Smooth transitions for trading data updates"
+  "date-fns": "Human-readable date formatting for trades and logs"
+  "clsx": "Utility for constructing className strings conditionally"
+  "tailwind-merge": "Utility function to efficiently merge Tailwind CSS classes"
+  "@radix-ui/react-dialog": "For confirmation modals (live mode warning)"
+  "@radix-ui/react-slot": "For component composition"
+  "@radix-ui/react-tooltip": "For interactive data tooltips"
+
+images:
+  - path: "artifacts/dashboard/public/images/grid-bg.png"
+    description: "Very subtle dark futuristic grid pattern, barely visible, dark blue/black background, trading terminal aesthetic"
+    aspect_ratio: "16:9"
+
+notes:
+  - Imports use React Query hooks from @workspace/api-client-react
+  - Dashboard auto-refreshes data at specific intervals (2s for stats, 3s for logs)

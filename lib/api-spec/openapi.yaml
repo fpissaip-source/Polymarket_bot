@@ -1,22 +1,24 @@
 openapi: 3.1.0
 info:
-  # Do not change the title, if the title changes, the import paths will be broken
   title: Api
   version: 0.1.0
-  description: API specification
+  description: Polymarket Bot Dashboard API
 servers:
   - url: /api
     description: Base API path
 tags:
   - name: health
     description: Health operations
+  - name: markets
+    description: Polymarket market data
+  - name: bot
+    description: Bot control and status
 paths:
   /healthz:
     get:
       operationId: healthCheck
       tags: [health]
       summary: Health check
-      description: Returns server health status
       responses:
         "200":
           description: Healthy
@@ -24,6 +26,127 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+
+  /markets:
+    get:
+      operationId: getMarkets
+      tags: [markets]
+      summary: Get active Polymarket crypto markets
+      responses:
+        "200":
+          description: List of active markets
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Market"
+
+  /markets/prices:
+    get:
+      operationId: getCryptoPrices
+      tags: [markets]
+      summary: Get current crypto spot prices from Binance
+      responses:
+        "200":
+          description: Map of symbol to price
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PriceMap"
+
+  /orderbook/{tokenId}:
+    get:
+      operationId: getOrderBook
+      tags: [markets]
+      summary: Get order book for a token
+      parameters:
+        - name: tokenId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Order book data
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrderBook"
+
+  /bot/status:
+    get:
+      operationId: getBotStatus
+      tags: [bot]
+      summary: Get current bot status and stats
+      responses:
+        "200":
+          description: Bot status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BotStatus"
+
+  /bot/trades:
+    get:
+      operationId: getBotTrades
+      tags: [bot]
+      summary: Get trade history
+      responses:
+        "200":
+          description: List of trades
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Trade"
+
+  /bot/logs:
+    get:
+      operationId: getBotLogs
+      tags: [bot]
+      summary: Get recent bot logs
+      responses:
+        "200":
+          description: Recent log lines
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LogResponse"
+
+  /bot/start:
+    post:
+      operationId: startBot
+      tags: [bot]
+      summary: Start the trading bot
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BotStartRequest"
+      responses:
+        "200":
+          description: Bot started
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BotActionResponse"
+
+  /bot/stop:
+    post:
+      operationId: stopBot
+      tags: [bot]
+      summary: Stop the trading bot
+      responses:
+        "200":
+          description: Bot stopped
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BotActionResponse"
+
 components:
   schemas:
     HealthStatus:
@@ -31,6 +154,158 @@ components:
       properties:
         status:
           type: string
-      required:
-        - status
+      required: [status]
 
+    Market:
+      type: object
+      properties:
+        id:
+          type: string
+        question:
+          type: string
+        asset:
+          type: string
+        yesPrice:
+          type: number
+          nullable: true
+        noPrice:
+          type: number
+          nullable: true
+        volume:
+          type: number
+          nullable: true
+        endDate:
+          type: string
+          nullable: true
+        active:
+          type: boolean
+      required: [id, question, asset, active]
+
+    PriceMap:
+      type: object
+      properties:
+        prices:
+          type: object
+          additionalProperties:
+            type: number
+        updatedAt:
+          type: string
+      required: [prices, updatedAt]
+
+    OrderBook:
+      type: object
+      properties:
+        tokenId:
+          type: string
+        bestBid:
+          type: number
+          nullable: true
+        bestAsk:
+          type: number
+          nullable: true
+        midPrice:
+          type: number
+          nullable: true
+        spread:
+          type: number
+          nullable: true
+        depth:
+          type: number
+        bids:
+          type: array
+          items:
+            $ref: "#/components/schemas/OrderLevel"
+        asks:
+          type: array
+          items:
+            $ref: "#/components/schemas/OrderLevel"
+      required: [tokenId, depth, bids, asks]
+
+    OrderLevel:
+      type: object
+      properties:
+        price:
+          type: number
+        size:
+          type: number
+      required: [price, size]
+
+    BotStatus:
+      type: object
+      properties:
+        running:
+          type: boolean
+        mode:
+          type: string
+          enum: [dry_run, live, stopped]
+        bankroll:
+          type: number
+        totalTrades:
+          type: integer
+        winRate:
+          type: number
+        totalPnl:
+          type: number
+        biggestWin:
+          type: number
+        biggestLoss:
+          type: number
+        marketsWatched:
+          type: integer
+        uptime:
+          type: string
+          nullable: true
+        pid:
+          type: integer
+          nullable: true
+      required: [running, mode, bankroll, totalTrades, winRate, totalPnl, biggestWin, biggestLoss, marketsWatched]
+
+    Trade:
+      type: object
+      properties:
+        id:
+          type: string
+        marketId:
+          type: string
+        asset:
+          type: string
+        side:
+          type: string
+        price:
+          type: number
+        size:
+          type: number
+        pnl:
+          type: number
+        timestamp:
+          type: string
+        status:
+          type: string
+      required: [id, marketId, asset, side, price, size, pnl, timestamp, status]
+
+    LogResponse:
+      type: object
+      properties:
+        lines:
+          type: array
+          items:
+            type: string
+        total:
+          type: integer
+      required: [lines, total]
+
+    BotStartRequest:
+      type: object
+      properties:
+        dryRun:
+          type: boolean
+      required: [dryRun]
+
+    BotActionResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        message:
+          type: string
+      required: [success, message]
