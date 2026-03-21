@@ -42,7 +42,7 @@ TOTAL_COST_TAKER = TAKER_FEE + TAKER_SLIPPAGE + TAKER_EXEC_RISK   # ~2%
 MIN_EDGE_TAKER = 0.50         # 50% edge required — effectively disables taker/FOK orders
 
 # Legacy aliases (used by EdgeModel default)
-MIN_EDGE = MIN_EDGE_TAKER
+MIN_EDGE = MIN_EDGE_MAKER     # Maker orders only — 0.5% threshold
 TRADING_FEE = TAKER_FEE
 SLIPPAGE_ESTIMATE = TAKER_SLIPPAGE
 INCOMPLETE_EXEC_RISK = TAKER_EXEC_RISK
