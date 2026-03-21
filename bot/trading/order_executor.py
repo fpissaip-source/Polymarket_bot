@@ -234,31 +234,43 @@ class OrderExecutor:
         return ApiCreds(api_key="", api_secret="", api_passphrase="")
 
     def _check_balance_and_allowance(self):
-        try:
-            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-            self.client.update_balance_allowance(params)
-            logger.info("[ALLOWANCE] Called update_balance_allowance (COLLATERAL)")
-        except Exception as e:
-            logger.warning(f"[ALLOWANCE] update_balance_allowance failed: {e}")
+        funder = getattr(self.client.builder, "funder", "?")
+        sig = getattr(self.client.builder, "sig_type", "?")
+        logger.info(f"[ALLOWANCE] Approving exchange contracts for funder={funder} sig_type={sig}")
 
+        # Approve USDC.e (collateral) → Exchange contract (required for BUY orders)
+        for asset_type, label in [
+            (AssetType.COLLATERAL, "COLLATERAL/USDC.e"),
+            (AssetType.CONDITIONAL, "CONDITIONAL/CTF"),
+        ]:
+            try:
+                params = BalanceAllowanceParams(asset_type=asset_type)
+                self.client.update_balance_allowance(params)
+                logger.info(f"[ALLOWANCE] ✓ Approved {label}")
+            except Exception as e:
+                logger.warning(f"[ALLOWANCE] Could not approve {label}: {e}")
+
+        # Check current USDC.e balance
         try:
             params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
             bal = self.client.get_balance_allowance(params)
             if bal:
-                balance = bal.get("balance", "0")
+                balance_raw = bal.get("balance", "0") or "0"
+                balance_usd = float(balance_raw) / 1_000_000
                 allowances = bal.get("allowances", {})
-                logger.info(f"[BALANCE] USDC.e balance: {balance}")
-                for addr, val in allowances.items():
-                    logger.info(f"[ALLOWANCE] {addr}: {val}")
-                if balance == "0" or float(balance) < 1_000_000:
-                    balance_usd = float(balance) / 1_000_000 if balance != "0" else 0
+                logger.info(f"[BALANCE] USDC.e balance: ${balance_usd:.2f} (raw={balance_raw})")
+                for addr, val in (allowances or {}).items():
+                    logger.info(f"[ALLOWANCE]   {addr}: {val}")
+                if balance_usd < 1.0:
                     logger.warning(
-                        f"[BALANCE] USDC.e balance is ${balance_usd:.2f}! "
-                        f"Fund wallet {self.client.builder.funder} with USDC.e on Polygon. "
-                        f"Orders will fail without balance."
+                        f"[BALANCE] ⚠ Only ${balance_usd:.2f} USDC.e on {funder}. "
+                        f"Orders need at least $5. If you deposited via Polymarket website, "
+                        f"the funds are in the proxy wallet — ensure proxy={funder} is correct."
                     )
+                else:
+                    logger.info(f"[BALANCE] ✓ ${balance_usd:.2f} USDC.e ready for trading")
         except Exception as e:
-            logger.warning(f"[BALANCE] Could not check balance: {e}")
+            logger.warning(f"[BALANCE] Could not fetch balance: {e}")
 
     def _fetch_tick_size(self, token_id: str) -> str:
         if token_id in self._tick_cache:
