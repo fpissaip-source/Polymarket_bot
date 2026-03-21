@@ -179,7 +179,7 @@ class ArbitrageBot:
         self._tier_base_edge = self._current_min_edge
         self._MARKET_REFRESH_INTERVAL = 30
         self._MARKET_WINDOW_MIN = MIN_SECONDS_BEFORE_EXPIRY
-        self._MARKET_WINDOW_MAX = 330
+        self._MARKET_WINDOW_MAX = 930  # 15min + 30s buffer
 
         for m1, m2 in RELATED_MARKETS:
             self.spread_map.register_pair(m1, m2)
@@ -423,7 +423,7 @@ class ArbitrageBot:
             logger.info(f"Discovering {asset} markets via Gamma API...")
             markets = gamma.discover_5min_markets(asset)
             if not markets:
-                logger.warning(f"No 5-min markets found for {asset} on Gamma — skipping")
+                logger.warning(f"No 15-min markets found for {asset} on Gamma — skipping")
                 continue
 
             registered_for_asset = 0
@@ -442,7 +442,7 @@ class ArbitrageBot:
                     )
                     continue
 
-                market_id = f"{asset}_5m_{str(condition_id)[:8]}"
+                market_id = f"{asset}_15m_{str(condition_id)[:8]}"
 
                 end_time = 0.0
                 now_ts = time.time()
@@ -470,7 +470,7 @@ class ArbitrageBot:
                 question_text = m.get("question", "")[:60]
                 mins_left = round((end_time - time.time()) / 60, 1) if end_time > 0 else "?"
                 logger.info(
-                    f"[5m] {asset}: registered {market_id} | "
+                    f"[15m] {asset}: registered {market_id} | "
                     f"{mins_left}m left | q='{question_text}'"
                 )
                 self.register_market(
@@ -478,7 +478,7 @@ class ArbitrageBot:
                     token_id_yes=yes_token,
                     token_id_no=no_token,
                     asset=asset,
-                    timeframe="5m",
+                    timeframe="15m",
                     end_time=end_time,
                     gamma_price_yes=gamma_price_yes,
                     gamma_price_no=gamma_price_no,
@@ -489,9 +489,9 @@ class ArbitrageBot:
                 registered += 1
                 registered_for_asset += 1
 
-        logger.info(f"Auto-discovery complete: {registered} 5-min crypto markets registered")
+        logger.info(f"Auto-discovery complete: {registered} 15-min crypto markets registered")
 
-        # Event market discovery DISABLED — bot trades 5-min crypto only
+        # Event market discovery DISABLED — bot trades 15-min crypto only
         logger.info("Event market discovery skipped (5-min crypto mode only)")
 
         self._last_market_refresh = time.time()
@@ -1130,7 +1130,7 @@ class ArbitrageBot:
                 condition_id = m.get("conditionId") or m.get("id", "")
                 if not condition_id:
                     continue
-                market_id = f"{asset}_5m_{str(condition_id)[:8]}"
+                market_id = f"{asset}_15m_{str(condition_id)[:8]}"
                 if market_id in self._markets:
                     continue
 
@@ -1176,7 +1176,7 @@ class ArbitrageBot:
                     token_id_yes=yt,
                     token_id_no=nt,
                     asset=asset,
-                    timeframe="5m",
+                    timeframe="15m",
                     end_time=et,
                     gamma_price_yes=gpy,
                     gamma_price_no=gpn,
@@ -1514,10 +1514,10 @@ class ArbitrageBot:
             size = opp.kelly_result.position_size
             side = opp.edge_result.side          # "YES", "NO", or "BOTH"
 
-            # 5-minute markets: use GTC at competitive price — FOK fails on thin books,
+            # 15-minute markets: use GTC at competitive price — FOK fails on thin books,
             # GTC sits in the order book and fills when matched.
             is_passive = opp.edge_result.is_passive
-            if market.timeframe == "5m":
+            if market.timeframe == "15m":
                 is_passive = True
                 if side == "NO":
                     price = round(1.0 - opp.stoikov_quote.bid, 6)
@@ -1572,8 +1572,16 @@ class ArbitrageBot:
                     logger.info(f"[GAS SKIP] {opp.market_id}: {gas_reason}")
                     continue
 
-                # Hard cap: never exceed MAX_OPEN_TRADES concurrent positions
+                # Hard cap: reserve 2 slots for arbitrage, directional trades use rest
                 n_open = len(self._live_positions)
+                ARB_RESERVED_SLOTS = 2
+                directional_limit = MAX_OPEN_TRADES - ARB_RESERVED_SLOTS
+                if n_open >= directional_limit and side != "BOTH":
+                    logger.info(
+                        f"[SKIP] {opp.market_id}: {n_open}/{directional_limit} directional slots used — "
+                        f"reserving {ARB_RESERVED_SLOTS} for arb"
+                    )
+                    continue
                 if n_open >= MAX_OPEN_TRADES:
                     logger.info(
                         f"[SKIP] {opp.market_id}: {n_open}/{MAX_OPEN_TRADES} positions open — "
@@ -1777,7 +1785,7 @@ class ArbitrageBot:
         if state.end_time <= 0:
             return 0.5
         now = time.time()
-        window = 5 * 60  # 5-minute markets assumed
+        window = 15 * 60  # 15-minute markets assumed
         remaining = state.end_time - now
         if remaining <= 0:
             return 0.0

@@ -18,7 +18,7 @@ CHAIN_ID = int(os.getenv("CHAIN_ID", "137"))  # Polygon
 # Crypto price feed
 PRICE_FEED_URL = os.getenv("PRICE_FEED_URL", "https://api.binance.com/api/v3/ticker/price")
 CRYPTO_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
-# Only BTC/ETH/SOL have active 5-min Up/Down markets on Polymarket
+# Only BTC/ETH/SOL have active 15-min Up/Down markets on Polymarket
 POLYMARKET_ASSETS = ["BTC", "ETH", "SOL"]
 
 # Bayesian model
@@ -91,7 +91,7 @@ DRY_RUN_BANKROLL = float(os.getenv("DRY_RUN_BANKROLL", "25.00"))  # Virtual capi
 # Fixed bet sizing (overrides Kelly when smaller)
 BET_SIZE_PCT = float(os.getenv("BET_SIZE_PCT", "0.20"))
 MIN_BET_SIZE = float(os.getenv("MIN_BET_SIZE", "1.00"))
-MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "2"))
+MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "4"))
 MAX_TOTAL_EXPOSURE_PCT = float(os.getenv("MAX_TOTAL_EXPOSURE_PCT", "0.85"))
 MAX_POSITION_HOLD_MINUTES = float(os.getenv("MAX_POSITION_HOLD_MINUTES", "20.0"))  # Force-sell after this
 MIN_BANKROLL_FLOOR = float(os.getenv("MIN_BANKROLL_FLOOR", "3.0"))
@@ -127,5 +127,5 @@ MC_TRADES = 200               # Number of trades per simulation
 MC_MAX_DD_LIMIT = 0.30        # Stop if max drawdown exceeds 30%
 
 # Bot loop
-POLL_INTERVAL_SECONDS = 1     # How often to scan markets (1s for 5-min markets)
+POLL_INTERVAL_SECONDS = 2     # How often to scan markets (2s for 15-min markets)
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
