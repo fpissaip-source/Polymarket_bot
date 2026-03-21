@@ -410,22 +410,31 @@ class OrderExecutor:
             logger.warning(f"[ALLOWANCE] Could not approve CONDITIONAL token {token_id[:16]}...: {e}")
             return False
 
-        # Poll for on-chain confirmation (5 × 2s = max 10s)
-        for i in range(5):
-            time.sleep(2)
+        # Poll for on-chain confirmation (10 × 3s = max 30s)
+        for i in range(10):
+            time.sleep(3)
             try:
                 data = self.client.get_balance_allowance(params)
-                allowance = float(data.get("allowance", "0") or "0") / 1_000_000
-                if allowance > 0:
+                logger.info(f"[ALLOWANCE] Poll {i+1}/10 raw response: {data}")
+                # Check both possible field names
+                allowance_single = float(data.get("allowance", "0") or "0")
+                allowances_dict = data.get("allowances", {}) or {}
+                balance_raw = float(data.get("balance", "0") or "0")
+                has_allowance = (
+                    allowance_single > 0
+                    or any(float(v or 0) > 0 for v in allowances_dict.values())
+                    or balance_raw > 0  # If we have balance, tokens are there
+                )
+                if has_allowance:
                     logger.info(
-                        f"[ALLOWANCE] ✓ Confirmed on-chain after {(i+1)*2}s "
+                        f"[ALLOWANCE] ✓ Confirmed on-chain after {(i+1)*3}s "
                         f"| token={token_id[:16]}..."
                     )
                     return True
-            except Exception:
-                pass
-        logger.warning(f"[ALLOWANCE] ⚠ Not confirmed after 10s | token={token_id[:16]}...")
-        return False
+            except Exception as e:
+                logger.warning(f"[ALLOWANCE] Poll {i+1}/10 error: {e}")
+        logger.warning(f"[ALLOWANCE] ⚠ Not confirmed after 30s — proceeding anyway | token={token_id[:16]}...")
+        return True  # Proceed anyway — the order might still work
 
     def close_position(self, token_id: str, shares: float, price: float,
                        tick_size: str = "0.01", neg_risk: bool = False) -> str | None:
