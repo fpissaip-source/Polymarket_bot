@@ -603,34 +603,20 @@ class ArbitrageBot:
                     sl_price = round(entry_price * (1.0 - sl_ratio), 4)
                     tp_price = round(entry_price * (1.0 + tp_ratio), 4)
 
-                    # Wait for token settlement before placing sell brackets
+                    # Wait for token settlement before placing TP bracket
                     logger.info(f"[SETTLEMENT] Waiting 5s for token settlement...")
                     time.sleep(5)
 
-                    # SL bracket — retry up to 3 times with increasing delays
-                    if not pos.get("sl_order_id"):
-                        sl_oid = None
-                        for attempt in range(3):
-                            sl_oid = self.executor.place_sl_sell_order(
-                                token_id, filled_shares, sl_price,
-                                tick_size=tick_size, neg_risk=neg_risk,
-                            )
-                            if sl_oid:
-                                break
-                            if attempt < 2:
-                                wait = 5 * (attempt + 1)
-                                logger.info(f"[BRACKET] SL retry {attempt+2}/3 in {wait}s...")
-                                time.sleep(wait)
-                        if sl_oid:
-                            pos["sl_order_id"] = sl_oid
-                            logger.info(
-                                f"[BRACKET] SL placed: {sl_oid[:12]} | "
-                                f"{filled_shares:.2f} shares @ {sl_price:.4f} (SL={sl_ratio:.0%})"
-                            )
-                        else:
-                            logger.warning(f"[BRACKET] SL order failed after 3 attempts — bot monitors manually")
+                    # NOTE: SL brackets are NOT placed as GTC limit orders.
+                    # On the CLOB, a GTC SELL at SL_PRICE means "sell at any price >= SL_PRICE".
+                    # Since SL_PRICE < current market, it would fill IMMEDIATELY (selling at a loss).
+                    # SL is monitored by the bot's price loop instead (close_position when price drops).
+                    logger.info(
+                        f"[BRACKET] SL={sl_price:.4f} ({sl_ratio:.0%}) monitored by bot price loop"
+                    )
 
-                    # TP bracket — retry up to 3 times with increasing delays
+                    # TP bracket — GTC SELL at TP price. Works correctly because TP_PRICE > current
+                    # price, so it sits in the book and only fills when price RISES to TP level.
                     if not pos.get("tp_order_id"):
                         tp_oid = None
                         for attempt in range(3):
@@ -715,57 +701,20 @@ class ArbitrageBot:
                     f"| {shares:.2f} shares | value=${current_value:.2f}"
                 )
 
-                # ── Handle OCO brackets (SL + TP) ──────────────────────────────────
-                sl_order_id = pos.get("sl_order_id", "")
+                # ── Handle TP bracket (only TP is placed as GTC in book) ─────────
                 tp_order_id = pos.get("tp_order_id", "")
-                sl_already_filled = False
                 tp_already_filled = False
-
-                # Cancel BOTH brackets — the CLOB may have auto-executed one already
-                if sl_order_id:
-                    sl_cancel_status = self.executor.cancel_order(sl_order_id)
-                    if sl_cancel_status == "ALREADY_DONE":
-                        if "STOP_LOSS" in reason or "PRE_EXPIRY" in reason or "MAX_HOLD" in reason:
-                            logger.info(
-                                f"[BRACKET_SL] CLOB auto-liquidated {market_id} via SL bracket — "
-                                f"skipping manual sell"
-                            )
-                            sl_already_filled = True
-                        else:
-                            logger.warning(
-                                f"[BRACKET_SL] SL bracket already filled before TP triggered "
-                                f"— position may already be sold"
-                            )
-                    else:
-                        logger.info(f"[BRACKET_SL] Cancelled SL bracket {sl_order_id[:12]}")
 
                 if tp_order_id:
                     tp_cancel_status = self.executor.cancel_order(tp_order_id)
                     if tp_cancel_status == "ALREADY_DONE":
-                        if "TAKE_PROFIT" in reason or "PRE_EXPIRY" in reason:
-                            logger.info(
-                                f"[BRACKET_TP] CLOB auto-executed TP bracket for {market_id} "
-                                f"— skipping manual sell"
-                            )
-                            tp_already_filled = True
-                        else:
-                            logger.warning(
-                                f"[BRACKET_TP] TP bracket already filled before SL triggered"
-                            )
+                        logger.info(
+                            f"[BRACKET_TP] CLOB auto-executed TP for {market_id} — "
+                            f"position already sold ✓"
+                        )
+                        tp_already_filled = True
                     else:
                         logger.info(f"[BRACKET_TP] Cancelled TP bracket {tp_order_id[:12]}")
-
-                if sl_already_filled:
-                    to_remove.append(order_id)
-                    sl_ratio_val = SL_RATIO_LOW if entry_price < LOW_PRICE_THRESHOLD else SL_RATIO
-                    recovered = shares * (entry_price * (1.0 - sl_ratio_val))
-                    logger.info(
-                        f"[BRACKET_SL] Position closed by CLOB bracket: "
-                        f"recovered=${recovered:.2f} (loss=${entry_size - recovered:.2f})"
-                    )
-                    self.kelly.release(entry_size)
-                    self._save_bankroll()
-                    continue
 
                 if tp_already_filled:
                     to_remove.append(order_id)
