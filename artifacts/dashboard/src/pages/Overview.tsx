@@ -26,6 +26,7 @@ type BotStatus = {
   totalTrades: number;
   resolvedTrades: number;
   openTrades: number;
+  openExposure: number;
   winRate: number;
   totalPnl: number;
   biggestWin: number;
@@ -53,7 +54,7 @@ type SimulationData = {
   adaptive: Record<string, unknown>;
   virtualBankroll: number;
   regime: Record<string, RegimeInfo>;
-  gas: { gwei?: number; matic_usd?: number; gas_cost_usd?: number; veto_ratio?: number };
+  gas: { gwei?: number; matic_usd?: number; gas_cost_usd?: number; veto_ratio?: number; veto_tiers?: [number, number][]; veto_large?: number };
 };
 
 const SYMBOL_LABELS: Record<string, string> = {
@@ -120,6 +121,8 @@ export function Overview() {
   const bankrollChange = status ? ((status.virtualBankroll - status.initialBankroll) / status.initialBankroll) * 100 : 0;
 
   const adaptive = (status?.adaptive ?? {}) as Record<string, unknown>;
+  const assetBias = adaptive.asset_bias as Record<string, number> | undefined;
+  const bayesianPriorAdj = adaptive.bayesian_prior_adj as Record<string, number> | undefined;
 
   return (
     <div className="p-6 space-y-6">
@@ -156,57 +159,66 @@ export function Overview() {
         <StatCard
           label="Offene Trades"
           value={`${status?.openTrades ?? 0}`}
-          sub="warten auf Ergebnis"
+          sub={status?.openExposure ? `$${status.openExposure.toFixed(2)} Exposure` : "warten auf Ergebnis"}
           color="text-yellow-400"
         />
       </div>
 
-      {status?.earlyExits && status.earlyExits.total > 0 && (
-        <div className="grid grid-cols-3 gap-4">
-          <StatCard
-            label="Take-Profit Exits"
-            value={`${status.earlyExits.tp}`}
-            sub="Gewinn mitgenommen"
-            color="text-green-400"
-          />
-          <StatCard
-            label="Stop-Loss Exits"
-            value={`${status.earlyExits.sl}`}
-            sub="Verlust begrenzt"
-            color="text-red-400"
-          />
-          <StatCard
-            label="Voller Ablauf"
-            value={`${status.resolvedTrades - status.earlyExits.total}`}
-            sub="bis Ende gehalten"
-          />
-        </div>
-      )}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <StatCard
+          label="Märkte beobachtet"
+          value={`${status?.marketsWatched ?? 0}`}
+          sub="einzigartige Märkte gesehen"
+        />
+        <StatCard
+          label="Größter Gewinn"
+          value={status?.biggestWin ? `+$${status.biggestWin.toFixed(4)}` : "—"}
+          color="text-green-400"
+        />
+        <StatCard
+          label="Größter Verlust"
+          value={status?.biggestLoss ? `$${status.biggestLoss.toFixed(4)}` : "—"}
+          color="text-red-400"
+        />
+        <StatCard
+          label="TP / SL Exits"
+          value={status?.earlyExits ? `${status.earlyExits.tp} / ${status.earlyExits.sl}` : "—"}
+          sub="Take-Profit / Stop-Loss"
+        />
+      </div>
 
       <div className="grid grid-cols-2 gap-4">
         <StatCard
           label="Live Bankroll"
-          value={`$${status?.bankroll?.toFixed(2) ?? "2.00"}`}
-          sub="fuer Live-Trading"
+          value={`$${status?.bankroll?.toFixed(2) ?? "25.00"}`}
+          sub="USDC.e im Proxy-Wallet"
         />
         <div className="bg-card border border-border rounded-lg p-4">
-          <p className="text-xs text-muted-foreground mb-2">Entscheidungen</p>
+          <p className="text-xs text-muted-foreground mb-2">UP / DOWN Trefferquote</p>
           {sim?.decisionBreakdown ? (
-            <div className="space-y-2">
-              <div className="flex justify-between text-sm">
-                <span className="text-green-400 font-bold">UP</span>
-                <span className="font-mono text-xs">
-                  {sim.decisionBreakdown.UP.wins}/{sim.decisionBreakdown.UP.total} Wins
-                  {sim.decisionBreakdown.UP.total > 0 && ` (${((sim.decisionBreakdown.UP.wins / sim.decisionBreakdown.UP.total) * 100).toFixed(0)}%)`}
-                </span>
-              </div>
-              <div className="flex justify-between text-sm">
-                <span className="text-red-400 font-bold">DOWN</span>
-                <span className="font-mono text-xs">
-                  {sim.decisionBreakdown.DOWN.wins}/{sim.decisionBreakdown.DOWN.total} Wins
-                  {sim.decisionBreakdown.DOWN.total > 0 && ` (${((sim.decisionBreakdown.DOWN.wins / sim.decisionBreakdown.DOWN.total) * 100).toFixed(0)}%)`}
-                </span>
-              </div>
+            <div className="space-y-3">
+              {(["UP", "DOWN"] as const).map(dir => {
+                const d = sim.decisionBreakdown[dir];
+                const wr = d.total > 0 ? (d.wins / d.total) * 100 : 0;
+                return (
+                  <div key={dir}>
+                    <div className="flex justify-between text-xs mb-1">
+                      <span className={`font-bold ${dir === "UP" ? "text-green-400" : "text-red-400"}`}>
+                        {dir === "UP" ? "↑" : "↓"} {dir}
+                      </span>
+                      <span className="font-mono text-muted-foreground">
+                        {d.wins}/{d.total} ({wr.toFixed(0)}%)
+                      </span>
+                    </div>
+                    <div className="w-full bg-muted/30 rounded h-1.5">
+                      <div
+                        className={`h-1.5 rounded ${dir === "UP" ? "bg-green-500" : "bg-red-500"}`}
+                        style={{ width: `${wr}%` }}
+                      />
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           ) : (
             <p className="text-sm text-muted-foreground">Keine Daten</p>
@@ -221,6 +233,8 @@ export function Overview() {
             {Object.entries(status.perAsset).map(([asset, data]) => {
               const wr = data.total > 0 ? (data.wins / data.total) * 100 : 0;
               const maxPnl = Math.max(...Object.values(status.perAsset).map(d => Math.abs(d.pnl)), 0.01);
+              const bias = assetBias?.[asset];
+              const priorAdj = bayesianPriorAdj?.[asset];
               return (
                 <div key={asset} className="bg-card border border-border rounded-lg p-3">
                   <div className="flex justify-between items-center mb-2">
@@ -234,6 +248,16 @@ export function Overview() {
                     <span>{data.wins}/{data.total} Wins</span>
                     <span>{wr.toFixed(0)}% WR</span>
                   </div>
+                  {(bias != null || priorAdj != null) && (
+                    <div className="flex gap-3 mt-1.5 text-[10px] text-muted-foreground border-t border-border/40 pt-1.5">
+                      {bias != null && (
+                        <span>Bias: <span className={bias >= 0 ? "text-green-400" : "text-red-400"}>{bias >= 0 ? "+" : ""}{bias.toFixed(3)}</span></span>
+                      )}
+                      {priorAdj != null && (
+                        <span>Prior: <span className={priorAdj >= 0 ? "text-green-400" : "text-red-400"}>{priorAdj >= 0 ? "+" : ""}{priorAdj.toFixed(3)}</span></span>
+                      )}
+                    </div>
+                  )}
                 </div>
               );
             })}
@@ -243,34 +267,59 @@ export function Overview() {
 
       {adaptive && (adaptive as Record<string, unknown>).total_analyzed != null && (
         <div>
-          <h3 className="text-sm font-semibold text-muted-foreground mb-3 uppercase tracking-wider">Adaptive Optimierung</h3>
-          <div className="bg-card border border-border rounded-lg p-4 grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
-            <div>
-              <p className="text-xs text-muted-foreground">Kelly Anpassung</p>
-              <p className={`font-mono font-bold ${(adaptive.kelly_lambda_adj as number) >= 0 ? "text-green-400" : "text-red-400"}`}>
-                {(adaptive.kelly_lambda_adj as number) >= 0 ? "+" : ""}{((adaptive.kelly_lambda_adj as number) ?? 0).toFixed(4)}
-              </p>
-            </div>
-            <div>
-              <p className="text-xs text-muted-foreground">Edge Anpassung</p>
-              <p className={`font-mono font-bold ${(adaptive.edge_threshold_adj as number) <= 0 ? "text-green-400" : "text-red-400"}`}>
-                {(adaptive.edge_threshold_adj as number) >= 0 ? "+" : ""}{((adaptive.edge_threshold_adj as number) ?? 0).toFixed(4)}
-              </p>
-            </div>
-            <div>
-              <p className="text-xs text-muted-foreground">Trades analysiert</p>
-              <p className="font-mono font-bold">{(adaptive.total_analyzed as number) ?? 0}</p>
-            </div>
-            <div>
-              <p className="text-xs text-muted-foreground">Asset Bias</p>
-              <div className="flex gap-2 flex-wrap">
-                {adaptive.asset_bias && Object.entries(adaptive.asset_bias as Record<string, number>).map(([a, v]) => (
-                  <span key={a} className={`text-xs font-mono ${v >= 0 ? "text-green-400" : "text-red-400"}`}>
-                    {a}: {v >= 0 ? "+" : ""}{v.toFixed(3)}
-                  </span>
-                ))}
+          <h3 className="text-sm font-semibold text-muted-foreground mb-3 uppercase tracking-wider">Adaptive Optimierung — Lernfortschritt</h3>
+          <div className="bg-card border border-border rounded-lg p-4 space-y-4">
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+              <div>
+                <p className="text-xs text-muted-foreground">Trades analysiert</p>
+                <p className="font-mono font-bold text-lg">{(adaptive.total_analyzed as number) ?? 0}</p>
+              </div>
+              <div>
+                <p className="text-xs text-muted-foreground">Kelly Anpassung</p>
+                <p className={`font-mono font-bold text-lg ${(adaptive.kelly_lambda_adj as number) >= 0 ? "text-green-400" : "text-red-400"}`}>
+                  {(adaptive.kelly_lambda_adj as number) >= 0 ? "+" : ""}{((adaptive.kelly_lambda_adj as number) ?? 0).toFixed(4)}
+                </p>
+                <p className="text-xs text-muted-foreground">{(adaptive.kelly_lambda_adj as number) >= 0 ? "Aggressiver" : "Konservativer"}</p>
+              </div>
+              <div>
+                <p className="text-xs text-muted-foreground">Edge Anpassung</p>
+                <p className={`font-mono font-bold text-lg ${(adaptive.edge_threshold_adj as number) <= 0 ? "text-green-400" : "text-red-400"}`}>
+                  {(adaptive.edge_threshold_adj as number) >= 0 ? "+" : ""}{((adaptive.edge_threshold_adj as number) ?? 0).toFixed(4)}
+                </p>
+                <p className="text-xs text-muted-foreground">{(adaptive.edge_threshold_adj as number) <= 0 ? "Mehr Trades" : "Höhere Hürde"}</p>
+              </div>
+              <div>
+                <p className="text-xs text-muted-foreground">Asset Bias</p>
+                <div className="flex gap-1.5 flex-wrap mt-1">
+                  {assetBias && Object.entries(assetBias).filter(([, v]) => Math.abs(v) > 0.001).map(([a, v]) => (
+                    <span key={a} className={`text-xs font-mono px-1.5 py-0.5 rounded ${v >= 0 ? "bg-green-500/10 text-green-400" : "bg-red-500/10 text-red-400"}`}>
+                      {a} {v >= 0 ? "+" : ""}{v.toFixed(3)}
+                    </span>
+                  ))}
+                  {(!assetBias || Object.values(assetBias).every(v => Math.abs(v) <= 0.001)) && (
+                    <span className="text-xs text-muted-foreground">Noch neutral</span>
+                  )}
+                </div>
               </div>
             </div>
+            {bayesianPriorAdj && Object.keys(bayesianPriorAdj).length > 0 && (
+              <div className="border-t border-border/40 pt-3">
+                <p className="text-xs text-muted-foreground mb-2">Bayesianische Prior-Anpassungen pro Asset</p>
+                <div className="flex gap-3 flex-wrap">
+                  {Object.entries(bayesianPriorAdj).map(([asset, v]) => (
+                    <div key={asset} className="text-xs">
+                      <span className="text-muted-foreground">{asset}: </span>
+                      <span className={`font-mono font-bold ${v > 0 ? "text-green-400" : v < 0 ? "text-red-400" : "text-muted-foreground"}`}>
+                        {v >= 0 ? "+" : ""}{v.toFixed(4)}
+                      </span>
+                      <span className="text-muted-foreground ml-1 text-[10px]">
+                        ({v > 0.01 ? "Bias UP" : v < -0.01 ? "Bias DOWN" : "Neutral"})
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -304,7 +353,7 @@ export function Overview() {
               <span>Gas: <span className="text-foreground font-mono">{sim.gas.gwei?.toFixed(1)} Gwei</span></span>
               <span>MATIC: <span className="text-foreground font-mono">${sim.gas.matic_usd?.toFixed(4)}</span></span>
               <span>Tx-Kosten: <span className="text-foreground font-mono">${sim.gas.gas_cost_usd?.toFixed(5)}</span></span>
-              <span>Veto bei: <span className="text-orange-400 font-mono">&gt;{((sim.gas.veto_ratio ?? 0.3) * 100).toFixed(0)}% Edge</span></span>
+              <span>Veto: <span className="text-orange-400 font-mono">{sim.gas.veto_tiers ? sim.gas.veto_tiers.map(([t, r]) => `<$${t}→${(r*100).toFixed(0)}%`).join(', ') + `, $${sim.gas.veto_tiers[sim.gas.veto_tiers.length-1]?.[0]}+→${((sim.gas.veto_large ?? 0.15)*100).toFixed(0)}%` : `>${((sim.gas.veto_ratio ?? 0.3) * 100).toFixed(0)}% Edge`}</span></span>
             </div>
           )}
         </div>

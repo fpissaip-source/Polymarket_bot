@@ -135,7 +135,7 @@ router.get("/bot/status", (req, res) => {
     totalPnl: Math.round(totalPnl * 10000) / 10000,
     biggestWin: Math.round(biggestWin * 10000) / 10000,
     biggestLoss: Math.round(biggestLoss * 10000) / 10000,
-    marketsWatched: 0,
+    marketsWatched: new Set(dryRunLog.map(e => e.market_id)).size,
     uptime,
     pid: botProcess?.pid ?? null,
     perAsset,
