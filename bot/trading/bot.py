@@ -1333,12 +1333,11 @@ class ArbitrageBot:
             size = opp.kelly_result.position_size
             side = opp.edge_result.side          # "YES", "NO", or "BOTH"
 
-            # 5-minute markets: always AGGRESSIVE (FOK at ask) — GTC maker orders
-            # almost never fill in a 5-min window on thin books.
+            # 5-minute markets: use GTC at competitive price — FOK fails on thin books,
+            # GTC sits in the order book and fills when matched.
             is_passive = opp.edge_result.is_passive
             if market.timeframe == "5m":
-                is_passive = False
-                # For FOK taker: buy at ask (YES) or 1-bid (NO) to guarantee fill
+                is_passive = True
                 if side == "NO":
                     price = round(1.0 - opp.stoikov_quote.bid, 6)
                 else:
@@ -1530,6 +1529,19 @@ class ArbitrageBot:
         half = max(size / 2.0, MIN_BET_SIZE)
         yes_price = market.last_price
         no_price = market.last_price_no
+
+        yes_min = 5.0 * yes_price if yes_price > 0 else 999
+        no_min = 5.0 * no_price if no_price > 0 else 999
+        needed = max(yes_min, no_min)
+        if half < needed:
+            if self.kelly.available_capital >= needed * 2:
+                half = needed
+            else:
+                logger.warning(
+                    f"Both legs rejected for {market.market_id}: "
+                    f"need ${needed:.2f}/leg (5-share min) but only ${self.kelly.available_capital:.2f} available"
+                )
+                return
 
         logger.info(
             f"[LIVE] Within-market arb {market.market_id}: "
