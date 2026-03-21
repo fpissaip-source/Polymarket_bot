@@ -59,6 +59,7 @@ from config import (
     LOW_PRICE_THRESHOLD,
     TP_SL_CHECK_INTERVAL,
     MIN_SECONDS_BEFORE_EXPIRY,
+    MIN_BET_SIZE,
 )
 
 TRADES_FILE = Path(__file__).parent.parent / "trades.json"
@@ -802,6 +803,13 @@ class ArbitrageBot:
                     f"= ${kelly_result.position_size:.3f}"
                 )
 
+            # Enforce Polymarket minimum order size ($1.00)
+            if kelly_result.is_viable and kelly_result.position_size > 0:
+                if kelly_result.position_size < MIN_BET_SIZE:
+                    kelly_result = dc_replace(
+                        kelly_result, position_size=MIN_BET_SIZE
+                    )
+                    logger.debug(f"[MIN_BET] size clamped to ${MIN_BET_SIZE:.2f}")
             if kelly_result.is_viable and kelly_result.position_size > 0:
                 opp = TradeOpportunity(
                     market_id=market_id,

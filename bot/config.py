@@ -88,8 +88,9 @@ DRY_RUN_BANKROLL = float(os.getenv("DRY_RUN_BANKROLL", "25.00"))  # Virtual capi
 
 # Fixed bet sizing (overrides Kelly when smaller)
 BET_SIZE_PCT = 0.02           # Each trade = 2% of current bankroll
+MIN_BET_SIZE = 1.00           # Polymarket minimum order size in USD
 MAX_OPEN_TRADES = 4           # Max concurrent open positions
-MAX_TOTAL_EXPOSURE_PCT = 0.08 # Max 8% of bankroll open at once
+MAX_TOTAL_EXPOSURE_PCT = 0.20 # Max 20% of bankroll open at once (4 × $1 on $25 bankroll)
 MIN_BANKROLL_FLOOR = 3.0      # Stop trading if virtual bankroll drops below $3
 
 # Growth tiers: (min_balance, max_balance, kelly_lambda, min_edge)
