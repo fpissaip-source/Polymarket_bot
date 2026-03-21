@@ -586,11 +586,13 @@ class OrderExecutor:
             bd = self.client.get_balance_allowance(bp)
             ctf_bal = float(bd.get("balance", "0") or "0") / 1_000_000
             if 0 < ctf_bal < shares:
+                import math
+                floored = math.floor(ctf_bal * 100) / 100  # Floor to 2 decimals
                 logger.info(
-                    f"[SL_ORDER] Adjusting shares {shares:.2f} → {ctf_bal:.2f} "
-                    f"(actual CTF balance)"
+                    f"[SL_ORDER] Adjusting shares {shares:.2f} → {floored:.2f} "
+                    f"(actual CTF balance={ctf_bal:.6f})"
                 )
-                shares = round(ctf_bal, 2)
+                shares = floored
                 if shares < 5.0:
                     logger.warning(f"[SL_ORDER] CTF balance {shares:.2f} < 5 min — skipping")
                     return None
@@ -636,11 +638,13 @@ class OrderExecutor:
             bd = self.client.get_balance_allowance(bp)
             ctf_bal = float(bd.get("balance", "0") or "0") / 1_000_000
             if 0 < ctf_bal < shares:
+                import math
+                floored = math.floor(ctf_bal * 100) / 100  # Floor to 2 decimals
                 logger.info(
-                    f"[TP_ORDER] Adjusting shares {shares:.2f} → {ctf_bal:.2f} "
-                    f"(actual CTF balance)"
+                    f"[TP_ORDER] Adjusting shares {shares:.2f} → {floored:.2f} "
+                    f"(actual CTF balance={ctf_bal:.6f})"
                 )
-                shares = round(ctf_bal, 2)
+                shares = floored
                 if shares < 5.0:
                     logger.warning(f"[TP_ORDER] CTF balance {shares:.2f} < 5 min — skipping")
                     return None
