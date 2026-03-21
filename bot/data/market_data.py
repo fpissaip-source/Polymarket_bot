@@ -259,16 +259,8 @@ class PolymarketDataClient:
         imbalance = (bid_vol - ask_vol) / total if total > 1e-8 else 0.0
         depth = min(1.0, total / 1000.0)
 
-        tick_size = None
-        neg_risk = None
         min_order_size = 0.0
         if book:
-            ts = book.get("tick_size") or book.get("minimum_tick_size")
-            if ts is not None and str(ts) in ("0.1", "0.01", "0.001", "0.0001"):
-                tick_size = str(ts)
-            nr = book.get("neg_risk")
-            if nr is not None:
-                neg_risk = bool(nr)
             mos = book.get("min_order_size") or book.get("minimum_order_size")
             if mos is not None:
                 try:
@@ -276,10 +268,8 @@ class PolymarketDataClient:
                 except (TypeError, ValueError):
                     pass
 
-        if tick_size is None:
-            tick_size = self.get_tick_size(token_id)
-        if neg_risk is None:
-            neg_risk = self.get_neg_risk(token_id)
+        tick_size = self.get_tick_size(token_id)
+        neg_risk = self.get_neg_risk(token_id)
 
         return {
             "mid_price": mid_price,

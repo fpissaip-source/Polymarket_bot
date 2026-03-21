@@ -674,8 +674,12 @@ class ArbitrageBot:
             no_data = self.data_client.get_book_data(state.token_id_no)
             p_yes = yes_data["mid_price"]
             p_no = no_data["mid_price"]
-            state.tick_size = yes_data.get("tick_size", "0.01")
-            state.neg_risk = yes_data.get("neg_risk", False)
+            book_tick = yes_data.get("tick_size")
+            book_neg = yes_data.get("neg_risk")
+            if book_tick is not None and book_tick in ("0.1", "0.01", "0.001", "0.0001"):
+                state.tick_size = book_tick
+            if book_neg is not None:
+                state.neg_risk = book_neg
             if p_yes is None and state.gamma_price_yes is not None:
                 if abs(state.gamma_price_yes - 0.5) > 0.01:
                     p_yes = state.gamma_price_yes
