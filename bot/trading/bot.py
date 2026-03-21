@@ -612,19 +612,38 @@ class ArbitrageBot:
                     f"[SELL] cancel={cancel_status} mid={current_price:.4f} best_bid={best_bid:.4f} "
                     f"selling {actual_shares:.2f} shares @ {sell_price}"
                 )
-                result = self.executor.close_position(
+                sell_order_id = self.executor.close_position(
                     token_id, actual_shares, sell_price,
                     tick_size=tick_size, neg_risk=neg_risk,
                 )
-                if result:
-                    logger.info(f"[SELL] SUCCESS — order_id={result}")
-                else:
+                if not sell_order_id:
                     logger.error(f"[SELL] FAILED for {market_id} — retrying next cycle")
                     continue
 
-                to_remove.append(order_id)
-                self.kelly.release(entry_size)
-                self._save_bankroll()
+                sold_shares = self.executor.get_order_fills(sell_order_id)
+                if sold_shares < 0:
+                    sold_shares = actual_shares
+                    logger.warning(f"[SELL] Fill verify API unavailable — assuming full sell of {actual_shares:.2f}")
+
+                DUST = 1.0
+                remaining = actual_shares - sold_shares
+                if remaining <= DUST:
+                    logger.info(f"[SELL] COMPLETE — sold={sold_shares:.2f} remaining={remaining:.2f} (dust)")
+                    to_remove.append(order_id)
+                    self.kelly.release(entry_size)
+                    self._save_bankroll()
+                else:
+                    fraction_sold = sold_shares / actual_shares if actual_shares > 0 else 1.0
+                    partial_usdc = entry_size * fraction_sold
+                    logger.warning(
+                        f"[SELL] PARTIAL — sold={sold_shares:.2f}/{actual_shares:.2f} "
+                        f"remaining={remaining:.2f} shares — updating position, retrying next cycle"
+                    )
+                    pos["shares"] = remaining
+                    pos["entry_size"] = entry_size - partial_usdc
+                    self.kelly.release(partial_usdc)
+                    self._save_live_positions()
+                    self._save_bankroll()
 
         for oid in to_remove:
             self._live_positions.pop(oid, None)
