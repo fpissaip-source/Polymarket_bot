@@ -228,9 +228,14 @@ class ArbitrageBot:
                       if pos.get("end_time", 0) == 0 or pos["end_time"] > now - 60}
             self._live_positions = active
             if active:
+                # Reconstruct committed capital so Kelly doesn't over-allocate
+                for pos in active.values():
+                    self.kelly.allocate(pos.get("entry_size", 0.0))
+                committed = sum(p.get("entry_size", 0) for p in active.values())
                 logger.info(
                     f"[STARTUP] Restored {len(active)} live positions from previous session: "
                     + ", ".join(f"{p['market_id']}" for p in active.values())
+                    + f" | committed_capital reconstructed = ${committed:.2f}"
                 )
         except Exception as e:
             logger.warning(f"Could not load live positions: {e}")
