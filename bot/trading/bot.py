@@ -60,6 +60,8 @@ from config import (
     TP_SL_CHECK_INTERVAL,
     MIN_SECONDS_BEFORE_EXPIRY,
     MIN_BET_SIZE,
+    MAX_OPEN_TRADES,
+    MAX_TOTAL_EXPOSURE_PCT,
 )
 
 TRADES_FILE = Path(__file__).parent.parent / "trades.json"
@@ -505,20 +507,18 @@ class ArbitrageBot:
             if reason:
                 logger.info(
                     f"[{reason}] {pos['market_id']} order={order_id[:8]} "
-                    f"entry={entry_price:.4f} current={current_price:.4f} pnl={pnl_ratio:+.1%}"
+                    f"entry={entry_price:.4f} now={current_price:.4f} pnl={pnl_ratio:+.1%} "
+                    f"| {shares:.2f} shares | value=${current_value:.2f}"
                 )
-                # Try cancel first (works if order is still open / unfilled)
+                # 1. Try cancel (works if order is still open/unfilled)
                 cancelled = self.executor.cancel_order(order_id)
                 if not cancelled:
-                    # Order already filled — place a limit SELL to close the position
+                    # 2. Order already filled — sell all shares to close position
+                    # Use close_position() which accepts shares directly, bypasses $5 minimum
                     sell_price = round(current_price, 4)
-                    self.executor.place_limit_order(
-                        token_id, "SELL", sell_price, entry_size,
+                    self.executor.close_position(
+                        token_id, shares, sell_price,
                         tick_size=tick_size, neg_risk=neg_risk,
-                    )
-                    logger.info(
-                        f"[{reason}] Placed SELL {shares:.2f} shares @ {sell_price:.4f} "
-                        f"to close position"
                     )
                 to_remove.append(order_id)
                 self.kelly.release(entry_size)
@@ -1010,6 +1010,33 @@ class ArbitrageBot:
                 )
                 if not gas_ok:
                     logger.info(f"[GAS SKIP] {opp.market_id}: {gas_reason}")
+                    continue
+
+                # Hard cap: never exceed MAX_OPEN_TRADES concurrent positions
+                n_open = len(self._live_positions)
+                if n_open >= MAX_OPEN_TRADES:
+                    logger.info(
+                        f"[SKIP] {opp.market_id}: {n_open}/{MAX_OPEN_TRADES} positions open — "
+                        f"waiting for TP/SL/expiry before opening more"
+                    )
+                    continue
+
+                # Hard cap: never exceed MAX_TOTAL_EXPOSURE_PCT of bankroll
+                max_exposure = self.kelly.bankroll * MAX_TOTAL_EXPOSURE_PCT
+                if self.kelly.committed_capital + size > max_exposure:
+                    logger.info(
+                        f"[SKIP] {opp.market_id}: exposure ${self.kelly.committed_capital:.2f}+"
+                        f"${size:.2f} > max ${max_exposure:.2f} "
+                        f"({MAX_TOTAL_EXPOSURE_PCT:.0%} of ${self.kelly.bankroll:.2f})"
+                    )
+                    continue
+
+                # Hard cap: enough free capital for this trade
+                if self.kelly.available_capital < size:
+                    logger.info(
+                        f"[SKIP] {opp.market_id}: available=${self.kelly.available_capital:.2f} "
+                        f"< trade size ${size:.2f}"
+                    )
                     continue
 
             if self.dry_run:

@@ -380,6 +380,48 @@ class OrderExecutor:
         return self.place_order(token_id, side, price, size, order_type="GTC",
                                 tick_size=tick_size, neg_risk=neg_risk)
 
+    def close_position(self, token_id: str, shares: float, price: float,
+                       tick_size: str = "0.01", neg_risk: bool = False) -> str | None:
+        """
+        Sell `shares` outcome tokens at `price` to close a position.
+        Bypasses the USD minimum-size check — used for TP/SL exits only.
+        """
+        try:
+            real_tick, real_neg = self._tick(token_id, tick_size, neg_risk)
+            decimals = TICK_DECIMALS[real_tick]
+            rounded_price = round(price, decimals)
+            rounded_shares = round(shares, 2)
+
+            if rounded_shares < 1.0:
+                logger.warning(f"[CLOSE] Too few shares to sell: {rounded_shares:.2f} (min 1)")
+                return None
+
+            options = PartialCreateOrderOptions(tick_size=real_tick, neg_risk=real_neg)
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=rounded_price,
+                size=rounded_shares,
+                side="SELL",
+                expiration=0,
+            )
+            logger.info(
+                f"[CLOSE] SELL {rounded_shares} shares @ {rounded_price} "
+                f"| tick={real_tick} neg_risk={real_neg} | maker={self.client.builder.funder}"
+            )
+            signed = self.client.create_order(order_args, options)
+            resp = _post_with_retry(self.client.post_order, signed, OrderType.GTC)
+            order_id = resp.get("orderID") or resp.get("id")
+            status = resp.get("status", "unknown")
+            error_msg = resp.get("errorMsg", "")
+            if error_msg:
+                logger.warning(f"[CLOSE] Error: {error_msg}")
+                return None
+            logger.info(f"[CLOSE] SUCCESS SELL {rounded_shares} shares @ {rounded_price} | status={status} | id={order_id}")
+            return order_id
+        except Exception as e:
+            logger.error(f"[CLOSE] Failed to close position: {e}")
+            return None
+
     def place_fok_order(self, token_id: str, side: str, price: float, size: float,
                         tick_size: str = "0.01", neg_risk: bool = False) -> str | None:
         return self.place_order(token_id, side, price, size, order_type="FOK",
