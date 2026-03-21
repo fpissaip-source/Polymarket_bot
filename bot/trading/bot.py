@@ -54,6 +54,9 @@ from config import (
     BANKROLL_STATE_FILE,
     TP_RATIO,
     SL_RATIO,
+    TP_RATIO_LOW,
+    SL_RATIO_LOW,
+    LOW_PRICE_THRESHOLD,
     TP_SL_CHECK_INTERVAL,
     SWEET_SPOT_LOW_MIN,
     SWEET_SPOT_LOW_MAX,
@@ -422,13 +425,24 @@ class ArbitrageBot:
             unrealized_pnl = current_value - entry.size
             pnl_ratio = unrealized_pnl / entry.size if entry.size > 0 else 0
 
-            if pnl_ratio >= TP_RATIO:
+            # Adaptive TP/SL: tighter thresholds for low-price positions
+            # (e.g. YES at 0.19 can drop 38% in one tick — standard 20% SL is too loose)
+            is_low_price = entry.exec_price < LOW_PRICE_THRESHOLD
+            tp = TP_RATIO_LOW if is_low_price else TP_RATIO
+            sl = SL_RATIO_LOW if is_low_price else SL_RATIO
+            if is_low_price:
+                logger.debug(
+                    f"[SL] ADAPTIVE: exec_price={entry.exec_price:.4f} < {LOW_PRICE_THRESHOLD} "
+                    f"→ using TP={tp:.0%}, SL={sl:.0%}"
+                )
+
+            if pnl_ratio >= tp:
                 self.dry_run_tracker.early_exit(
                     entry.trade_id, current_price,
                     f"TAKE_PROFIT({pnl_ratio:+.1%})"
                 )
                 self.kelly.bankroll = self.dry_run_tracker.virtual_bankroll
-            elif pnl_ratio <= -SL_RATIO:
+            elif pnl_ratio <= -sl:
                 self.dry_run_tracker.early_exit(
                     entry.trade_id, current_price,
                     f"STOP_LOSS({pnl_ratio:+.1%})"
