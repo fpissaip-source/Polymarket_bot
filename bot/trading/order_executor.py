@@ -471,25 +471,48 @@ class OrderExecutor:
                 price=rounded_price,
             )
 
-            signed = self.client.create_market_order(market_args, options)
-            resp = _post_with_retry(self.client.post_order, signed, OrderType.FOK)
-            order_id = resp.get("orderID") or resp.get("id")
-            status = resp.get("status", "unknown")
-            error_msg = resp.get("errorMsg", "")
+            # Try FOK first, fall back to FAK if FOK fails (exception or errorMsg)
+            fok_failed = False
+            try:
+                signed = self.client.create_market_order(market_args, options)
+                resp = _post_with_retry(self.client.post_order, signed, OrderType.FOK)
+                error_msg = resp.get("errorMsg", "")
+                if error_msg:
+                    logger.warning(f"[CLOSE] FOK rejected: {error_msg} — retrying as FAK")
+                    fok_failed = True
+                else:
+                    order_id = resp.get("orderID") or resp.get("id")
+                    status = resp.get("status", "unknown")
+                    logger.info(f"[CLOSE] SUCCESS (FOK) SELL {rounded_shares} shares @ {rounded_price} | status={status} | id={order_id}")
+                    return order_id
+            except Exception as fok_e:
+                fok_err = str(fok_e).lower()
+                if "not enough balance" in fok_err or "allowance" in fok_err:
+                    logger.error(f"[CLOSE] FATAL balance/allowance error: {fok_e}")
+                    return "BALANCE_ERROR"
+                logger.warning(f"[CLOSE] FOK exception: {fok_e} — retrying as FAK")
+                fok_failed = True
 
-            if error_msg:
-                logger.warning(f"[CLOSE] FOK rejected: {error_msg} — retrying as FAK (partial fill)")
-                signed2 = self.client.create_market_order(market_args, options)
-                resp2 = _post_with_retry(self.client.post_order, signed2, OrderType.FAK)
-                order_id = resp2.get("orderID") or resp2.get("id")
-                error_msg2 = resp2.get("errorMsg", "")
-                if error_msg2:
-                    logger.error(f"[CLOSE] FAK also rejected: {error_msg2} — will retry next cycle")
+            # FAK fallback: fill what's available, cancel the rest (partial sell OK)
+            if fok_failed:
+                try:
+                    signed2 = self.client.create_market_order(market_args, options)
+                    resp2 = _post_with_retry(self.client.post_order, signed2, OrderType.FAK)
+                    error_msg2 = resp2.get("errorMsg", "")
+                    if error_msg2:
+                        logger.error(f"[CLOSE] FAK also rejected: {error_msg2} — will retry next cycle")
+                        return None
+                    order_id = resp2.get("orderID") or resp2.get("id")
+                    status = resp2.get("status", "unknown")
+                    logger.info(f"[CLOSE] SUCCESS (FAK) SELL {rounded_shares} shares @ {rounded_price} | status={status} | id={order_id}")
+                    return order_id
+                except Exception as fak_e:
+                    fak_err = str(fak_e).lower()
+                    if "not enough balance" in fak_err or "allowance" in fak_err:
+                        logger.error(f"[CLOSE] FATAL balance/allowance error: {fak_e}")
+                        return "BALANCE_ERROR"
+                    logger.error(f"[CLOSE] FAK also failed: {fak_e} — will retry next cycle")
                     return None
-                status = resp2.get("status", "unknown")
-
-            logger.info(f"[CLOSE] SUCCESS SELL {rounded_shares} shares @ {rounded_price} | status={status} | id={order_id}")
-            return order_id
         except Exception as e:
             err_str = str(e).lower()
             if "not enough balance" in err_str or "allowance" in err_str:
