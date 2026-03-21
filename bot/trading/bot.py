@@ -64,6 +64,7 @@ from config import (
     MAX_OPEN_TRADES,
     MAX_TOTAL_EXPOSURE_PCT,
     MAX_POSITION_HOLD_MINUTES,
+    POLYMARKET_PROXY_ADDRESS,
 )
 
 TRADES_FILE = Path(__file__).parent.parent / "trades.json"
@@ -225,23 +226,65 @@ class ArbitrageBot:
         try:
             with open(self.LIVE_POSITIONS_FILE) as f:
                 loaded = json.load(f)
-            # Only keep positions that haven't expired yet
-            now = time.time()
-            active = {oid: pos for oid, pos in loaded.items()
-                      if pos.get("end_time", 0) == 0 or pos["end_time"] > now - 60}
-            self._live_positions = active
-            if active:
-                # Reconstruct committed capital so Kelly doesn't over-allocate
-                for pos in active.values():
-                    self.kelly.allocate(pos.get("entry_size", 0.0))
-                committed = sum(p.get("entry_size", 0) for p in active.values())
-                logger.info(
-                    f"[STARTUP] Restored {len(active)} live positions from previous session: "
-                    + ", ".join(f"{p['market_id']}" for p in active.values())
-                    + f" | committed_capital reconstructed = ${committed:.2f}"
-                )
         except Exception as e:
             logger.warning(f"Could not load live positions: {e}")
+            return
+
+        # Step 1: Drop expired entries (end_time past by >60s)
+        now = time.time()
+        active = {oid: pos for oid, pos in loaded.items()
+                  if pos.get("end_time", 0) == 0 or pos["end_time"] > now - 60}
+
+        # Step 2: Reconcile against actual on-chain token balances
+        # Prevents ghost positions when bot was restarted after manual/external closure
+        try:
+            gamma = GammaClient()
+            real_positions = gamma.get_positions(POLYMARKET_PROXY_ADDRESS)
+            # Build set of token_ids with a meaningful balance (>= 0.01 shares)
+            real_token_ids: set[str] = set()
+            for rp in real_positions:
+                tid = str(rp.get("asset") or rp.get("token_id") or rp.get("tokenId") or "")
+                size = float(rp.get("size") or rp.get("balance") or 0)
+                if tid and size >= 0.01:
+                    real_token_ids.add(tid)
+            logger.info(f"[STARTUP] On-chain positions: {len(real_token_ids)} token(s) with balance")
+
+            purged = []
+            reconciled = {}
+            for oid, pos in active.items():
+                tid = pos.get("token_id", "")
+                if tid and tid not in real_token_ids:
+                    purged.append(pos.get("market_id", oid[:8]))
+                    logger.warning(
+                        f"[STARTUP] Ghost position purged: {pos.get('market_id', oid[:8])} "
+                        f"— token {tid[:16]}... has no on-chain balance"
+                    )
+                else:
+                    reconciled[oid] = pos
+            if purged:
+                logger.warning(
+                    f"[STARTUP] Purged {len(purged)} ghost position(s): {purged} "
+                    f"— these existed in live_positions.json but had no real token balance"
+                )
+            active = reconciled
+        except Exception as e:
+            logger.warning(f"[STARTUP] Position reconciliation failed (keeping all tracked): {e}")
+
+        self._live_positions = active
+        if active:
+            for pos in active.values():
+                self.kelly.allocate(pos.get("entry_size", 0.0))
+            committed = sum(p.get("entry_size", 0) for p in active.values())
+            logger.info(
+                f"[STARTUP] Restored {len(active)} live positions: "
+                + ", ".join(f"{p['market_id']}" for p in active.values())
+                + f" | committed_capital = ${committed:.2f}"
+            )
+        else:
+            logger.info("[STARTUP] No active positions — bot starts with clean slate")
+
+        # Persist reconciled state immediately
+        self._save_live_positions()
 
     # ------------------------------------------------------------------
     # Dynamic tier adjustment
