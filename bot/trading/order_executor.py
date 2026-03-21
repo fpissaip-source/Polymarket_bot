@@ -110,10 +110,18 @@ class OrderExecutor:
         clob_side = BUY if side.upper() == "BUY" else SELL
         ot = _ORDER_TYPE_MAP.get(order_type.upper(), OrderType.GTC)
 
+        # Polymarket size = number of shares (tokens), not dollar amount
+        # shares = dollar_amount / price  (each share costs `price` USDC)
+        shares = size / price if price > 0 else 0
+        if shares < 1.0:
+            logger.warning(f"Order too small: ${size:.2f} / {price:.4f} = {shares:.2f} shares (min 1)")
+            return None
+
+        # Polymarket tick size = 0.01 (prices in cents)
         order_args = OrderArgs(
             token_id=token_id,
-            price=round(price, 4),
-            size=round(size, 2),
+            price=round(price, 2),
+            size=round(shares, 2),
             side=clob_side,
             expiration=expiration,
         )

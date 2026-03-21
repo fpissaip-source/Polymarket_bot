@@ -976,7 +976,7 @@ class ArbitrageBot:
 
     def _place_arb_both_sides(self, market: MarketState, size: float, aggressive: bool):
         """Place both YES and NO legs of a within-market arbitrage."""
-        half = size / 2.0
+        half = max(size / 2.0, MIN_BET_SIZE)
         yes_price = market.last_price
         no_price = market.last_price_no
 
