@@ -528,6 +528,7 @@ class OrderExecutor:
 
         # Set ERC1155 allowance for this specific token BEFORE placing the GTC sell bracket
         self._approve_conditional_token(token_id)
+        time.sleep(3)   # Wait for Polygon tx confirmation before placing GTC order
 
         size_usd = shares * sl_price
         logger.info(
@@ -561,6 +562,7 @@ class OrderExecutor:
 
         # Set ERC1155 allowance for this specific token BEFORE placing the GTC sell bracket
         self._approve_conditional_token(token_id)
+        time.sleep(3)   # Wait for Polygon tx confirmation before placing GTC order
 
         size_usd = shares * tp_price
         logger.info(
