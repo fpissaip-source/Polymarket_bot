@@ -601,6 +601,12 @@ class ArbitrageBot:
                     actual_shares = shares
                     logger.warning(f"[SELL] Fill API unavailable — using estimated shares={shares:.2f}")
                 elif actual_shares <= 0:
+                    if cancel_status == "API_ERROR":
+                        logger.warning(
+                            f"[SELL] Cancel failed + zero fills confirmed — "
+                            f"BUY order may still be open, retrying next cycle"
+                        )
+                        continue
                     logger.info(f"[SELL] Zero filled shares confirmed — nothing to sell")
                     to_remove.append(order_id)
                     self.kelly.release(entry_size)
