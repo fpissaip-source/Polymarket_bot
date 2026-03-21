@@ -385,9 +385,11 @@ class OrderExecutor:
         """
         Sell `shares` outcome tokens at `price` to close a position.
         Bypasses the USD minimum-size check — used for TP/SL exits only.
+        Uses FOK (Fill or Kill) for immediate execution on fast markets.
         """
         try:
-            real_tick, real_neg = self._tick(token_id, tick_size, neg_risk)
+            real_tick = self._fetch_tick_size(token_id)
+            real_neg = self._fetch_neg_risk(token_id)
             decimals = TICK_DECIMALS[real_tick]
             rounded_price = round(price, decimals)
             rounded_shares = round(shares, 2)
@@ -401,7 +403,7 @@ class OrderExecutor:
                 token_id=token_id,
                 price=rounded_price,
                 size=rounded_shares,
-                side="SELL",
+                side=SELL,
                 expiration=0,
             )
             logger.info(
@@ -409,13 +411,20 @@ class OrderExecutor:
                 f"| tick={real_tick} neg_risk={real_neg} | maker={self.client.builder.funder}"
             )
             signed = self.client.create_order(order_args, options)
-            resp = _post_with_retry(self.client.post_order, signed, OrderType.GTC)
+            resp = _post_with_retry(self.client.post_order, signed, OrderType.FOK)
             order_id = resp.get("orderID") or resp.get("id")
             status = resp.get("status", "unknown")
             error_msg = resp.get("errorMsg", "")
             if error_msg:
-                logger.warning(f"[CLOSE] Error: {error_msg}")
-                return None
+                logger.warning(f"[CLOSE] FOK rejected: {error_msg} — retrying as GTC")
+                signed2 = self.client.create_order(order_args, options)
+                resp2 = _post_with_retry(self.client.post_order, signed2, OrderType.GTC)
+                order_id = resp2.get("orderID") or resp2.get("id")
+                error_msg2 = resp2.get("errorMsg", "")
+                if error_msg2:
+                    logger.error(f"[CLOSE] GTC also failed: {error_msg2}")
+                    return None
+                status = resp2.get("status", "unknown")
             logger.info(f"[CLOSE] SUCCESS SELL {rounded_shares} shares @ {rounded_price} | status={status} | id={order_id}")
             return order_id
         except Exception as e:
