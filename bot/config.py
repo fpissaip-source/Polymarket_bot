@@ -89,11 +89,11 @@ BANKROLL = float(os.getenv("BANKROLL", "25.00"))  # Total capital in USD (live t
 DRY_RUN_BANKROLL = float(os.getenv("DRY_RUN_BANKROLL", "25.00"))  # Virtual capital for dry-run simulation
 
 # Fixed bet sizing (overrides Kelly when smaller)
-BET_SIZE_PCT = 0.20           # Each trade = 20% of current bankroll ($5 on $25)
-MIN_BET_SIZE = 5.00           # Polymarket practical minimum order size in USD
-MAX_OPEN_TRADES = 3           # Max concurrent open positions
-MAX_TOTAL_EXPOSURE_PCT = 0.60 # Max 60% of bankroll open at once (3 × $5 on $25 bankroll)
-MIN_BANKROLL_FLOOR = 3.0      # Stop trading if virtual bankroll drops below $3
+BET_SIZE_PCT = float(os.getenv("BET_SIZE_PCT", "0.20"))
+MIN_BET_SIZE = float(os.getenv("MIN_BET_SIZE", "5.00"))
+MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "3"))
+MAX_TOTAL_EXPOSURE_PCT = float(os.getenv("MAX_TOTAL_EXPOSURE_PCT", "0.60"))
+MIN_BANKROLL_FLOOR = float(os.getenv("MIN_BANKROLL_FLOOR", "3.0"))
 
 # Growth tiers: (min_balance, max_balance, kelly_lambda, min_edge)
 GROWTH_TIERS = [
