@@ -225,6 +225,8 @@ class ArbitrageBot:
         gamma_price_yes: float | None = None,
         gamma_price_no: float | None = None,
         condition_id: str = "",
+        neg_risk: bool = False,
+        tick_size: str = "0.01",
     ):
         spot = 0.0
         if hasattr(self, '_last_prices') and asset.upper() in (self._last_prices or {}):
@@ -248,6 +250,8 @@ class ArbitrageBot:
             gamma_price_no=gamma_price_no,
             spot_at_start=spot,
             condition_id=condition_id,
+            neg_risk=neg_risk,
+            tick_size=tick_size,
         )
         # Auto-register spread pairs: any two markets with the same asset
         for existing_id, existing in self._markets.items():
@@ -255,7 +259,10 @@ class ArbitrageBot:
                 self.spread_map.register_pair(existing_id, market_id)
                 logger.info(f"Spread pair registered: {existing_id} <-> {market_id}")
         self._markets[market_id] = state
-        logger.info(f"Registered market: {market_id} ({asset} {timeframe})")
+        logger.info(
+            f"Registered market: {market_id} ({asset} {timeframe}) "
+            f"neg_risk={neg_risk} tick={tick_size}"
+        )
 
     def auto_discover_markets(self):
         """
@@ -311,6 +318,10 @@ class ArbitrageBot:
                     continue
 
                 gamma_price_yes, gamma_price_no = extract_gamma_prices(m)
+                market_neg_risk = bool(m.get("negRisk", m.get("neg_risk", False)))
+                market_tick_size = str(m.get("minimumTickSize", m.get("minimum_tick_size", "0.01")))
+                if market_tick_size not in ("0.1", "0.01", "0.001", "0.0001"):
+                    market_tick_size = "0.01"
 
                 self.register_market(
                     market_id=market_id,
@@ -322,6 +333,8 @@ class ArbitrageBot:
                     gamma_price_yes=gamma_price_yes,
                     gamma_price_no=gamma_price_no,
                     condition_id=str(condition_id),
+                    neg_risk=market_neg_risk,
+                    tick_size=market_tick_size,
                 )
                 registered += 1
                 registered_for_asset += 1
@@ -563,14 +576,19 @@ class ArbitrageBot:
                     continue
 
                 gamma_price_yes, gamma_price_no = extract_gamma_prices(m)
+                market_neg_risk = bool(m.get("negRisk", m.get("neg_risk", False)))
+                market_tick_size = str(m.get("minimumTickSize", m.get("minimum_tick_size", "0.01")))
+                if market_tick_size not in ("0.1", "0.01", "0.001", "0.0001"):
+                    market_tick_size = "0.01"
 
                 if best_market is None or (end_time > 0 and end_time > best_end):
                     best_market = (market_id, yes_token, no_token, end_time,
-                                   gamma_price_yes, gamma_price_no, str(condition_id))
+                                   gamma_price_yes, gamma_price_no, str(condition_id),
+                                   market_neg_risk, market_tick_size)
                     best_end = end_time
 
             if best_market:
-                mid, yt, nt, et, gpy, gpn, cid = best_market
+                mid, yt, nt, et, gpy, gpn, cid, nr, ts = best_market
                 self.register_market(
                     market_id=mid,
                     token_id_yes=yt,
@@ -581,6 +599,8 @@ class ArbitrageBot:
                     gamma_price_yes=gpy,
                     gamma_price_no=gpn,
                     condition_id=cid,
+                    neg_risk=nr,
+                    tick_size=ts,
                 )
                 new_count += 1
 

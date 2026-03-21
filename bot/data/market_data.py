@@ -48,12 +48,16 @@ class PolymarketDataClient:
       GET /book?token_id=...    → order book
       GET /midpoint?token_id=... → midpoint price  
       GET /price?token_id=...   → last trade price
+      GET /neg-risk?token_id=... → neg_risk flag
+      GET /tick-size?token_id=... → tick_size
     """
 
     def __init__(self, host: str = POLYMARKET_HOST):
         self.host = host.rstrip("/")
         self._session = requests.Session()
         self._session.headers.update({"Content-Type": "application/json"})
+        self._neg_risk_cache: dict[str, bool] = {}
+        self._tick_size_cache: dict[str, str] = {}
 
     def get_order_book(self, token_id: str) -> dict:
         try:
@@ -112,6 +116,43 @@ class PolymarketDataClient:
         except Exception as e:
             logger.debug(f"Last trade price fetch failed for {token_id[:16]}...: {e}")
         return None
+
+    def get_neg_risk(self, token_id: str) -> bool:
+        if token_id in self._neg_risk_cache:
+            return self._neg_risk_cache[token_id]
+        try:
+            r = self._session.get(
+                f"{self.host}/neg-risk",
+                params={"token_id": token_id},
+                timeout=10,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                val = bool(data.get("neg_risk", False))
+                self._neg_risk_cache[token_id] = val
+                return val
+        except Exception as e:
+            logger.debug(f"neg-risk fetch failed for {token_id[:16]}...: {e}")
+        return False
+
+    def get_tick_size(self, token_id: str) -> str:
+        if token_id in self._tick_size_cache:
+            return self._tick_size_cache[token_id]
+        try:
+            r = self._session.get(
+                f"{self.host}/tick-size",
+                params={"token_id": token_id},
+                timeout=10,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                ts = str(data.get("minimum_tick_size", "0.01"))
+                if ts in ("0.1", "0.01", "0.001", "0.0001"):
+                    self._tick_size_cache[token_id] = ts
+                    return ts
+        except Exception as e:
+            logger.debug(f"tick-size fetch failed for {token_id[:16]}...: {e}")
+        return "0.01"
 
     def get_prices_batch(self, token_ids: list[str], side: str = "BUY") -> dict[str, float]:
         """
@@ -218,12 +259,12 @@ class PolymarketDataClient:
         imbalance = (bid_vol - ask_vol) / total if total > 1e-8 else 0.0
         depth = min(1.0, total / 1000.0)
 
-        tick_size = "0.01"
-        neg_risk = False
+        tick_size = None
+        neg_risk = None
         min_order_size = 0.0
         if book:
             ts = book.get("tick_size") or book.get("minimum_tick_size")
-            if ts is not None:
+            if ts is not None and str(ts) in ("0.1", "0.01", "0.001", "0.0001"):
                 tick_size = str(ts)
             nr = book.get("neg_risk")
             if nr is not None:
@@ -234,6 +275,11 @@ class PolymarketDataClient:
                     min_order_size = float(mos)
                 except (TypeError, ValueError):
                     pass
+
+        if tick_size is None:
+            tick_size = self.get_tick_size(token_id)
+        if neg_risk is None:
+            neg_risk = self.get_neg_risk(token_id)
 
         return {
             "mid_price": mid_price,
