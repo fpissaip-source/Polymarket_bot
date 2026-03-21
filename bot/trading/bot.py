@@ -645,21 +645,42 @@ class ArbitrageBot:
                     f"[FILL_CONFIRMED] {market_id} order={order_id[:8]} "
                     f"filled={filled_shares:.2f} shares @ {entry_price:.4f}"
                 )
-                if not pos.get("sl_order_id") and filled_shares >= 5.0:
-                    sl_ratio = SL_RATIO_LOW if entry_price < LOW_PRICE_THRESHOLD else SL_RATIO
+                if filled_shares >= 5.0:
+                    is_low = entry_price < LOW_PRICE_THRESHOLD
+                    sl_ratio = SL_RATIO_LOW if is_low else SL_RATIO
+                    tp_ratio = TP_RATIO_LOW if is_low else TP_RATIO
                     sl_price = round(entry_price * (1.0 - sl_ratio), 4)
-                    sl_oid = self.executor.place_sl_sell_order(
-                        token_id, filled_shares, sl_price,
-                        tick_size=tick_size, neg_risk=neg_risk,
-                    ) or ""
-                    if sl_oid:
-                        pos["sl_order_id"] = sl_oid
-                        logger.info(
-                            f"[BRACKET] SL placed after fill confirmed: {sl_oid[:12]} | "
-                            f"{filled_shares:.2f} shares @ {sl_price:.4f} (SL={sl_ratio:.0%})"
-                        )
-                    else:
-                        logger.warning(f"[BRACKET] SL order failed after fill — bot monitors manually")
+                    tp_price = round(entry_price * (1.0 + tp_ratio), 4)
+
+                    # SL bracket
+                    if not pos.get("sl_order_id"):
+                        sl_oid = self.executor.place_sl_sell_order(
+                            token_id, filled_shares, sl_price,
+                            tick_size=tick_size, neg_risk=neg_risk,
+                        ) or ""
+                        if sl_oid:
+                            pos["sl_order_id"] = sl_oid
+                            logger.info(
+                                f"[BRACKET] SL placed: {sl_oid[:12]} | "
+                                f"{filled_shares:.2f} shares @ {sl_price:.4f} (SL={sl_ratio:.0%})"
+                            )
+                        else:
+                            logger.warning(f"[BRACKET] SL order failed — bot monitors manually")
+
+                    # TP bracket — GTC limit sell at take-profit price, sits in CLOB book
+                    if not pos.get("tp_order_id"):
+                        tp_oid = self.executor.place_tp_sell_order(
+                            token_id, filled_shares, tp_price,
+                            tick_size=tick_size, neg_risk=neg_risk,
+                        ) or ""
+                        if tp_oid:
+                            pos["tp_order_id"] = tp_oid
+                            logger.info(
+                                f"[BRACKET] TP placed: {tp_oid[:12]} | "
+                                f"{filled_shares:.2f} shares @ {tp_price:.4f} (TP={tp_ratio:.0%})"
+                            )
+                        else:
+                            logger.warning(f"[BRACKET] TP order failed — bot monitors manually")
                 self._save_live_positions()
 
             try:
@@ -723,40 +744,45 @@ class ArbitrageBot:
                     f"| {shares:.2f} shares | value=${current_value:.2f}"
                 )
 
-                # ── Handle SL bracket order ─────────────────────────────────────────
+                # ── Handle OCO brackets (SL + TP) ──────────────────────────────────
                 sl_order_id = pos.get("sl_order_id", "")
+                tp_order_id = pos.get("tp_order_id", "")
                 sl_already_filled = False
+                tp_already_filled = False
+
+                # Cancel BOTH brackets — the CLOB may have auto-executed one already
                 if sl_order_id:
                     sl_cancel_status = self.executor.cancel_order(sl_order_id)
-                    if "STOP_LOSS" in reason:
-                        if sl_cancel_status == "ALREADY_DONE":
-                            # CLOB already auto-executed the bracket sell — position is gone
+                    if sl_cancel_status == "ALREADY_DONE":
+                        if "STOP_LOSS" in reason or "PRE_EXPIRY" in reason or "MAX_HOLD" in reason:
                             logger.info(
-                                f"[BRACKET_SL] CLOB already auto-liquidated {market_id} "
-                                f"via bracket order {sl_order_id[:12]} — skipping manual sell"
+                                f"[BRACKET_SL] CLOB auto-liquidated {market_id} via SL bracket — "
+                                f"skipping manual sell"
                             )
                             sl_already_filled = True
-                        elif sl_cancel_status == "CANCELED":
-                            logger.info(
-                                f"[BRACKET_SL] Bracket order {sl_order_id[:12]} cancelled — "
-                                f"proceeding with manual SL sell"
-                            )
                         else:
                             logger.warning(
-                                f"[BRACKET_SL] Cancel API error for {sl_order_id[:12]} — "
-                                f"proceeding with manual SL sell anyway"
+                                f"[BRACKET_SL] SL bracket already filled before TP triggered "
+                                f"— position may already be sold"
                             )
                     else:
-                        # TP or PRE_EXPIRY: cancel bracket so it doesn't interfere with TP sell
-                        if sl_cancel_status == "ALREADY_DONE":
-                            logger.warning(
-                                f"[BRACKET_TP] Bracket SL {sl_order_id[:12]} already filled "
-                                f"(price fell to SL before TP triggered) — position may already be sold"
-                            )
-                        else:
+                        logger.info(f"[BRACKET_SL] Cancelled SL bracket {sl_order_id[:12]}")
+
+                if tp_order_id:
+                    tp_cancel_status = self.executor.cancel_order(tp_order_id)
+                    if tp_cancel_status == "ALREADY_DONE":
+                        if "TAKE_PROFIT" in reason or "PRE_EXPIRY" in reason:
                             logger.info(
-                                f"[BRACKET_TP] Cancelled SL bracket {sl_order_id[:12]} before TP sell"
+                                f"[BRACKET_TP] CLOB auto-executed TP bracket for {market_id} "
+                                f"— skipping manual sell"
                             )
+                            tp_already_filled = True
+                        else:
+                            logger.warning(
+                                f"[BRACKET_TP] TP bracket already filled before SL triggered"
+                            )
+                    else:
+                        logger.info(f"[BRACKET_TP] Cancelled TP bracket {tp_order_id[:12]}")
 
                 if sl_already_filled:
                     to_remove.append(order_id)
@@ -765,6 +791,19 @@ class ArbitrageBot:
                     logger.info(
                         f"[BRACKET_SL] Position closed by CLOB bracket: "
                         f"recovered=${recovered:.2f} (loss=${entry_size - recovered:.2f})"
+                    )
+                    self.kelly.release(entry_size)
+                    self._save_bankroll()
+                    continue
+
+                if tp_already_filled:
+                    to_remove.append(order_id)
+                    tp_ratio_val = TP_RATIO_LOW if entry_price < LOW_PRICE_THRESHOLD else TP_RATIO
+                    received = shares * (entry_price * (1.0 + tp_ratio_val))
+                    profit = received - entry_size
+                    logger.info(
+                        f"[BRACKET_TP] Position closed by CLOB TP bracket: "
+                        f"received=${received:.2f} (profit=${profit:.2f}) ✓"
                     )
                     self.kelly.release(entry_size)
                     self._save_bankroll()
@@ -1620,7 +1659,8 @@ class ArbitrageBot:
                 "entry_time": time.time(),
                 "end_time": end_time,
                 "sl_order_id": sl_order_id,
-                "buy_filled": False,   # Set True once fill confirmed; SL bracket placed then
+                "buy_filled": False,   # Set True once fill confirmed; SL+TP brackets placed then
+                "tp_order_id": "",     # GTC TP bracket order ID (placed after buy fills)
             }
             self._save_live_positions()
             logger.info(

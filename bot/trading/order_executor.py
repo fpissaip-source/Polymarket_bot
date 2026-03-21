@@ -543,6 +543,36 @@ class OrderExecutor:
             min_size_usd=0,
         )
 
+    def place_tp_sell_order(
+        self, token_id: str, shares: float, tp_price: float,
+        tick_size: str = "0.01", neg_risk: bool = False,
+    ) -> str | None:
+        """Place a GTC SELL limit order at the take-profit price.
+        Sits in the CLOB book — fills automatically when price reaches TP, even between bot ticks.
+        tp_price: the price at which to take profit
+        shares:   number of shares to sell (must be >= 5 for CLOB acceptance)
+        """
+        if shares < 5.0:
+            logger.warning(
+                f"[TP_ORDER] Skipping bracket: {shares:.2f} shares < 5 (CLOB min) — "
+                f"position will be managed by bot TP/SL loop only"
+            )
+            return None
+
+        # Set ERC1155 allowance for this specific token BEFORE placing the GTC sell bracket
+        self._approve_conditional_token(token_id)
+
+        size_usd = shares * tp_price
+        logger.info(
+            f"[TP_ORDER] Placing GTC SELL bracket: {shares:.2f} shares @ {tp_price:.4f} "
+            f"(size=${size_usd:.2f})"
+        )
+        return self.place_order(
+            token_id, "SELL", tp_price, size_usd,
+            order_type="GTC", tick_size=tick_size, neg_risk=neg_risk,
+            min_size_usd=0,
+        )
+
     def cancel_order(self, order_id: str) -> str:
         """Cancel order. Returns status string:
         'CANCELED'       — order was successfully cancelled (unfilled/partial)
