@@ -421,6 +421,28 @@ class OrderExecutor:
                 logger.warning(f"[CLOSE] Zero shares — nothing to sell")
                 return None
 
+            # Verify CTF (outcome) token balance before selling
+            # "Fehlende Token-Balance" = proxy wallet doesn't hold the ERC1155 tokens
+            try:
+                bal_params = BalanceAllowanceParams(
+                    asset_type=AssetType.CONDITIONAL,
+                    token_id=token_id,
+                )
+                bal_data = self.client.get_balance_allowance(bal_params)
+                raw_bal = bal_data.get("balance", "0") or "0"
+                ctf_balance = float(raw_bal) / 1_000_000
+                logger.info(
+                    f"[CLOSE] CTF token balance: {ctf_balance:.4f} shares "
+                    f"| needed: {rounded_shares:.2f} | token={token_id[:16]}..."
+                )
+                if ctf_balance < rounded_shares * 0.95:
+                    logger.warning(
+                        f"[CLOSE] ⚠ CTF balance ({ctf_balance:.4f}) < needed ({rounded_shares:.2f}) "
+                        f"— CLOB fill may not have delivered tokens yet. Attempting anyway."
+                    )
+            except Exception as be:
+                logger.warning(f"[CLOSE] Could not check CTF balance: {be}")
+
             options = PartialCreateOrderOptions(tick_size=real_tick, neg_risk=real_neg)
             logger.info(
                 f"[CLOSE] SELL {rounded_shares} shares @ {rounded_price} (worst-price) "

@@ -40,6 +40,7 @@ from data.sentiment_analyzer import EventSentimentAnalyzer
 from data.dry_run_tracker import DryRunTracker
 from trading.order_executor import OrderExecutor
 from models.adaptive import AdaptiveLearner
+from models.rewards import is_rewarded, get_rewarded_condition_ids
 
 from config import (
     POLL_INTERVAL_SECONDS,
@@ -167,6 +168,7 @@ class ArbitrageBot:
         self._last_stats_log = 0.0
         self._last_adaptive_update = 0.0
         self._last_tp_sl_check = 0.0
+        self._last_allowance_refresh = 0.0
         self._tick_count = 0
         # Live position tracking for TP/SL: order_id → position dict
         self._live_positions: dict[str, dict] = {}
@@ -932,6 +934,15 @@ class ArbitrageBot:
             self._last_tp_sl_check = now
             self._check_tp_sl(now)
 
+        # --- 0b. Periodic allowance refresh + rewards cache (every 30 min) ---
+        if not self.dry_run and (now - self._last_allowance_refresh) >= 1800:
+            self._last_allowance_refresh = now
+            try:
+                self.executor._check_balance_and_allowance()
+            except Exception as e:
+                logger.warning(f"[ALLOWANCE] Periodic refresh failed: {e}")
+            get_rewarded_condition_ids(force_refresh=True)
+
         # --- 1. Fetch crypto spot prices ---
         new_prices = self.price_feed.fetch()
 
@@ -1199,7 +1210,14 @@ class ArbitrageBot:
 
     def _execute_opportunities(self, opportunities: list[TradeOpportunity]):
         """Execute the best opportunities. Dry-run logs only; live mode places orders."""
-        opportunities.sort(key=lambda o: o.edge_result.ev_net, reverse=True)
+        # Prioritize: rewarded markets first (extra LP income), then by EV
+        opportunities.sort(
+            key=lambda o: (
+                int(is_rewarded(self._markets[o.market_id].condition_id)),
+                o.edge_result.ev_net,
+            ),
+            reverse=True,
+        )
 
         for opp in opportunities:
             market = self._markets[opp.market_id]
@@ -1209,6 +1227,9 @@ class ArbitrageBot:
             price = (1.0 - raw_price) if side == "NO" else raw_price
             is_passive = opp.edge_result.is_passive
             exec_type = "GTC/MAKER" if is_passive else "FOK/TAKER"
+            has_rewards = is_rewarded(market.condition_id)
+            if has_rewards:
+                logger.info(f"[REWARDS] {opp.market_id} has active CLOB LP rewards — prioritized")
 
             # ── CLOB 5-share minimum enforcement ────────────────────────────────
             # If Kelly produces a small bet, bump size up to the CLOB minimum.
