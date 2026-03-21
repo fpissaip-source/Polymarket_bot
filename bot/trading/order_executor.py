@@ -478,22 +478,20 @@ class OrderExecutor:
         """Query CLOB API for actual filled share count.
         Returns filled shares (>=0) on success, -1.0 on API failure.
 
-        Polymarket stores sizes in fixed-math with 6 decimals:
-        original_size and size_matched are in token units * 1e6.
-        e.g. size_matched="50000000" → 50.0 shares filled.
+        The GET /order endpoint returns size_matched and original_size as
+        human-readable decimals (e.g. "15.62" = 15.62 shares). Do NOT
+        divide by 1e6 — that would give near-zero values.
         """
         try:
             order = self.client.get_order(order_id)
             size_matched_raw = order.get("size_matched", "0")
             original_size_raw = order.get("original_size", "0")
             price_raw = order.get("price", "0")
-            size_matched = float(size_matched_raw)
-            original_size = float(original_size_raw)
-            filled_shares = size_matched / 1_000_000.0
-            total_shares = original_size / 1_000_000.0
+            filled_shares = float(size_matched_raw)
+            total_shares = float(original_size_raw)
             logger.info(
                 f"[ORDER_CHECK] {order_id[:8]} filled={filled_shares:.2f}/{total_shares:.2f} shares "
-                f"(raw matched={size_matched_raw} original={original_size_raw} price={price_raw})"
+                f"(price={price_raw})"
             )
             return filled_shares
         except Exception as e:
