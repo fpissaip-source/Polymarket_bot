@@ -592,19 +592,34 @@ class ArbitrageBot:
                     f"entry={entry_price:.4f} now={current_price:.4f} pnl={pnl_ratio:+.1%} "
                     f"| {shares:.2f} shares | value=${current_value:.2f}"
                 )
-                # 1. Try cancel (works if order is still open/unfilled)
-                cancelled = self.executor.cancel_order(order_id)
-                if not cancelled:
-                    # 2. Order filled — sell shares at best_bid (where buyers are)
-                    sell_price = round(best_bid, 4)
-                    logger.info(
-                        f"[SELL] mid={current_price:.4f} best_bid={best_bid:.4f} "
-                        f"selling {shares:.2f} shares @ {sell_price}"
-                    )
-                    self.executor.close_position(
-                        token_id, shares, sell_price,
-                        tick_size=tick_size, neg_risk=neg_risk,
-                    )
+                self.executor.cancel_order(order_id)
+
+                actual_shares = self.executor.get_order_fills(order_id)
+                if actual_shares < 0:
+                    actual_shares = shares
+                    logger.warning(f"[SELL] Using estimated shares={shares:.2f} (API unavailable)")
+                elif actual_shares < 0.5:
+                    logger.info(f"[SELL] No/too few filled shares ({actual_shares:.2f}) — nothing to sell")
+                    to_remove.append(order_id)
+                    self.kelly.release(entry_size)
+                    self._save_bankroll()
+                    continue
+
+                sell_price = round(best_bid, 4)
+                logger.info(
+                    f"[SELL] mid={current_price:.4f} best_bid={best_bid:.4f} "
+                    f"selling {actual_shares:.2f} shares @ {sell_price}"
+                )
+                result = self.executor.close_position(
+                    token_id, actual_shares, sell_price,
+                    tick_size=tick_size, neg_risk=neg_risk,
+                )
+                if result:
+                    logger.info(f"[SELL] SUCCESS — order_id={result}")
+                else:
+                    logger.error(f"[SELL] FAILED for {market_id} — retrying next cycle")
+                    continue
+
                 to_remove.append(order_id)
                 self.kelly.release(entry_size)
                 self._save_bankroll()

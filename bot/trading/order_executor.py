@@ -394,8 +394,8 @@ class OrderExecutor:
             rounded_price = round(price, decimals)
             rounded_shares = round(shares, 2)
 
-            if rounded_shares < 1.0:
-                logger.warning(f"[CLOSE] Too few shares to sell: {rounded_shares:.2f} (min 1)")
+            if rounded_shares <= 0:
+                logger.warning(f"[CLOSE] Zero shares — nothing to sell")
                 return None
 
             options = PartialCreateOrderOptions(tick_size=real_tick, neg_risk=real_neg)
@@ -444,13 +444,47 @@ class OrderExecutor:
                                 expiration=expiration, tick_size=tick_size, neg_risk=neg_risk)
 
     def cancel_order(self, order_id: str) -> bool:
+        """Cancel order. Returns True if order was in canceled list, False otherwise."""
         try:
-            self.client.cancel(order_id)
-            logger.info(f"Cancelled order {order_id}")
-            return True
+            resp = self.client.cancel(order_id)
+            canceled_list = resp.get("canceled", []) if isinstance(resp, dict) else []
+            not_canceled = resp.get("not_canceled", {}) if isinstance(resp, dict) else {}
+            if order_id in canceled_list:
+                logger.info(f"Cancelled order {order_id}")
+                return True
+            else:
+                reason = not_canceled.get(order_id, "unknown")
+                logger.info(f"Order {order_id} not cancelled (likely filled): {reason}")
+                return False
         except Exception as e:
             logger.error(f"Failed to cancel order {order_id}: {e}")
             return False
+
+    def get_order_fills(self, order_id: str) -> float:
+        """Query CLOB API for actual filled share count.
+        Returns filled shares (>=0) on success, -1.0 on API failure.
+
+        Polymarket stores sizes in fixed-math with 6 decimals:
+        original_size and size_matched are in token units * 1e6.
+        e.g. size_matched="50000000" → 50.0 shares filled.
+        """
+        try:
+            order = self.client.get_order(order_id)
+            size_matched_raw = order.get("size_matched", "0")
+            original_size_raw = order.get("original_size", "0")
+            price_raw = order.get("price", "0")
+            size_matched = float(size_matched_raw)
+            original_size = float(original_size_raw)
+            filled_shares = size_matched / 1_000_000.0
+            total_shares = original_size / 1_000_000.0
+            logger.info(
+                f"[ORDER_CHECK] {order_id[:8]} filled={filled_shares:.2f}/{total_shares:.2f} shares "
+                f"(raw matched={size_matched_raw} original={original_size_raw} price={price_raw})"
+            )
+            return filled_shares
+        except Exception as e:
+            logger.warning(f"[ORDER_CHECK] Failed to get order {order_id}: {e}")
+            return -1.0
 
     def get_open_orders(self) -> list[dict]:
         try:
