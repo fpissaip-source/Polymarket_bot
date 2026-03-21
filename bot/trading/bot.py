@@ -1205,6 +1205,27 @@ class ArbitrageBot:
             is_passive = opp.edge_result.is_passive
             exec_type = "GTC/MAKER" if is_passive else "FOK/TAKER"
 
+            # ── CLOB 5-share minimum enforcement ────────────────────────────────
+            # If Kelly produces a small bet, bump size up to the CLOB minimum.
+            # This also raises the stake so the gas-cost ratio improves (EV scales
+            # linearly with size while gas is fixed per transaction).
+            if price > 0:
+                clob_min_size = 5.0 * price  # 5 shares × price = minimum viable USD
+                if size < clob_min_size:
+                    if not self.dry_run:
+                        if clob_min_size > self.kelly.available_capital:
+                            logger.info(
+                                f"[SKIP] {opp.market_id}: need ${clob_min_size:.2f} for CLOB "
+                                f"5-share min but only ${self.kelly.available_capital:.2f} available"
+                            )
+                            continue
+                    logger.info(
+                        f"[CLOB_MIN] {opp.market_id}: bumping size "
+                        f"${size:.2f} → ${clob_min_size:.2f} "
+                        f"(5 shares × {price:.4f})"
+                    )
+                    size = clob_min_size
+
             # Realistic maker entry price for dry-run:
             # YES trades fill at bid (below mid); NO trades fill at 1 - ask (below mid on NO side)
             if side == "NO":
