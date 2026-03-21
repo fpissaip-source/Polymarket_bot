@@ -540,11 +540,14 @@ class ArbitrageBot:
                 data = self.data_client.get_book_data(token_id)
                 current_price = data.get("mid_price") or data.get("last_price")
                 if current_price is None:
-                    # If book data unavailable AND expiry is near/past, force purge
-                    if time_to_expiry < 30:
+                    # No book data = market likely closed.
+                    # Purge if: expiry is near/past, OR end_time unknown (can't confirm still active)
+                    unknown_expiry = end_time == 0
+                    if time_to_expiry < 30 or unknown_expiry:
                         logger.warning(
-                            f"[FORCE_PURGE] {market_id} order={order_id[:8]} — no book data, "
-                            f"market closing/closed ({time_to_expiry:.0f}s left)"
+                            f"[FORCE_PURGE] {market_id} order={order_id[:8]} — no book data "
+                            f"({'unknown expiry' if unknown_expiry else f'{time_to_expiry:.0f}s left'}), "
+                            f"releasing ${entry_size:.2f}"
                         )
                         to_remove.append(order_id)
                         self.kelly.release(entry_size)
