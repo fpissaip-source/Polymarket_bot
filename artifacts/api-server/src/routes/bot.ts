@@ -118,6 +118,9 @@ router.get("/bot/status", (req, res) => {
     perAsset[e.asset].pnl += e.pnl || 0;
   }
 
+  const openEntries = dryRunLog.filter(e => !e.outcome || e.outcome === "");
+  const openExposure = openEntries.reduce((s, e) => s + (e.size || 0), 0);
+
   res.json({
     running: botProcess !== null && botProcess.exitCode === null,
     mode: botProcess && botProcess.exitCode === null ? botMode : "stopped",
@@ -126,7 +129,8 @@ router.get("/bot/status", (req, res) => {
     initialBankroll: initialBk,
     totalTrades: dryRunLog.length,
     resolvedTrades: resolved.length,
-    openTrades: dryRunLog.length - resolved.length,
+    openTrades: openEntries.length,
+    openExposure: Math.round(openExposure * 100) / 100,
     winRate,
     totalPnl: Math.round(totalPnl * 10000) / 10000,
     biggestWin: Math.round(biggestWin * 10000) / 10000,

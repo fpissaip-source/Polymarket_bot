@@ -19,6 +19,14 @@ logger = logging.getLogger(__name__)
 DRY_RUN_LOG = Path(__file__).parent.parent / "dry_run_log.json"
 TRADES_FILE = Path(__file__).parent.parent / "trades.json"
 
+try:
+    from config import BET_SIZE_PCT, MAX_OPEN_TRADES, MAX_TOTAL_EXPOSURE_PCT, MIN_BANKROLL_FLOOR
+except ImportError:
+    BET_SIZE_PCT = 0.02
+    MAX_OPEN_TRADES = 4
+    MAX_TOTAL_EXPOSURE_PCT = 0.08
+    MIN_BANKROLL_FLOOR = 3.0
+
 
 @dataclass
 class DryRunEntry:
@@ -75,6 +83,17 @@ class DryRunTracker:
         except Exception as e:
             logger.warning(f"DryRunTracker: could not save log: {e}")
 
+    @property
+    def open_exposure(self) -> float:
+        return sum(e.size for e in self._entries if e.outcome == "")
+
+    @property
+    def open_count(self) -> int:
+        return sum(1 for e in self._entries if e.outcome == "")
+
+    def has_open_position(self, market_id: str) -> bool:
+        return any(e.market_id == market_id and e.outcome == "" for e in self._entries)
+
     def record(self, market_id: str, asset: str, side: str,
                q: float, p: float, edge: float, size: float, exec_price: float,
                question: str = "", timeframe: str = "5m",
@@ -87,9 +106,29 @@ class DryRunTracker:
         elif side == "NO":
             decision = "DOWN"
 
-        capped_size = min(size, self._virtual_bankroll * 0.5)
-        if capped_size <= 0:
-            logger.warning(f"DryRunTracker: insufficient virtual bankroll (${self._virtual_bankroll:.2f}), skipping")
+        if self._virtual_bankroll < MIN_BANKROLL_FLOOR:
+            logger.warning(f"DryRunTracker: bankroll ${self._virtual_bankroll:.2f} below floor ${MIN_BANKROLL_FLOOR}, pausing")
+            return
+
+        if self.has_open_position(market_id):
+            logger.debug(f"DryRunTracker: already have open position on {market_id}, skipping")
+            return
+
+        if self.open_count >= MAX_OPEN_TRADES:
+            logger.debug(f"DryRunTracker: max open trades ({MAX_OPEN_TRADES}) reached, skipping")
+            return
+
+        max_exposure = self._virtual_bankroll * MAX_TOTAL_EXPOSURE_PCT
+        if self.open_exposure >= max_exposure:
+            logger.debug(f"DryRunTracker: max exposure ${max_exposure:.2f} reached, skipping")
+            return
+
+        bet_size = self._virtual_bankroll * BET_SIZE_PCT
+        remaining_exposure = max_exposure - self.open_exposure
+        capped_size = min(bet_size, remaining_exposure)
+
+        if capped_size < 0.01:
+            logger.debug(f"DryRunTracker: computed bet too small (${capped_size:.4f}), skipping")
             return
 
         ts = time.time()
@@ -121,7 +160,8 @@ class DryRunTracker:
         self._write_trade(entry)
         logger.info(
             f"[DRY RUN TRADE] {asset} {decision} | q={q:.3f} p={p:.3f} edge={edge:.4f} "
-            f"size=${capped_size:.2f} | bankroll=${self._virtual_bankroll:.2f} | {question[:60]}"
+            f"size=${capped_size:.2f} ({BET_SIZE_PCT*100:.0f}% of ${self._virtual_bankroll:.2f}) | "
+            f"open={self.open_count}/{MAX_OPEN_TRADES} | exposure=${self.open_exposure:.2f}"
         )
 
     def get_open_entries(self) -> list[DryRunEntry]:
@@ -220,6 +260,7 @@ class DryRunTracker:
                     t["status"] = e.outcome
                     t["outcome"] = e.outcome
                     t["actual_outcome"] = e.actual_outcome
+                    t["exit_reason"] = e.exit_reason
                     updated += 1
 
             if updated:
@@ -259,9 +300,15 @@ class DryRunTracker:
                 per_asset[a]["wins"] += 1
             per_asset[a]["pnl"] += e.pnl
 
+        early_exits = [e for e in resolved if e.exit_reason]
+        tp_count = sum(1 for e in early_exits if e.exit_reason.startswith("TAKE_PROFIT"))
+        sl_count = sum(1 for e in early_exits if e.exit_reason.startswith("STOP_LOSS"))
+
         return {
             "total_opportunities": total,
             "resolved": n,
+            "open_count": self.open_count,
+            "open_exposure": round(self.open_exposure, 4),
             "wins": wins,
             "losses": n - wins,
             "win_rate": round(wins / n, 3),
@@ -273,6 +320,8 @@ class DryRunTracker:
             "initial_bankroll": self._initial_bankroll,
             "bankroll_change_pct": round(((self._virtual_bankroll - self._initial_bankroll) / self._initial_bankroll) * 100, 1),
             "per_asset": per_asset,
+            "tp_count": tp_count,
+            "sl_count": sl_count,
         }
 
     def log_stats(self):

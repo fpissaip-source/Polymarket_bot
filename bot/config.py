@@ -65,28 +65,32 @@ STOIKOV_GAMMA = 0.1           # Risk aversion coefficient
 STOIKOV_SIGMA_DEFAULT = 0.02  # Default variance estimate
 
 # Kelly model
-KELLY_FRACTION = 0.25         # Fractional Kelly (lambda), conservative
-KELLY_MAX_FRACTION = 0.5      # Maximum fraction of bankroll per trade
+KELLY_FRACTION = 0.25         # Fractional Kelly (lambda) — used internally, capped by BET_SIZE_PCT
+KELLY_MAX_FRACTION = 0.02     # Hard cap: max 2% of bankroll per single trade
 BANKROLL = float(os.getenv("BANKROLL", "2.00"))  # Total capital in USD (live trading)
 DRY_RUN_BANKROLL = float(os.getenv("DRY_RUN_BANKROLL", "25.00"))  # Virtual capital for dry-run simulation
 
+# Fixed bet sizing (overrides Kelly when smaller)
+BET_SIZE_PCT = 0.02           # Each trade = 2% of current bankroll
+MAX_OPEN_TRADES = 4           # Max concurrent open positions
+MAX_TOTAL_EXPOSURE_PCT = 0.08 # Max 8% of bankroll open at once
+MIN_BANKROLL_FLOOR = 3.0      # Stop trading if virtual bankroll drops below $3
+
 # Growth tiers: (min_balance, max_balance, kelly_lambda, min_edge)
-# Bot starts aggressive at $5 and scales down as bankroll grows.
-# Goal: $5.27 → $100 → $1,000 → $10,000
 GROWTH_TIERS = [
-    (0.0,    50.0,   0.50,  0.010),         # Tier 1:   $0–$50     aggressive, 1% edge
-    (50.0,   100.0,  0.45,  0.025),         # Tier 2:  $50–$100    still aggressive
-    (100.0,  500.0,  0.35,  0.025),         # Tier 3: $100–$500    moderate
-    (500.0,  1000.0, 0.30,  0.030),         # Tier 4: $500–$1000   standard
-    (1000.0, float("inf"), 0.25, 0.030),    # Tier 5: $1000+       conservative
+    (0.0,    50.0,   0.25,  0.020),         # Tier 1:   $0–$50     conservative, 2% edge
+    (50.0,   100.0,  0.25,  0.025),         # Tier 2:  $50–$100
+    (100.0,  500.0,  0.25,  0.025),         # Tier 3: $100–$500
+    (500.0,  1000.0, 0.25,  0.030),         # Tier 4: $500–$1000
+    (1000.0, float("inf"), 0.25, 0.030),    # Tier 5: $1000+
 ]
 
 # State file for bankroll persistence across restarts
 BANKROLL_STATE_FILE = "bankroll_state.json"
 
-# Take-Profit / Stop-Loss (early exit)
-TP_RATIO = 0.15               # Take profit at 15% return on trade
-SL_RATIO = 0.25               # Stop loss at 25% loss on trade
+# Take-Profit / Stop-Loss — always equal, take small gains, cut small losses
+TP_RATIO = 0.05               # Take profit at +5% return on trade
+SL_RATIO = 0.05               # Stop loss at -5% loss on trade (same as TP!)
 TP_SL_CHECK_INTERVAL = 10     # Check TP/SL every 10 seconds
 
 # Monte Carlo
