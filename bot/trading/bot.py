@@ -1342,8 +1342,20 @@ class ArbitrageBot:
             raw_price = opp.stoikov_quote.reservation_price
             size = opp.kelly_result.position_size
             side = opp.edge_result.side          # "YES", "NO", or "BOTH"
-            price = (1.0 - raw_price) if side == "NO" else raw_price
+
+            # 5-minute markets: always AGGRESSIVE (FOK at ask) — GTC maker orders
+            # almost never fill in a 5-min window on thin books.
             is_passive = opp.edge_result.is_passive
+            if market.timeframe == "5m":
+                is_passive = False
+                # For FOK taker: buy at ask (YES) or 1-bid (NO) to guarantee fill
+                if side == "NO":
+                    price = round(1.0 - opp.stoikov_quote.bid, 6)
+                else:
+                    price = round(opp.stoikov_quote.ask, 6)
+            else:
+                price = (1.0 - raw_price) if side == "NO" else raw_price
+
             exec_type = "GTC/MAKER" if is_passive else "FOK/TAKER"
             has_rewards = is_rewarded(market.condition_id)
             if has_rewards:
