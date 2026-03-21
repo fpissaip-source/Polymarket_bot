@@ -790,7 +790,7 @@ class ArbitrageBot:
             self._current_min_edge = self.edge_model.min_edge
 
         # --- 0. Check Take-Profit / Stop-Loss on open trades ---
-        if self.dry_run and now - self._last_tp_sl_check >= TP_SL_CHECK_INTERVAL:
+        if now - self._last_tp_sl_check >= TP_SL_CHECK_INTERVAL:
             self._last_tp_sl_check = now
             self._check_tp_sl(now)
 
