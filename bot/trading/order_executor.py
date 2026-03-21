@@ -384,9 +384,15 @@ class OrderExecutor:
                        tick_size: str = "0.01", neg_risk: bool = False) -> str | None:
         """
         Sell `shares` outcome tokens at `price` (worst-price limit) to close a position.
-        Uses create_market_order (SELL, amount=shares, price=worst_price) + FOK as per
-        Polymarket docs: https://docs.polymarket.com/trading/orders/create#market-orders
-        Falls back to GTC limit order if FOK rejected.
+        Uses create_market_order(SELL, amount=shares, price=worst_price) per Polymarket docs.
+
+        Execution strategy (immediate fills only — no GTC resting orders):
+          1. FOK  — fill all-or-nothing immediately
+          2. FAK  — fill what's available immediately, cancel rest (partial sell OK)
+          3. None — if both fail, return None so _check_tp_sl retries next cycle
+
+        GTC fallback is intentionally NOT used: a resting sell order would appear
+        as "success" but might never fill, causing undetected open exposure.
         """
         try:
             real_tick = self._fetch_tick_size(token_id)
@@ -411,6 +417,7 @@ class OrderExecutor:
                 amount=rounded_shares,
                 price=rounded_price,
             )
+
             signed = self.client.create_market_order(market_args, options)
             resp = _post_with_retry(self.client.post_order, signed, OrderType.FOK)
             order_id = resp.get("orderID") or resp.get("id")
@@ -418,20 +425,13 @@ class OrderExecutor:
             error_msg = resp.get("errorMsg", "")
 
             if error_msg:
-                logger.warning(f"[CLOSE] FOK rejected: {error_msg} — retrying as GTC limit")
-                limit_args = OrderArgs(
-                    token_id=token_id,
-                    price=rounded_price,
-                    size=rounded_shares,
-                    side=SELL,
-                    expiration=0,
-                )
-                signed2 = self.client.create_order(limit_args, options)
-                resp2 = _post_with_retry(self.client.post_order, signed2, OrderType.GTC)
+                logger.warning(f"[CLOSE] FOK rejected: {error_msg} — retrying as FAK (partial fill)")
+                signed2 = self.client.create_market_order(market_args, options)
+                resp2 = _post_with_retry(self.client.post_order, signed2, OrderType.FAK)
                 order_id = resp2.get("orderID") or resp2.get("id")
                 error_msg2 = resp2.get("errorMsg", "")
                 if error_msg2:
-                    logger.error(f"[CLOSE] GTC also failed: {error_msg2}")
+                    logger.error(f"[CLOSE] FAK also rejected: {error_msg2} — will retry next cycle")
                     return None
                 status = resp2.get("status", "unknown")
 
