@@ -90,7 +90,7 @@ DRY_RUN_BANKROLL = float(os.getenv("DRY_RUN_BANKROLL", "25.00"))  # Virtual capi
 
 # Fixed bet sizing (overrides Kelly when smaller)
 BET_SIZE_PCT = float(os.getenv("BET_SIZE_PCT", "0.20"))
-MIN_BET_SIZE = float(os.getenv("MIN_BET_SIZE", "5.00"))
+MIN_BET_SIZE = float(os.getenv("MIN_BET_SIZE", "1.00"))
 MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "3"))
 MAX_TOTAL_EXPOSURE_PCT = float(os.getenv("MAX_TOTAL_EXPOSURE_PCT", "0.60"))
 MIN_BANKROLL_FLOOR = float(os.getenv("MIN_BANKROLL_FLOOR", "3.0"))
