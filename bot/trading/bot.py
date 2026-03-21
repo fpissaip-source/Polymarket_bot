@@ -597,6 +597,39 @@ class ArbitrageBot:
                         self.kelly.release(entry_size)
                         self._save_bankroll()
                         continue
+                    elif wait_secs > 30:
+                        # After 30s with no confirmed fill, start price monitoring using
+                        # estimated shares. This catches TP at +179% even when the fill
+                        # API lags. We can't place a SELL yet (no tokens confirmed), but
+                        # we CAN cancel the unfilled BUY if price already hit SL/TP.
+                        est_shares = pos.get("shares", 0)
+                        if est_shares > 0:
+                            try:
+                                _em_data = self.data_client.get_book_data(token_id)
+                                _em_price = _em_data.get("mid_price") or _em_data.get("last_price")
+                                if _em_price is not None:
+                                    _is_low = entry_price < LOW_PRICE_THRESHOLD
+                                    _tp_em = TP_RATIO_LOW if _is_low else TP_RATIO
+                                    _sl_em = SL_RATIO_LOW if _is_low else SL_RATIO
+                                    _pnl_em = (_em_price - entry_price) / entry_price
+                                    if _pnl_em >= _tp_em or _pnl_em <= -_sl_em:
+                                        logger.warning(
+                                            f"[EARLY_EXIT] {market_id} pnl={_pnl_em:+.1%} "
+                                            f"hit TP/SL threshold before fill confirmed — "
+                                            f"cancelling unfilled buy"
+                                        )
+                                        self.executor.cancel_order(order_id)
+                                        to_remove.append(order_id)
+                                        self.kelly.release(entry_size)
+                                        self._save_bankroll()
+                                        continue
+                            except Exception:
+                                pass
+                        logger.debug(
+                            f"[FILL_WAIT] {market_id} order={order_id[:8]} "
+                            f"— waiting for fill ({wait_secs:.0f}s)"
+                        )
+                        continue
                     else:
                         # Still pending — skip TP/SL this cycle (no tokens to sell yet)
                         logger.debug(
@@ -608,9 +641,27 @@ class ArbitrageBot:
                 # Buy confirmed filled — update position and place SL bracket now
                 pos["buy_filled"] = True
                 pos["shares"] = filled_shares
+                # Correct entry_size to actual cost (partial fills are common).
+                # Wrong entry_size causes fake SL: e.g. 1.59/5 shares filled →
+                # actual cost=$0.59 but entry_size=$1.85 → pnl shows -68% at same price.
+                actual_cost = round(filled_shares * entry_price, 4)
+                if abs(actual_cost - entry_size) > 0.01:
+                    logger.info(
+                        f"[FILL_CONFIRMED] Correcting entry_size: ${entry_size:.2f} → "
+                        f"${actual_cost:.2f} (filled {filled_shares:.2f} of "
+                        f"{round(entry_size/entry_price,2):.2f} shares)"
+                    )
+                    pos["entry_size"] = actual_cost
+                    entry_size = actual_cost
+                    # Release over-allocated capital back to Kelly
+                    over_allocated = pos.get("entry_size_original", entry_size + 0.01) - actual_cost
+                    if over_allocated > 0.01:
+                        self.kelly.release(over_allocated)
+                pos.setdefault("entry_size_original", entry_size)
                 logger.info(
                     f"[FILL_CONFIRMED] {market_id} order={order_id[:8]} "
-                    f"filled={filled_shares:.2f} shares @ {entry_price:.4f}"
+                    f"filled={filled_shares:.2f} shares @ {entry_price:.4f} | "
+                    f"actual_cost=${actual_cost:.2f}"
                 )
                 if filled_shares >= 5.0:
                     is_low = entry_price < LOW_PRICE_THRESHOLD
@@ -817,8 +868,16 @@ class ArbitrageBot:
                     tick_size=tick_size, neg_risk=neg_risk,
                 )
                 if sell_order_id == "BALANCE_ERROR":
+                    # If market still has >30s left, retry next cycle — tokens may not
+                    # have settled yet. Only accept full loss if market is near/past expiry.
+                    if time_to_expiry > 30:
+                        logger.warning(
+                            f"[SELL] BALANCE_ERROR but {time_to_expiry:.0f}s left — "
+                            f"retrying next cycle (CTF tokens may still be settling)"
+                        )
+                        continue
                     logger.warning(
-                        f"[SELL] Balance/allowance fatal — market likely expired, "
+                        f"[SELL] Balance/allowance fatal — market expired, "
                         f"accepting full loss of ${entry_size:.2f} for {market_id}"
                     )
                     to_remove.append(order_id)
