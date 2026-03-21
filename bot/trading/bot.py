@@ -86,6 +86,8 @@ class MarketState:
     is_event: bool = False  # True for politics/sports/etc. markets
     spot_at_start: float = 0.0  # Crypto spot price when window opened
     condition_id: str = ""  # Full conditionId for Gamma API resolution
+    tick_size: str = "0.01"  # Market tick size for order pricing
+    neg_risk: bool = False   # True for multi-outcome (3+) markets
 
 
 @dataclass
@@ -652,6 +654,8 @@ class ArbitrageBot:
             no_data = self.data_client.get_book_data(state.token_id_no)
             p_yes = yes_data["mid_price"]
             p_no = no_data["mid_price"]
+            state.tick_size = yes_data.get("tick_size", "0.01")
+            state.neg_risk = yes_data.get("neg_risk", False)
             if p_yes is None and state.gamma_price_yes is not None:
                 if abs(state.gamma_price_yes - 0.5) > 0.01:
                     p_yes = state.gamma_price_yes
@@ -959,12 +963,18 @@ class ArbitrageBot:
             token_id = market.token_id_yes if side == "YES" else market.token_id_no
             logger.info(
                 f"[LIVE] Placing order: {opp.market_id} BUY {side} ${size:.2f} @ {price:.4f} "
-                f"({exec_type})"
+                f"({exec_type}) tick={market.tick_size} neg_risk={market.neg_risk}"
             )
             if is_passive:
-                order_id = self.executor.place_limit_order(token_id, "BUY", price, size)
+                order_id = self.executor.place_limit_order(
+                    token_id, "BUY", price, size,
+                    tick_size=market.tick_size, neg_risk=market.neg_risk,
+                )
             else:
-                order_id = self.executor.place_fok_order(token_id, "BUY", price, size)
+                order_id = self.executor.place_fok_order(
+                    token_id, "BUY", price, size,
+                    tick_size=market.tick_size, neg_risk=market.neg_risk,
+                )
 
             if order_id:
                 logger.info(f"Order accepted: {order_id}")
@@ -984,12 +994,18 @@ class ArbitrageBot:
             f"[LIVE] Within-market arb {market.market_id}: "
             f"BUY YES ${half:.2f} @ {yes_price:.4f} + BUY NO ${half:.2f} @ {no_price:.4f}"
         )
+        ts = market.tick_size
+        nr = market.neg_risk
         if aggressive:
-            yes_id = self.executor.place_fok_order(market.token_id_yes, "BUY", yes_price, half)
-            no_id = self.executor.place_fok_order(market.token_id_no, "BUY", no_price, half)
+            yes_id = self.executor.place_fok_order(market.token_id_yes, "BUY", yes_price, half,
+                                                    tick_size=ts, neg_risk=nr)
+            no_id = self.executor.place_fok_order(market.token_id_no, "BUY", no_price, half,
+                                                   tick_size=ts, neg_risk=nr)
         else:
-            yes_id = self.executor.place_limit_order(market.token_id_yes, "BUY", yes_price, half)
-            no_id = self.executor.place_limit_order(market.token_id_no, "BUY", no_price, half)
+            yes_id = self.executor.place_limit_order(market.token_id_yes, "BUY", yes_price, half,
+                                                      tick_size=ts, neg_risk=nr)
+            no_id = self.executor.place_limit_order(market.token_id_no, "BUY", no_price, half,
+                                                     tick_size=ts, neg_risk=nr)
 
         if yes_id and no_id:
             logger.info(f"Both legs accepted: YES={yes_id}, NO={no_id}")

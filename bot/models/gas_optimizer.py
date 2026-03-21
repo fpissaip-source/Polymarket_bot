@@ -7,7 +7,13 @@ This module:
   1. Fetches current Polygon gas price (Gwei) from a free public endpoint.
   2. Estimates the USD cost of the on-chain settlement transaction.
   3. Vetoes the trade if:
-       gas_cost_usd > GAS_VETO_RATIO * expected_pnl
+       gas_cost_usd > veto_ratio(stake) * expected_pnl
+
+  Veto ratio scales dynamically with bet size:
+    stake < $2  → 60%   (generous for micro-bets)
+    $2–$5       → 40%
+    $5–$25      → 30%
+    $25+        → 15%   (tight for large bets)
 
   expected_pnl = edge * stake
 
@@ -27,8 +33,19 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-# Veto threshold: gas_cost must be < this fraction of expected edge PnL
-GAS_VETO_RATIO = 0.30          # 30%
+GAS_VETO_TIERS = [
+    (2.0,  0.60),
+    (5.0,  0.40),
+    (25.0, 0.30),
+]
+GAS_VETO_LARGE = 0.15
+
+
+def get_veto_ratio(stake: float) -> float:
+    for threshold, ratio in GAS_VETO_TIERS:
+        if stake < threshold:
+            return ratio
+    return GAS_VETO_LARGE
 
 # Estimated gas units for a Polymarket CLOB settlement tx
 GAS_UNITS_ESTIMATE = 120_000   # ~120k gas for ERC-20 + conditional token ops
@@ -81,17 +98,18 @@ class GasOptimizer:
         if expected_pnl <= 0:
             return True, ""   # No expected PnL → gas check irrelevant
 
+        veto_ratio = get_veto_ratio(stake)
         ratio = gas_usd / expected_pnl
         reason = (
             f"gas={gas_usd:.4f}USD "
             f"({gwei:.1f} Gwei, MATIC=${matic:.3f}) "
-            f"= {ratio:.1%} of expected PnL ${expected_pnl:.4f}"
+            f"= {ratio:.1%} of expected PnL ${expected_pnl:.4f} "
+            f"(stake=${stake:.2f}, veto_threshold={veto_ratio:.0%})"
         )
 
-        if ratio > GAS_VETO_RATIO:
+        if ratio > veto_ratio:
             logger.warning(
-                f"[GAS VETO] Gas cost too high: {reason} "
-                f"(threshold {GAS_VETO_RATIO:.0%})"
+                f"[GAS VETO] Gas cost too high: {reason}"
             )
             return False, f"Gas veto: {reason}"
 
@@ -109,7 +127,8 @@ class GasOptimizer:
             "matic_usd": round(matic, 4),
             "gas_cost_usd": round(gas_usd, 6),
             "gas_units": GAS_UNITS_ESTIMATE,
-            "veto_ratio": GAS_VETO_RATIO,
+            "veto_tiers": GAS_VETO_TIERS,
+            "veto_large": GAS_VETO_LARGE,
         }
 
     # ------------------------------------------------------------------

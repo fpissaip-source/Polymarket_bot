@@ -8,6 +8,11 @@ Supported order types:
   GTD  – Good Till Date (expires at given timestamp)
   FOK  – Fill or Kill (immediate full fill or cancel)
   FAK  – Fill and Kill (immediate partial fill, rest cancelled)
+
+Per Polymarket docs, every order requires:
+  - tickSize  (string: "0.1", "0.01", "0.001", "0.0001")
+  - negRisk   (bool: True for multi-outcome 3+ markets)
+These are passed as CreateOrderOptions to create_order().
 """
 
 import time
@@ -23,7 +28,6 @@ except ImportError:
         "py_clob_client not installed – OrderExecutor disabled (dry-run only)"
     )
 
-# py-clob-client >= 0.15 removed BUY/SELL from constants – use string literals
 BUY = "BUY"
 SELL = "SELL"
 
@@ -49,9 +53,11 @@ _ORDER_TYPE_MAP = {
     "FAK": OrderType.FAK,
 } if _PY_CLOB_AVAILABLE else {}
 
+VALID_TICK_SIZES = {"0.1", "0.01", "0.001", "0.0001"}
+TICK_DECIMALS = {"0.1": 1, "0.01": 2, "0.001": 3, "0.0001": 4}
+
 
 def _post_with_retry(fn, *args, retries: int = 4):
-    """Call fn(*args) with exponential backoff on rate-limit errors."""
     for attempt in range(retries):
         try:
             return fn(*args)
@@ -67,7 +73,6 @@ def _post_with_retry(fn, *args, retries: int = 4):
 
 
 class OrderExecutor:
-    """Places and manages orders via py-clob-client."""
 
     def __init__(self):
         if not _PY_CLOB_AVAILABLE:
@@ -89,67 +94,101 @@ class OrderExecutor:
             funder=PROXY_ADDRESS if PROXY_ADDRESS else None,
         )
         logger.info(f"OrderExecutor initialized (sig_type={sig_type})")
+        self._check_allowance()
+
+    def _check_allowance(self):
+        try:
+            bal = self.client.get_balance_allowance()
+            if bal:
+                allowance = bal.get("allowance") or bal.get("balance_allowance", {}).get("allowance")
+                balance = bal.get("balance") or bal.get("balance_allowance", {}).get("balance")
+                logger.info(f"[ALLOWANCE] balance={balance}, allowance={allowance}")
+                if allowance is not None and float(allowance) < 1.0:
+                    logger.warning(
+                        "[ALLOWANCE] USDC.e allowance is zero or too low! "
+                        "Orders will fail. Approve the Exchange contract first."
+                    )
+        except Exception as e:
+            logger.debug(f"[ALLOWANCE] Could not check balance/allowance: {e}")
 
     def place_order(
         self,
         token_id: str,
-        side: str,                      # "BUY" or "SELL"
-        price: float,                   # limit price [0, 1]
-        size: float,                    # USDC amount
-        order_type: str = "GTC",        # GTC | GTD | FOK | FAK
-        expiration: int | None = None,  # Unix timestamp (GTD only)
+        side: str,
+        price: float,
+        size: float,
+        order_type: str = "GTC",
+        expiration: int | None = None,
+        tick_size: str = "0.01",
+        neg_risk: bool = False,
     ) -> str | None:
-        """
-        Place a limit order. Returns order_id or None on failure.
-
-        - GTC: stays in book until filled or cancelled
-        - GTD: expires at `expiration` Unix timestamp
-        - FOK: fill entire size immediately or cancel
-        - FAK: fill what's available now, cancel remainder
-        """
         clob_side = BUY if side.upper() == "BUY" else SELL
         ot = _ORDER_TYPE_MAP.get(order_type.upper(), OrderType.GTC)
 
-        # Polymarket size = number of shares (tokens), not dollar amount
-        # shares = dollar_amount / price  (each share costs `price` USDC)
+        if tick_size not in VALID_TICK_SIZES:
+            tick_size = "0.01"
+        decimals = TICK_DECIMALS[tick_size]
+
         shares = size / price if price > 0 else 0
         if shares < 1.0:
             logger.warning(f"Order too small: ${size:.2f} / {price:.4f} = {shares:.2f} shares (min 1)")
             return None
 
-        # Polymarket tick size = 0.01 (prices in cents)
+        rounded_price = round(price, decimals)
+
         order_args = OrderArgs(
             token_id=token_id,
-            price=round(price, 2),
+            price=rounded_price,
             size=round(shares, 2),
             side=clob_side,
             expiration=expiration,
         )
 
+        options = {"tick_size": tick_size, "neg_risk": neg_risk}
+
         try:
-            signed = self.client.create_order(order_args)
+            signed = self.client.create_order(order_args, options)
             resp = _post_with_retry(self.client.post_order, signed, ot)
             order_id = resp.get("orderID") or resp.get("id")
+            status = resp.get("status", "unknown")
+            error_msg = resp.get("errorMsg", "")
+            if error_msg:
+                logger.warning(
+                    f"[{order_type}] Order response error: {error_msg} "
+                    f"| {side} {shares:.2f} shares @ {rounded_price} "
+                    f"| tick={tick_size} neg_risk={neg_risk}"
+                )
+                return None
             logger.info(
-                f"[{order_type}] {side} {size:.2f} USDC @ {price:.4f} "
-                f"| token={token_id[:12]}... | id={order_id}"
+                f"[{order_type}] {side} ${size:.2f} ({shares:.2f} shares) @ {rounded_price} "
+                f"| tick={tick_size} neg_risk={neg_risk} "
+                f"| status={status} | id={order_id}"
             )
             return order_id
         except Exception as e:
-            logger.error(f"Failed to place {order_type} order: {e}")
+            logger.error(
+                f"Failed to place {order_type} order: {e} "
+                f"| {side} {shares:.2f} shares @ {rounded_price} "
+                f"| tick={tick_size} neg_risk={neg_risk}"
+            )
             return None
 
-    # Convenience wrappers
-    def place_limit_order(self, token_id: str, side: str, price: float, size: float) -> str | None:
-        return self.place_order(token_id, side, price, size, order_type="GTC")
+    def place_limit_order(self, token_id: str, side: str, price: float, size: float,
+                          tick_size: str = "0.01", neg_risk: bool = False) -> str | None:
+        return self.place_order(token_id, side, price, size, order_type="GTC",
+                                tick_size=tick_size, neg_risk=neg_risk)
 
-    def place_fok_order(self, token_id: str, side: str, price: float, size: float) -> str | None:
-        return self.place_order(token_id, side, price, size, order_type="FOK")
+    def place_fok_order(self, token_id: str, side: str, price: float, size: float,
+                        tick_size: str = "0.01", neg_risk: bool = False) -> str | None:
+        return self.place_order(token_id, side, price, size, order_type="FOK",
+                                tick_size=tick_size, neg_risk=neg_risk)
 
     def place_gtd_order(
-        self, token_id: str, side: str, price: float, size: float, expiration: int
+        self, token_id: str, side: str, price: float, size: float, expiration: int,
+        tick_size: str = "0.01", neg_risk: bool = False,
     ) -> str | None:
-        return self.place_order(token_id, side, price, size, order_type="GTD", expiration=expiration)
+        return self.place_order(token_id, side, price, size, order_type="GTD",
+                                expiration=expiration, tick_size=tick_size, neg_risk=neg_risk)
 
     def cancel_order(self, order_id: str) -> bool:
         try:
