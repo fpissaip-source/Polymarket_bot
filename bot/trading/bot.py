@@ -934,10 +934,13 @@ class ArbitrageBot:
                     self._save_bankroll()
                     continue
 
-                sell_price = round(best_bid, 4)
+                # Use aggressive worst-price to ensure fill: allow up to 20% slippage
+                # from best_bid. The price param is the MINIMUM we accept — setting it
+                # too high (= best_bid) causes FOK/FAK to fail when bids shift.
+                sell_price = round(max(best_bid * 0.80, 0.01), 4)
                 logger.info(
                     f"[SELL] cancel={cancel_status} mid={current_price:.4f} best_bid={best_bid:.4f} "
-                    f"selling {actual_shares:.2f} shares @ {sell_price}"
+                    f"selling {actual_shares:.2f} shares @ {sell_price} (worst-price, 20% slippage)"
                 )
                 sell_order_id = self.executor.close_position(
                     token_id, actual_shares, sell_price,
