@@ -308,6 +308,7 @@ class OrderExecutor:
         expiration: int | None = None,
         tick_size: str = "0.01",
         neg_risk: bool = False,
+        min_size_usd: float | None = None,
     ) -> str | None:
         clob_side = BUY if side.upper() == "BUY" else SELL
         ot = _ORDER_TYPE_MAP.get(order_type.upper(), OrderType.GTC)
@@ -325,9 +326,11 @@ class OrderExecutor:
             )
             return None
 
-        min_size = max(MIN_BET_SIZE, 0.01)
-        if size < min_size - 0.01:
-            logger.warning(f"Order size ${size:.2f} below ${min_size:.2f} minimum — skipping")
+        # min_size_usd=0 skips the dollar-floor (used for SL bracket sells where
+        # the USD value may be small but the share count already cleared the 5-share gate above)
+        effective_min = min_size_usd if min_size_usd is not None else max(MIN_BET_SIZE, 0.01)
+        if effective_min > 0 and size < effective_min - 0.01:
+            logger.warning(f"Order size ${size:.2f} below ${effective_min:.2f} minimum — skipping")
             return None
 
         # ── Fetch live tick_size / neg_risk from CLOB ────────────────────────
@@ -490,9 +493,13 @@ class OrderExecutor:
             f"[SL_ORDER] Placing GTC SELL bracket: {shares:.2f} shares @ {sl_price:.4f} "
             f"(size=${size_usd:.2f})"
         )
+        # min_size_usd=0: skip dollar-floor — shares already >= 5 (CLOB min cleared above).
+        # Low-price tokens naturally produce small USD values (e.g. 7 shares × 0.12 = $0.84)
+        # which would otherwise be blocked by MIN_BET_SIZE even though the order is valid.
         return self.place_order(
             token_id, "SELL", sl_price, size_usd,
             order_type="GTC", tick_size=tick_size, neg_risk=neg_risk,
+            min_size_usd=0,
         )
 
     def cancel_order(self, order_id: str) -> str:
