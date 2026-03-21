@@ -225,9 +225,13 @@ class OrderExecutor:
         neg_risk = real_neg
         decimals = TICK_DECIMALS[tick_size]
 
+        if size < 5.0:
+            logger.warning(f"Order size ${size:.2f} below $5 minimum — skipping")
+            return None
+
         shares = size / price if price > 0 else 0
-        if shares < 1.0:
-            logger.warning(f"Order too small: ${size:.2f} / {price:.4f} = {shares:.2f} shares (min 1)")
+        if shares < 5.0:
+            logger.warning(f"Order too small: ${size:.2f} / {price:.4f} = {shares:.2f} shares (min 5)")
             return None
 
         rounded_price = round(price, decimals)
