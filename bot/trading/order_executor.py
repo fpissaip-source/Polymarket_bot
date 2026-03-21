@@ -12,7 +12,7 @@ Supported order types:
 Per Polymarket docs, every order requires:
   - tickSize  (string: "0.1", "0.01", "0.001", "0.0001")
   - negRisk   (bool: True for multi-outcome 3+ markets)
-These are passed as CreateOrderOptions to create_order().
+These are fetched dynamically from the CLOB API before each order.
 """
 
 import time
@@ -96,9 +96,16 @@ class OrderExecutor:
             funder=PROXY_ADDRESS if PROXY_ADDRESS else None,
         )
         logger.info(f"OrderExecutor initialized (sig_type={sig_type})")
-        self._check_allowance()
+        self._tick_cache: dict[str, str] = {}
+        self._neg_risk_cache: dict[str, bool] = {}
+        self._ensure_allowance()
 
-    def _check_allowance(self):
+    def _ensure_allowance(self):
+        try:
+            self.client.update_balance_allowance()
+            logger.info("[ALLOWANCE] Called update_balance_allowance to ensure approval")
+        except Exception as e:
+            logger.warning(f"[ALLOWANCE] update_balance_allowance failed: {e}")
         try:
             bal = self.client.get_balance_allowance()
             if bal:
@@ -108,10 +115,37 @@ class OrderExecutor:
                 if allowance is not None and float(allowance) < 1.0:
                     logger.warning(
                         "[ALLOWANCE] USDC.e allowance is zero or too low! "
-                        "Orders will fail. Approve the Exchange contract first."
+                        "Orders may fail. Try running update_balance_allowance again."
                     )
         except Exception as e:
             logger.debug(f"[ALLOWANCE] Could not check balance/allowance: {e}")
+
+    def _fetch_tick_size(self, token_id: str) -> str:
+        if token_id in self._tick_cache:
+            return self._tick_cache[token_id]
+        try:
+            ts = self.client.get_tick_size(token_id)
+            ts_str = str(ts)
+            if ts_str in VALID_TICK_SIZES:
+                self._tick_cache[token_id] = ts_str
+                logger.debug(f"[TICK] {token_id[:16]}... = {ts_str}")
+                return ts_str
+        except Exception as e:
+            logger.warning(f"[TICK] get_tick_size failed for {token_id[:16]}...: {e}")
+        return "0.01"
+
+    def _fetch_neg_risk(self, token_id: str) -> bool:
+        if token_id in self._neg_risk_cache:
+            return self._neg_risk_cache[token_id]
+        try:
+            nr = self.client.get_neg_risk(token_id)
+            val = bool(nr)
+            self._neg_risk_cache[token_id] = val
+            logger.debug(f"[NEG_RISK] {token_id[:16]}... = {val}")
+            return val
+        except Exception as e:
+            logger.warning(f"[NEG_RISK] get_neg_risk failed for {token_id[:16]}...: {e}")
+        return False
 
     def place_order(
         self,
@@ -127,8 +161,16 @@ class OrderExecutor:
         clob_side = BUY if side.upper() == "BUY" else SELL
         ot = _ORDER_TYPE_MAP.get(order_type.upper(), OrderType.GTC)
 
-        if tick_size not in VALID_TICK_SIZES:
-            tick_size = "0.01"
+        real_tick = self._fetch_tick_size(token_id)
+        real_neg = self._fetch_neg_risk(token_id)
+
+        if real_tick != tick_size:
+            logger.info(f"[TICK OVERRIDE] {tick_size} -> {real_tick} (from CLOB)")
+        if real_neg != neg_risk:
+            logger.info(f"[NEG_RISK OVERRIDE] {neg_risk} -> {real_neg} (from CLOB)")
+
+        tick_size = real_tick
+        neg_risk = real_neg
         decimals = TICK_DECIMALS[tick_size]
 
         shares = size / price if price > 0 else 0
@@ -148,6 +190,11 @@ class OrderExecutor:
 
         options = PartialCreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk)
 
+        logger.info(
+            f"[{order_type}] Placing order: {clob_side} {round(shares,2)} shares @ {rounded_price} "
+            f"| tick={tick_size} neg_risk={neg_risk} | token={token_id[:16]}..."
+        )
+
         try:
             signed = self.client.create_order(order_args, options)
             resp = _post_with_retry(self.client.post_order, signed, ot)
@@ -162,7 +209,7 @@ class OrderExecutor:
                 )
                 return None
             logger.info(
-                f"[{order_type}] {side} ${size:.2f} ({shares:.2f} shares) @ {rounded_price} "
+                f"[{order_type}] SUCCESS {side} ${size:.2f} ({shares:.2f} shares) @ {rounded_price} "
                 f"| tick={tick_size} neg_risk={neg_risk} "
                 f"| status={status} | id={order_id}"
             )
