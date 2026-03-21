@@ -613,6 +613,18 @@ class ArbitrageBot:
                     self._save_bankroll()
                     continue
 
+                # Dead market guard: best_bid near zero = no liquidity (market expired as loser)
+                DEAD_BID = 0.02
+                if best_bid <= DEAD_BID:
+                    logger.warning(
+                        f"[SELL] Dead market — best_bid={best_bid:.4f} ≤ {DEAD_BID:.2f} "
+                        f"(no liquidity, expired as loser). Accepting full loss of ${entry_size:.2f}."
+                    )
+                    to_remove.append(order_id)
+                    self.kelly.release(entry_size)
+                    self._save_bankroll()
+                    continue
+
                 sell_price = round(best_bid, 4)
                 logger.info(
                     f"[SELL] cancel={cancel_status} mid={current_price:.4f} best_bid={best_bid:.4f} "
@@ -622,6 +634,15 @@ class ArbitrageBot:
                     token_id, actual_shares, sell_price,
                     tick_size=tick_size, neg_risk=neg_risk,
                 )
+                if sell_order_id == "BALANCE_ERROR":
+                    logger.warning(
+                        f"[SELL] Balance/allowance fatal — market likely expired, "
+                        f"accepting full loss of ${entry_size:.2f} for {market_id}"
+                    )
+                    to_remove.append(order_id)
+                    self.kelly.release(entry_size)
+                    self._save_bankroll()
+                    continue
                 if not sell_order_id:
                     logger.error(f"[SELL] FAILED for {market_id} — retrying next cycle")
                     continue

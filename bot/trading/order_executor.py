@@ -438,6 +438,10 @@ class OrderExecutor:
             logger.info(f"[CLOSE] SUCCESS SELL {rounded_shares} shares @ {rounded_price} | status={status} | id={order_id}")
             return order_id
         except Exception as e:
+            err_str = str(e).lower()
+            if "not enough balance" in err_str or "allowance" in err_str:
+                logger.error(f"[CLOSE] FATAL balance/allowance error (market likely expired): {e}")
+                return "BALANCE_ERROR"
             logger.error(f"[CLOSE] Failed to close position: {e}")
             return None
 
