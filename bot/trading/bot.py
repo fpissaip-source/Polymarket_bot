@@ -383,9 +383,9 @@ class ArbitrageBot:
 
         for asset in assets:
             logger.info(f"Discovering {asset} markets via Gamma API...")
-            markets = gamma.discover_crypto_markets(asset)
+            markets = gamma.discover_5min_markets(asset)
             if not markets:
-                logger.warning(f"No markets found for {asset} on Gamma — skipping")
+                logger.warning(f"No 5-min markets found for {asset} on Gamma — skipping")
                 continue
 
             registered_for_asset = 0
@@ -429,6 +429,12 @@ class ArbitrageBot:
                 if market_tick_size not in ("0.1", "0.01", "0.001", "0.0001"):
                     market_tick_size = "0.01"
 
+                question_text = m.get("question", "")[:60]
+                mins_left = round((end_time - time.time()) / 60, 1) if end_time > 0 else "?"
+                logger.info(
+                    f"[5m] {asset}: registered {market_id} | "
+                    f"{mins_left}m left | q='{question_text}'"
+                )
                 self.register_market(
                     market_id=market_id,
                     token_id_yes=yes_token,
@@ -445,7 +451,7 @@ class ArbitrageBot:
                 registered += 1
                 registered_for_asset += 1
 
-        logger.info(f"Auto-discovery complete: {registered} crypto markets registered")
+        logger.info(f"Auto-discovery complete: {registered} 5-min crypto markets registered")
 
         event_count = self._discover_event_markets(gamma)
         logger.info(f"Event markets discovered: {event_count}")
@@ -990,7 +996,7 @@ class ArbitrageBot:
             if has_active:
                 continue
 
-            markets = gamma.discover_crypto_markets(asset)
+            markets = gamma.discover_5min_markets(asset)
             best_market = None
             best_end = 0.0
             for m in markets:
