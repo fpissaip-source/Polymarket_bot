@@ -593,17 +593,15 @@ class ArbitrageBot:
                     f"| {shares:.2f} shares | value=${current_value:.2f}"
                 )
                 cancel_status = self.executor.cancel_order(order_id)
-
                 if cancel_status == "API_ERROR":
-                    logger.warning(f"[SELL] Cancel API failed — retrying next cycle to avoid untracked exposure")
-                    continue
+                    logger.warning(f"[SELL] Cancel API error — proceeding with sell anyway using estimated shares")
 
                 actual_shares = self.executor.get_order_fills(order_id)
                 if actual_shares < 0:
                     actual_shares = shares
-                    logger.warning(f"[SELL] Using estimated shares={shares:.2f} (API unavailable)")
-                elif actual_shares < 0.5:
-                    logger.info(f"[SELL] No/too few filled shares ({actual_shares:.2f}) — nothing to sell")
+                    logger.warning(f"[SELL] Fill API unavailable — using estimated shares={shares:.2f}")
+                elif actual_shares <= 0:
+                    logger.info(f"[SELL] Zero filled shares confirmed — nothing to sell")
                     to_remove.append(order_id)
                     self.kelly.release(entry_size)
                     self._save_bankroll()

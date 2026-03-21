@@ -23,7 +23,7 @@ import logging
 try:
     from py_clob_client.client import ClobClient
     from py_clob_client.clob_types import (
-        ApiCreds, OrderArgs, OrderType, PartialCreateOrderOptions,
+        ApiCreds, OrderArgs, MarketOrderArgs, OrderType, PartialCreateOrderOptions,
         BalanceAllowanceParams, AssetType,
     )
     _PY_CLOB_AVAILABLE = True
@@ -383,9 +383,10 @@ class OrderExecutor:
     def close_position(self, token_id: str, shares: float, price: float,
                        tick_size: str = "0.01", neg_risk: bool = False) -> str | None:
         """
-        Sell `shares` outcome tokens at `price` to close a position.
-        Bypasses the USD minimum-size check — used for TP/SL exits only.
-        Uses FOK (Fill or Kill) for immediate execution on fast markets.
+        Sell `shares` outcome tokens at `price` (worst-price limit) to close a position.
+        Uses create_market_order (SELL, amount=shares, price=worst_price) + FOK as per
+        Polymarket docs: https://docs.polymarket.com/trading/orders/create#market-orders
+        Falls back to GTC limit order if FOK rejected.
         """
         try:
             real_tick = self._fetch_tick_size(token_id)
@@ -399,25 +400,33 @@ class OrderExecutor:
                 return None
 
             options = PartialCreateOrderOptions(tick_size=real_tick, neg_risk=real_neg)
-            order_args = OrderArgs(
-                token_id=token_id,
-                price=rounded_price,
-                size=rounded_shares,
-                side=SELL,
-                expiration=0,
-            )
             logger.info(
-                f"[CLOSE] SELL {rounded_shares} shares @ {rounded_price} "
+                f"[CLOSE] SELL {rounded_shares} shares @ {rounded_price} (worst-price) "
                 f"| tick={real_tick} neg_risk={real_neg} | maker={self.client.builder.funder}"
             )
-            signed = self.client.create_order(order_args, options)
+
+            market_args = MarketOrderArgs(
+                token_id=token_id,
+                side=SELL,
+                amount=rounded_shares,
+                price=rounded_price,
+            )
+            signed = self.client.create_market_order(market_args, options)
             resp = _post_with_retry(self.client.post_order, signed, OrderType.FOK)
             order_id = resp.get("orderID") or resp.get("id")
             status = resp.get("status", "unknown")
             error_msg = resp.get("errorMsg", "")
+
             if error_msg:
-                logger.warning(f"[CLOSE] FOK rejected: {error_msg} — retrying as GTC")
-                signed2 = self.client.create_order(order_args, options)
+                logger.warning(f"[CLOSE] FOK rejected: {error_msg} — retrying as GTC limit")
+                limit_args = OrderArgs(
+                    token_id=token_id,
+                    price=rounded_price,
+                    size=rounded_shares,
+                    side=SELL,
+                    expiration=0,
+                )
+                signed2 = self.client.create_order(limit_args, options)
                 resp2 = _post_with_retry(self.client.post_order, signed2, OrderType.GTC)
                 order_id = resp2.get("orderID") or resp2.get("id")
                 error_msg2 = resp2.get("errorMsg", "")
@@ -425,6 +434,7 @@ class OrderExecutor:
                     logger.error(f"[CLOSE] GTC also failed: {error_msg2}")
                     return None
                 status = resp2.get("status", "unknown")
+
             logger.info(f"[CLOSE] SUCCESS SELL {rounded_shares} shares @ {rounded_price} | status={status} | id={order_id}")
             return order_id
         except Exception as e:
