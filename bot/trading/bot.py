@@ -833,15 +833,17 @@ class ArbitrageBot:
                     f"expires={f'{time_to_expiry:.0f}s' if time_to_expiry < 9e8 else 'unknown'}"
                 )
 
-            # ── Settlement cooldown: CTF tokens need ~20s to arrive on Polygon ──
-            # Without this, a TP/SL fires immediately after fill → BALANCE_ERROR.
-            SETTLEMENT_COOLDOWN = 20  # seconds
+            # ── Settlement cooldown: CTF tokens need a few seconds to arrive on Polygon ──
+            # Skip cooldown entirely if price moved significantly (don't miss exits).
+            # The TP bracket GTC order handles selling during cooldown anyway.
+            SETTLEMENT_COOLDOWN = 5  # seconds (reduced from 20 — allowance polling handles the rest)
             fill_confirmed_at = pos.get("fill_confirmed_at", 0)
-            if fill_confirmed_at > 0 and (now - fill_confirmed_at) < SETTLEMENT_COOLDOWN:
-                remaining_cd = SETTLEMENT_COOLDOWN - (now - fill_confirmed_at)
-                if int(now) % 5 == 0:  # Log every 5s to avoid spam
+            cooldown_remaining = SETTLEMENT_COOLDOWN - (now - fill_confirmed_at) if fill_confirmed_at > 0 else 0
+            if cooldown_remaining > 0 and abs(pnl_ratio) < 0.50:
+                # Only wait if price hasn't moved much — big moves need immediate action
+                if int(now) % 5 == 0:
                     logger.info(
-                        f"[SETTLEMENT] {market_id} waiting {remaining_cd:.0f}s for "
+                        f"[SETTLEMENT] {market_id} waiting {cooldown_remaining:.0f}s for "
                         f"CTF token settlement before TP/SL | pnl={pnl_ratio:+.1%}"
                     )
                 continue
