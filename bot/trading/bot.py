@@ -1214,6 +1214,15 @@ class ArbitrageBot:
 
             # Directional: BUY YES or BUY NO
             token_id = market.token_id_yes if side == "YES" else market.token_id_no
+
+            # Dedup: never open a second position for the same token
+            open_token_ids = {pos["token_id"] for pos in self._live_positions.values()}
+            if token_id in open_token_ids:
+                logger.info(
+                    f"[SKIP] {opp.market_id}: token {token_id[:12]}... already has an open position"
+                )
+                continue
+
             logger.info(
                 f"[LIVE] Placing order: {opp.market_id} BUY {side} ${size:.2f} @ {price:.4f} "
                 f"({exec_type}) tick={market.tick_size} neg_risk={market.neg_risk}"
