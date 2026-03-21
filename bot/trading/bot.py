@@ -540,20 +540,20 @@ class ArbitrageBot:
                 data = self.data_client.get_book_data(token_id)
                 current_price = data.get("mid_price") or data.get("last_price")
                 if current_price is None:
-                    # No book data = market likely closed.
-                    # Purge if: expiry is near/past, OR end_time unknown (can't confirm still active)
-                    unknown_expiry = end_time == 0
-                    if time_to_expiry < 30 or unknown_expiry:
-                        logger.warning(
-                            f"[FORCE_PURGE] {market_id} order={order_id[:8]} — no book data "
-                            f"({'unknown expiry' if unknown_expiry else f'{time_to_expiry:.0f}s left'}), "
-                            f"releasing ${entry_size:.2f}"
-                        )
-                        to_remove.append(order_id)
-                        self.kelly.release(entry_size)
-                        self._save_bankroll()
-                    continue
-            except Exception:
+                    raise ValueError("no mid_price or last_price")
+            except Exception as e:
+                # No book data = market likely closed / token invalid.
+                # Purge if: expiry unknown, expiry past, or near expiry
+                if end_time == 0 or time_to_expiry < 60:
+                    logger.warning(
+                        f"[FORCE_PURGE] {market_id} order={order_id[:8]} — "
+                        f"book data error ({e}), "
+                        f"{'unknown expiry' if end_time == 0 else f'{time_to_expiry:.0f}s left'}, "
+                        f"releasing ${entry_size:.2f}"
+                    )
+                    to_remove.append(order_id)
+                    self.kelly.release(entry_size)
+                    self._save_bankroll()
                 continue
 
             # Use stored share count if available (exact), else compute from size/price
