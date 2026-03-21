@@ -58,10 +58,6 @@ from config import (
     SL_RATIO_LOW,
     LOW_PRICE_THRESHOLD,
     TP_SL_CHECK_INTERVAL,
-    SWEET_SPOT_LOW_MIN,
-    SWEET_SPOT_LOW_MAX,
-    SWEET_SPOT_HIGH_MIN,
-    SWEET_SPOT_HIGH_MAX,
     MIN_SECONDS_BEFORE_EXPIRY,
 )
 
@@ -668,14 +664,8 @@ class ArbitrageBot:
             if p_yes is None or p_no is None:
                 market_stats.append(f"{state.asset}({state.timeframe}):NO_DATA")
                 continue
-            in_sweet_spot = (
-                (SWEET_SPOT_LOW_MIN <= p_yes <= SWEET_SPOT_LOW_MAX) or
-                (SWEET_SPOT_HIGH_MIN <= p_yes <= SWEET_SPOT_HIGH_MAX)
-            )
-            if not in_sweet_spot:
-                market_stats.append(
-                    f"{state.asset}({state.timeframe}):NO_SWEET_SPOT(p={p_yes:.2f})"
-                )
+            if p_yes > 0.95 or p_yes < 0.05:
+                market_stats.append(f"{state.asset}({state.timeframe}):RESOLVED(p={p_yes:.2f})")
                 continue
 
             ob_imbalance = yes_data["imbalance"] or 0.0
