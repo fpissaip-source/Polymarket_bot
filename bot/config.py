@@ -11,6 +11,8 @@ POLYMARKET_PRIVATE_KEY = "".join(os.getenv("POLYMARKET_PRIVATE_KEY", "").split()
 POLYMARKET_API_KEY = os.getenv("POLYMARKET_API_KEY", "")
 POLYMARKET_API_SECRET = os.getenv("POLYMARKET_API_SECRET", "")
 POLYMARKET_API_PASSPHRASE = os.getenv("POLYMARKET_API_PASSPHRASE", "")
+# Proxy wallet: holds the actual USDC.e balance; use sig_type=1 when set
+POLYMARKET_PROXY_ADDRESS = os.getenv("POLYMARKET_PROXY_ADDRESS", "0x024558B703f59Bff6BBA21919697163E96E2353B")
 CHAIN_ID = int(os.getenv("CHAIN_ID", "137"))  # Polygon
 
 # Crypto price feed

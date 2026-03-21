@@ -42,6 +42,7 @@ from config import (
     POLYMARKET_API_KEY,
     POLYMARKET_API_SECRET,
     POLYMARKET_API_PASSPHRASE,
+    POLYMARKET_PROXY_ADDRESS as _PROXY_ADDRESS_CFG,
     CHAIN_ID,
 )
 
@@ -50,7 +51,7 @@ import requests as _requests
 
 logger = logging.getLogger("polymarket_bot.executor")
 
-PROXY_ADDRESS = os.getenv("POLYMARKET_PROXY_ADDRESS", "").strip()
+PROXY_ADDRESS = os.getenv("POLYMARKET_PROXY_ADDRESS", _PROXY_ADDRESS_CFG).strip()
 
 _POLYGON_RPCS = [
     "https://polygon-bor-rpc.publicnode.com",
