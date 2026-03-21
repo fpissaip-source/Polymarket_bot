@@ -625,8 +625,8 @@ class ArbitrageBot:
                     sold_shares = actual_shares
                     logger.warning(f"[SELL] Fill verify API unavailable — assuming full sell of {actual_shares:.2f}")
 
-                DUST = 1.0
-                remaining = actual_shares - sold_shares
+                DUST = 0.01
+                remaining = max(0.0, actual_shares - sold_shares)
                 if remaining <= DUST:
                     logger.info(f"[SELL] COMPLETE — sold={sold_shares:.2f} remaining={remaining:.2f} (dust)")
                     to_remove.append(order_id)
