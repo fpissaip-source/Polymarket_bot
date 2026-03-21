@@ -1245,6 +1245,25 @@ class ArbitrageBot:
 
             # Within-market arb: buy both YES and NO simultaneously
             if side == "BOTH":
+                # Apply same capital + dedup guards as directional trades
+                open_token_ids_arb = {pos["token_id"] for pos in self._live_positions.values()}
+                if (market.token_id_yes in open_token_ids_arb
+                        or market.token_id_no in open_token_ids_arb):
+                    logger.info(f"[SKIP] {opp.market_id}: arb token already has open position")
+                    continue
+                n_open_arb = len(self._live_positions)
+                if n_open_arb + 2 > MAX_OPEN_TRADES:
+                    logger.info(
+                        f"[SKIP] {opp.market_id}: arb needs 2 slots, only "
+                        f"{MAX_OPEN_TRADES - n_open_arb} free"
+                    )
+                    continue
+                if self.kelly.available_capital < size:
+                    logger.info(
+                        f"[SKIP] {opp.market_id}: arb available=${self.kelly.available_capital:.2f}"
+                        f" < ${size:.2f}"
+                    )
+                    continue
                 self._place_arb_both_sides(market, size, not is_passive)
                 continue
 
