@@ -267,6 +267,44 @@ class ArbitrageBot:
                     f"— these existed in live_positions.json but had no real token balance"
                 )
             active = reconciled
+
+            # Step 3: Recover orphaned on-chain positions not in live_positions.json.
+            # This handles restarts where the bot placed + filled orders but crashed
+            # before saving the position, or when positions were opened externally.
+            tracked_token_ids = {pos.get("token_id", "") for pos in active.values()}
+            for rp in real_positions:
+                tid = str(rp.get("asset") or rp.get("token_id") or rp.get("tokenId") or "")
+                rp_size = float(rp.get("size") or rp.get("balance") or 0)
+                if not tid or rp_size < 4.5 or tid in tracked_token_ids:
+                    continue
+                # Orphaned position found — create a minimal tracking entry
+                rp_price = float(rp.get("avgPrice") or rp.get("avg_price") or rp.get("price") or 0)
+                rp_market = str(rp.get("market") or rp.get("condition_id") or rp.get("conditionId") or "")
+                rp_side = str(rp.get("outcome") or rp.get("side") or "YES")
+                if rp_price <= 0:
+                    rp_price = 0.50  # Fallback — we don't know the real entry price
+                synthetic_id = f"recovered_{tid[:16]}_{int(time.time())}"
+                active[synthetic_id] = {
+                    "market_id": rp_market or f"unknown_{tid[:12]}",
+                    "side": rp_side,
+                    "token_id": tid,
+                    "entry_price": rp_price,
+                    "entry_size": round(rp_size * rp_price, 4),
+                    "shares": rp_size,
+                    "tick_size": "0.01",
+                    "neg_risk": False,
+                    "entry_time": time.time(),
+                    "end_time": 0,
+                    "sl_order_id": "",
+                    "buy_filled": True,  # Already on-chain = already filled
+                    "tp_order_id": "",
+                    "shares_confirmed": True,
+                    "fill_confirmed_at": time.time() - 30,  # Skip settlement cooldown
+                }
+                logger.warning(
+                    f"[STARTUP] Recovered orphaned position: {rp_market or tid[:16]} "
+                    f"{rp_side} {rp_size:.2f} shares @ {rp_price:.4f} — now tracked for TP/SL"
+                )
         except Exception as e:
             logger.warning(f"[STARTUP] Position reconciliation failed (keeping all tracked): {e}")
 
@@ -543,6 +581,27 @@ class ArbitrageBot:
             buy_filled = pos.get("buy_filled", True)
             if not buy_filled:
                 filled_shares = self.executor.get_order_fills(order_id)
+
+                # ── CTF balance fallback: CLOB API sometimes returns size_matched=0
+                # even though tokens have been delivered to the wallet. Check on-chain
+                # balance directly to avoid missing fills and orphaning positions.
+                if filled_shares <= 0:
+                    try:
+                        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+                        _fb_params = BalanceAllowanceParams(
+                            asset_type=AssetType.CONDITIONAL, token_id=token_id
+                        )
+                        _fb_data = self.executor.client.get_balance_allowance(_fb_params)
+                        _fb_bal = float(_fb_data.get("balance", "0") or "0") / 1_000_000
+                        if _fb_bal >= 4.5:  # ~5 share CLOB minimum, allow small rounding
+                            logger.info(
+                                f"[FILL_FALLBACK] {market_id} CLOB API says 0 fills but "
+                                f"CTF balance={_fb_bal:.2f} shares — treating as filled"
+                            )
+                            filled_shares = _fb_bal
+                    except Exception as _fb_e:
+                        logger.debug(f"[FILL_FALLBACK] Balance check failed: {_fb_e}")
+
                 if filled_shares <= 0:
                     # Order not yet filled — check if it was cancelled without a fill
                     try:
