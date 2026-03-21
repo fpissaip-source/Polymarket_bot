@@ -83,7 +83,7 @@ STOIKOV_SIGMA_DEFAULT = 0.02  # Default variance estimate
 # Kelly model
 KELLY_FRACTION = 0.25         # Fractional Kelly (lambda) — used internally, capped by BET_SIZE_PCT
 KELLY_MAX_FRACTION = 0.02     # Hard cap: max 2% of bankroll per single trade
-BANKROLL = float(os.getenv("BANKROLL", "25.00"))  # Total capital in USD (live trading)
+BANKROLL = float(os.getenv("BANKROLL", "2.00"))  # Total capital in USD (live trading)
 DRY_RUN_BANKROLL = float(os.getenv("DRY_RUN_BANKROLL", "25.00"))  # Virtual capital for dry-run simulation
 
 # Fixed bet sizing (overrides Kelly when smaller)
