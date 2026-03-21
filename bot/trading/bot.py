@@ -62,6 +62,7 @@ from config import (
     MIN_BET_SIZE,
     MAX_OPEN_TRADES,
     MAX_TOTAL_EXPOSURE_PCT,
+    MAX_POSITION_HOLD_MINUTES,
 )
 
 TRADES_FILE = Path(__file__).parent.parent / "trades.json"
@@ -574,12 +575,14 @@ class ArbitrageBot:
             sl = SL_RATIO_LOW if is_low_price else SL_RATIO
 
             # Periodic position heartbeat (every 30 s visible in logs)
+            entry_time = pos.get("entry_time", now)
+            hold_minutes = (now - entry_time) / 60.0
             if int(now) % 30 == 0:
                 logger.info(
                     f"[POS] {market_id} {pos.get('side','')} "
                     f"entry={entry_price:.3f} now={current_price:.3f} "
                     f"pnl={pnl_ratio:+.1%} | {shares:.1f} shares | "
-                    f"TP={tp:.0%} SL={sl:.0%} | "
+                    f"TP={tp:.0%} SL={sl:.0%} held={hold_minutes:.1f}min | "
                     f"expires={f'{time_to_expiry:.0f}s' if time_to_expiry < 9e8 else 'unknown'}"
                 )
 
@@ -590,6 +593,8 @@ class ArbitrageBot:
                 reason = f"STOP_LOSS({pnl_ratio:+.1%})"
             elif 0 < time_to_expiry <= 90:
                 reason = f"PRE_EXPIRY({time_to_expiry:.0f}s left)"
+            elif hold_minutes >= MAX_POSITION_HOLD_MINUTES:
+                reason = f"MAX_HOLD({hold_minutes:.1f}min >= {MAX_POSITION_HOLD_MINUTES:.0f}min limit)"
 
             if reason:
                 logger.info(
