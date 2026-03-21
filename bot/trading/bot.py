@@ -146,6 +146,8 @@ class ArbitrageBot:
         self._last_adaptive_update = 0.0
         self._last_tp_sl_check = 0.0
         self._tick_count = 0
+        # Live position tracking for TP/SL: order_id → position dict
+        self._live_positions: dict[str, dict] = {}
         self.dry_run_tracker = DryRunTracker(virtual_bankroll=starting_bankroll)
         self._tier_base_lambda = self.kelly.lambda_fraction
         self._tier_base_edge = self._current_min_edge
@@ -403,56 +405,108 @@ class ArbitrageBot:
         return registered
 
     def _check_tp_sl(self, now: float):
-        if not self.dry_run:
-            return
-        open_entries = self.dry_run_tracker.get_open_entries()
-        if not open_entries:
+        # ── Dry-run mode: virtual P&L tracking ──────────────────────────
+        if self.dry_run:
+            open_entries = self.dry_run_tracker.get_open_entries()
+            if not open_entries:
+                return
+            for entry in open_entries:
+                market = self._markets.get(entry.market_id)
+                if not market:
+                    continue
+                try:
+                    if entry.side == "YES":
+                        data = self.data_client.get_book_data(market.token_id_yes)
+                    else:
+                        data = self.data_client.get_book_data(market.token_id_no)
+                    current_price = data["mid_price"]
+                    if current_price is None:
+                        continue
+                except Exception:
+                    continue
+                shares = entry.size / entry.exec_price if entry.exec_price > 0 else 0
+                current_value = shares * current_price
+                unrealized_pnl = current_value - entry.size
+                pnl_ratio = unrealized_pnl / entry.size if entry.size > 0 else 0
+                is_low_price = entry.exec_price < LOW_PRICE_THRESHOLD
+                tp = TP_RATIO_LOW if is_low_price else TP_RATIO
+                sl = SL_RATIO_LOW if is_low_price else SL_RATIO
+                if is_low_price:
+                    logger.info(
+                        f"[SL] ADAPTIVE: exec_price={entry.exec_price:.4f} < {LOW_PRICE_THRESHOLD} "
+                        f"→ using TP={tp:.0%}, SL={sl:.0%}"
+                    )
+                if pnl_ratio >= tp:
+                    self.dry_run_tracker.early_exit(
+                        entry.trade_id, current_price,
+                        f"TAKE_PROFIT({pnl_ratio:+.1%})"
+                    )
+                    self.kelly.bankroll = self.dry_run_tracker.virtual_bankroll
+                elif pnl_ratio <= -sl:
+                    self.dry_run_tracker.early_exit(
+                        entry.trade_id, current_price,
+                        f"STOP_LOSS({pnl_ratio:+.1%})"
+                    )
+                    self.kelly.bankroll = self.dry_run_tracker.virtual_bankroll
             return
 
-        for entry in open_entries:
-            market = self._markets.get(entry.market_id)
-            if not market:
-                continue
+        # ── Live mode: real order cancellation / sell ────────────────────
+        if not self._live_positions:
+            return
+        to_remove = []
+        for order_id, pos in list(self._live_positions.items()):
+            token_id = pos["token_id"]
+            entry_price = pos["entry_price"]
+            entry_size = pos["entry_size"]   # USD spent
+            tick_size = pos.get("tick_size", "0.01")
+            neg_risk = pos.get("neg_risk", False)
 
             try:
-                if entry.side == "YES":
-                    data = self.data_client.get_book_data(market.token_id_yes)
-                else:
-                    data = self.data_client.get_book_data(market.token_id_no)
-                current_price = data["mid_price"]
+                data = self.data_client.get_book_data(token_id)
+                current_price = data.get("mid_price") or data.get("last_price")
                 if current_price is None:
                     continue
             except Exception:
                 continue
 
-            shares = entry.size / entry.exec_price if entry.exec_price > 0 else 0
+            shares = entry_size / entry_price if entry_price > 0 else 0
             current_value = shares * current_price
-            unrealized_pnl = current_value - entry.size
-            pnl_ratio = unrealized_pnl / entry.size if entry.size > 0 else 0
+            pnl_ratio = (current_value - entry_size) / entry_size if entry_size > 0 else 0
 
-            # Adaptive TP/SL: tighter thresholds for low-price positions
-            # (e.g. YES at 0.19 can drop 38% in one tick — standard 20% SL is too loose)
-            is_low_price = entry.exec_price < LOW_PRICE_THRESHOLD
+            is_low_price = entry_price < LOW_PRICE_THRESHOLD
             tp = TP_RATIO_LOW if is_low_price else TP_RATIO
             sl = SL_RATIO_LOW if is_low_price else SL_RATIO
-            if is_low_price:
-                logger.info(
-                    f"[SL] ADAPTIVE: exec_price={entry.exec_price:.4f} < {LOW_PRICE_THRESHOLD} "
-                    f"→ using TP={tp:.0%}, SL={sl:.0%}"
-                )
 
+            reason = None
             if pnl_ratio >= tp:
-                self.dry_run_tracker.early_exit(
-                    entry.trade_id, current_price,
-                    f"TAKE_PROFIT({pnl_ratio:+.1%})"
-                )
-                self.kelly.bankroll = self.dry_run_tracker.virtual_bankroll
+                reason = f"TAKE_PROFIT({pnl_ratio:+.1%})"
             elif pnl_ratio <= -sl:
-                self.dry_run_tracker.early_exit(
-                    entry.trade_id, current_price,
-                    f"STOP_LOSS({pnl_ratio:+.1%})"
+                reason = f"STOP_LOSS({pnl_ratio:+.1%})"
+
+            if reason:
+                logger.info(
+                    f"[{reason}] {pos['market_id']} order={order_id[:8]} "
+                    f"entry={entry_price:.4f} current={current_price:.4f} pnl={pnl_ratio:+.1%}"
                 )
-                self.kelly.bankroll = self.dry_run_tracker.virtual_bankroll
+                # Try cancel first (works if order is still open / unfilled)
+                cancelled = self.executor.cancel_order(order_id)
+                if not cancelled:
+                    # Order already filled — place a limit SELL to close the position
+                    sell_price = round(current_price, 4)
+                    self.executor.place_limit_order(
+                        token_id, "SELL", sell_price, entry_size,
+                        tick_size=tick_size, neg_risk=neg_risk,
+                    )
+                    logger.info(
+                        f"[{reason}] Placed SELL {shares:.2f} shares @ {sell_price:.4f} "
+                        f"to close position"
+                    )
+                to_remove.append(order_id)
+                self.kelly.release(entry_size)
+                self._save_bankroll()
+
+        for oid in to_remove:
+            self._live_positions.pop(oid, None)
 
     def _refresh_markets(self, now: float):
         """
@@ -1004,7 +1058,11 @@ class ArbitrageBot:
                 logger.info(f"Order accepted: {order_id}")
                 self.kelly.allocate(size)
                 self._save_bankroll()
-                self._record_trade(opp.market_id, side, size, price, order_id)
+                self._record_trade(
+                    opp.market_id, side, size, price, order_id,
+                    token_id=token_id,
+                    tick_size=market.tick_size, neg_risk=market.neg_risk,
+                )
             else:
                 logger.warning(f"Order rejected for {opp.market_id}")
 
@@ -1035,6 +1093,10 @@ class ArbitrageBot:
             logger.info(f"Both legs accepted: YES={yes_id}, NO={no_id}")
             self.kelly.allocate(size)
             self._save_bankroll()
+            self._record_trade(market.market_id, "YES", half, yes_price, yes_id,
+                               token_id=market.token_id_yes, tick_size=ts, neg_risk=nr)
+            self._record_trade(market.market_id, "NO", half, no_price, no_id,
+                               token_id=market.token_id_no, tick_size=ts, neg_risk=nr)
         elif yes_id or no_id:
             logger.warning(
                 f"Partial arb fill for {market.market_id}: "
@@ -1042,6 +1104,12 @@ class ArbitrageBot:
             )
             self.kelly.allocate(half)
             self._save_bankroll()
+            if yes_id:
+                self._record_trade(market.market_id, "YES", half, yes_price, yes_id,
+                                   token_id=market.token_id_yes, tick_size=ts, neg_risk=nr)
+            if no_id:
+                self._record_trade(market.market_id, "NO", half, no_price, no_id,
+                                   token_id=market.token_id_no, tick_size=ts, neg_risk=nr)
         else:
             logger.warning(f"Both legs rejected for {market.market_id}")
 
@@ -1059,8 +1127,27 @@ class ArbitrageBot:
             return 0.0
         return min(1.0, remaining / window)
 
-    def _record_trade(self, market_id: str, side: str, size: float, price: float, order_id: str):
-        """Append a trade record to trades.json for the dashboard."""
+    def _record_trade(self, market_id: str, side: str, size: float, price: float,
+                      order_id: str, token_id: str = "",
+                      tick_size: str = "0.01", neg_risk: bool = False):
+        """Append a trade record to trades.json and register live position for TP/SL."""
+        # Register live position for TP/SL monitoring
+        if not self.dry_run and order_id and token_id:
+            self._live_positions[order_id] = {
+                "market_id": market_id,
+                "side": side,
+                "token_id": token_id,
+                "entry_price": price,
+                "entry_size": size,
+                "tick_size": tick_size,
+                "neg_risk": neg_risk,
+                "entry_time": time.time(),
+            }
+            logger.info(
+                f"[POSITION] Tracking live position: {market_id} {side} "
+                f"${size:.2f} @ {price:.4f} | TP={TP_RATIO:.0%} SL={SL_RATIO:.0%}"
+            )
+
         try:
             trades = []
             if TRADES_FILE.exists():
@@ -1072,9 +1159,8 @@ class ArbitrageBot:
                 "size": round(size, 4),
                 "price": round(price, 4),
                 "order_id": order_id,
-                "pnl": 0.0,  # Updated when market resolves
+                "pnl": 0.0,
             })
-            # Keep last 500 trades
             TRADES_FILE.write_text(json.dumps(trades[-500:]))
         except Exception as e:
             logger.warning(f"Could not record trade: {e}")
