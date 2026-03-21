@@ -312,13 +312,6 @@ class ArbitrageBot:
                     continue
 
                 gamma_price_yes, gamma_price_no = extract_gamma_prices(m)
-                if gamma_price_yes is not None:
-                    _in_spot = (
-                        (SWEET_SPOT_LOW_MIN <= gamma_price_yes <= SWEET_SPOT_LOW_MAX) or
-                        (SWEET_SPOT_HIGH_MIN <= gamma_price_yes <= SWEET_SPOT_HIGH_MAX)
-                    )
-                    if not _in_spot:
-                        continue
 
                 self.register_market(
                     market_id=market_id,
@@ -571,13 +564,6 @@ class ArbitrageBot:
                     continue
 
                 gamma_price_yes, gamma_price_no = extract_gamma_prices(m)
-                if gamma_price_yes is not None:
-                    _in_spot = (
-                        (SWEET_SPOT_LOW_MIN <= gamma_price_yes <= SWEET_SPOT_LOW_MAX) or
-                        (SWEET_SPOT_HIGH_MIN <= gamma_price_yes <= SWEET_SPOT_HIGH_MAX)
-                    )
-                    if not _in_spot:
-                        continue
 
                 if best_market is None or (end_time > 0 and end_time > best_end):
                     best_market = (market_id, yes_token, no_token, end_time,
