@@ -128,6 +128,25 @@ class ArbitrageBot:
         self.mc = MonteCarloSimulator()
         self.executor = None if dry_run else OrderExecutor()
 
+        if not dry_run and self.executor:
+            # Cancel leftover GTC orders from previous runs before anything else
+            n_cancelled = self.executor.cancel_all_open_orders()
+            # Sync bankroll to actual CLOB available balance
+            actual_balance = self.executor.get_available_balance_usd()
+            if actual_balance > 0:
+                effective = min(actual_balance, BANKROLL)
+                logger.info(
+                    f"[STARTUP] CLOB balance=${actual_balance:.2f} | "
+                    f"config BANKROLL=${BANKROLL:.2f} → using ${effective:.2f}"
+                )
+                self.kelly.bankroll = effective
+                starting_bankroll = effective
+            else:
+                logger.warning(
+                    f"[STARTUP] CLOB balance=$0 after cancelling {n_cancelled} orders. "
+                    f"Check your proxy wallet has USDC.e."
+                )
+
         self.wallet_tracker = WalletTracker()
         self._last_wallet_update = 0.0
         self.event_sentiment = EventSentimentAnalyzer()

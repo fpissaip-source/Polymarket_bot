@@ -407,3 +407,39 @@ class OrderExecutor:
         except Exception as e:
             logger.error(f"Failed to fetch open orders: {e}")
             return []
+
+    def cancel_all_open_orders(self) -> int:
+        """Cancel all open GTC orders on startup. Returns number cancelled."""
+        try:
+            orders = self.get_open_orders()
+            if not orders:
+                logger.info("[STARTUP] No open orders to cancel")
+                return 0
+            logger.info(f"[STARTUP] Found {len(orders)} open order(s) — cancelling all to free balance")
+            cancelled = 0
+            for o in orders:
+                oid = o.get("id") or o.get("orderID") or o.get("order_id")
+                if oid:
+                    try:
+                        self.client.cancel(oid)
+                        logger.info(f"[STARTUP] Cancelled order {oid[:12]}...")
+                        cancelled += 1
+                    except Exception as e:
+                        logger.warning(f"[STARTUP] Could not cancel {oid}: {e}")
+            logger.info(f"[STARTUP] Cancelled {cancelled}/{len(orders)} orders. Balance now freed.")
+            return cancelled
+        except Exception as e:
+            logger.error(f"[STARTUP] cancel_all_open_orders failed: {e}")
+            return 0
+
+    def get_available_balance_usd(self) -> float:
+        """Return USDC.e balance available for new orders (from CLOB API)."""
+        try:
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            bal = self.client.get_balance_allowance(params)
+            if bal:
+                raw = bal.get("balance", "0") or "0"
+                return float(raw) / 1_000_000
+        except Exception as e:
+            logger.debug(f"get_available_balance_usd: {e}")
+        return 0.0
