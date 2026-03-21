@@ -240,16 +240,15 @@ class OrderExecutor:
         logger.info(f"[ALLOWANCE] Approving exchange contracts for funder={funder} sig_type={sig}")
 
         # Approve USDC.e (collateral) → Exchange contract (required for BUY orders)
-        for asset_type, label in [
-            (AssetType.COLLATERAL, "COLLATERAL/USDC.e"),
-            (AssetType.CONDITIONAL, "CONDITIONAL/CTF"),
-        ]:
-            try:
-                params = BalanceAllowanceParams(asset_type=asset_type)
-                self.client.update_balance_allowance(params)
-                logger.info(f"[ALLOWANCE] ✓ Approved {label}")
-            except Exception as e:
-                logger.warning(f"[ALLOWANCE] Could not approve {label}: {e}")
+        # NOTE: CONDITIONAL/CTF (ERC1155) allowance MUST be set per-token-id before each sell.
+        # Do NOT call update_balance_allowance(CONDITIONAL) here — it fails with -1 token_id.
+        # Per-token allowance is set in close_position() and place_sl_sell_order() instead.
+        try:
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            self.client.update_balance_allowance(params)
+            logger.info("[ALLOWANCE] ✓ Approved COLLATERAL/USDC.e")
+        except Exception as e:
+            logger.warning(f"[ALLOWANCE] Could not approve COLLATERAL/USDC.e: {e}")
 
         # Check current USDC.e balance
         try:
@@ -396,6 +395,17 @@ class OrderExecutor:
         return self.place_order(token_id, side, price, size, order_type="GTC",
                                 tick_size=tick_size, neg_risk=neg_risk)
 
+    def _approve_conditional_token(self, token_id: str) -> None:
+        """Set ERC1155 CTF allowance for a specific token_id before selling.
+        Must be called before every SELL — CONDITIONAL allowances are per-token-id.
+        """
+        try:
+            params = BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
+            self.client.update_balance_allowance(params)
+            logger.info(f"[ALLOWANCE] ✓ Approved CONDITIONAL token {token_id[:16]}...")
+        except Exception as e:
+            logger.warning(f"[ALLOWANCE] Could not approve CONDITIONAL token {token_id[:16]}...: {e}")
+
     def close_position(self, token_id: str, shares: float, price: float,
                        tick_size: str = "0.01", neg_risk: bool = False) -> str | None:
         """
@@ -410,6 +420,9 @@ class OrderExecutor:
         GTC fallback is intentionally NOT used: a resting sell order would appear
         as "success" but might never fill, causing undetected open exposure.
         """
+        # Set ERC1155 allowance for this specific token BEFORE selling
+        self._approve_conditional_token(token_id)
+
         try:
             real_tick = self._fetch_tick_size(token_id)
             real_neg = self._fetch_neg_risk(token_id)
@@ -510,6 +523,10 @@ class OrderExecutor:
                 f"position will be managed by bot TP/SL loop only"
             )
             return None
+
+        # Set ERC1155 allowance for this specific token BEFORE placing the GTC sell bracket
+        self._approve_conditional_token(token_id)
+
         size_usd = shares * sl_price
         logger.info(
             f"[SL_ORDER] Placing GTC SELL bracket: {shares:.2f} shares @ {sl_price:.4f} "
