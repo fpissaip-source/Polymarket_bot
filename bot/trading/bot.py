@@ -597,6 +597,54 @@ class ArbitrageBot:
                     f"entry={entry_price:.4f} now={current_price:.4f} pnl={pnl_ratio:+.1%} "
                     f"| {shares:.2f} shares | value=${current_value:.2f}"
                 )
+
+                # ── Handle SL bracket order ─────────────────────────────────────────
+                sl_order_id = pos.get("sl_order_id", "")
+                sl_already_filled = False
+                if sl_order_id:
+                    sl_cancel_status = self.executor.cancel_order(sl_order_id)
+                    if "STOP_LOSS" in reason:
+                        if sl_cancel_status == "ALREADY_DONE":
+                            # CLOB already auto-executed the bracket sell — position is gone
+                            logger.info(
+                                f"[BRACKET_SL] CLOB already auto-liquidated {market_id} "
+                                f"via bracket order {sl_order_id[:12]} — skipping manual sell"
+                            )
+                            sl_already_filled = True
+                        elif sl_cancel_status == "CANCELED":
+                            logger.info(
+                                f"[BRACKET_SL] Bracket order {sl_order_id[:12]} cancelled — "
+                                f"proceeding with manual SL sell"
+                            )
+                        else:
+                            logger.warning(
+                                f"[BRACKET_SL] Cancel API error for {sl_order_id[:12]} — "
+                                f"proceeding with manual SL sell anyway"
+                            )
+                    else:
+                        # TP or PRE_EXPIRY: cancel bracket so it doesn't interfere with TP sell
+                        if sl_cancel_status == "ALREADY_DONE":
+                            logger.warning(
+                                f"[BRACKET_TP] Bracket SL {sl_order_id[:12]} already filled "
+                                f"(price fell to SL before TP triggered) — position may already be sold"
+                            )
+                        else:
+                            logger.info(
+                                f"[BRACKET_TP] Cancelled SL bracket {sl_order_id[:12]} before TP sell"
+                            )
+
+                if sl_already_filled:
+                    to_remove.append(order_id)
+                    sl_ratio_val = SL_RATIO_LOW if entry_price < LOW_PRICE_THRESHOLD else SL_RATIO
+                    recovered = shares * (entry_price * (1.0 - sl_ratio_val))
+                    logger.info(
+                        f"[BRACKET_SL] Position closed by CLOB bracket: "
+                        f"recovered=${recovered:.2f} (loss=${entry_size - recovered:.2f})"
+                    )
+                    self.kelly.release(entry_size)
+                    self._save_bankroll()
+                    continue
+
                 cancel_status = self.executor.cancel_order(order_id)
                 if cancel_status == "API_ERROR":
                     logger.warning(f"[SELL] Cancel API error — proceeding with sell anyway using estimated shares")
@@ -1297,11 +1345,33 @@ class ArbitrageBot:
                 logger.info(f"Order accepted: {order_id}")
                 self.kelly.allocate(size)
                 self._save_bankroll()
+
+                # Immediately place a GTC SELL bracket order at SL price
+                # so the CLOB auto-liquidates even if the bot crashes
+                sl_ratio = SL_RATIO_LOW if price < LOW_PRICE_THRESHOLD else SL_RATIO
+                sl_price = round(price * (1.0 - sl_ratio), 4)
+                shares = size / price if price > 0 else 0.0
+                sl_order_id = ""
+                if not self.dry_run and shares >= 1.0:
+                    sl_order_id = self.executor.place_sl_sell_order(
+                        token_id, shares, sl_price,
+                        tick_size=market.tick_size, neg_risk=market.neg_risk,
+                    ) or ""
+                    if sl_order_id:
+                        logger.info(
+                            f"[BRACKET] SL sell order placed: {sl_order_id[:12]} | "
+                            f"{shares:.2f} shares @ {sl_price:.4f} (SL={sl_ratio:.0%})"
+                        )
+                    else:
+                        logger.warning(
+                            f"[BRACKET] SL sell order FAILED — manual TP/SL monitoring only"
+                        )
+
                 self._record_trade(
                     opp.market_id, side, size, price, order_id,
                     token_id=token_id,
                     tick_size=market.tick_size, neg_risk=market.neg_risk,
-                    end_time=market.end_time,
+                    end_time=market.end_time, sl_order_id=sl_order_id,
                 )
             else:
                 logger.warning(f"Order rejected for {opp.market_id}")
@@ -1374,7 +1444,7 @@ class ArbitrageBot:
     def _record_trade(self, market_id: str, side: str, size: float, price: float,
                       order_id: str, token_id: str = "",
                       tick_size: str = "0.01", neg_risk: bool = False,
-                      end_time: float = 0.0):
+                      end_time: float = 0.0, sl_order_id: str = ""):
         """Append a trade record to trades.json and register live position for TP/SL."""
         # Register live position for TP/SL monitoring
         if not self.dry_run and order_id and token_id:
@@ -1389,13 +1459,15 @@ class ArbitrageBot:
                 "tick_size": tick_size,
                 "neg_risk": neg_risk,
                 "entry_time": time.time(),
-                "end_time": end_time,  # Market expiry timestamp
+                "end_time": end_time,
+                "sl_order_id": sl_order_id,  # GTC sell bracket order (auto-liquidation)
             }
             self._save_live_positions()
             logger.info(
                 f"[POSITION] Tracking live position: {market_id} {side} "
                 f"${size:.2f} @ {price:.4f} shares={shares:.2f} | "
                 f"TP={TP_RATIO:.0%} SL={SL_RATIO:.0%} | "
+                f"SL_order={'set ✓' if sl_order_id else 'NONE — manual only'} | "
                 f"expires={time.strftime('%H:%M:%S', time.localtime(end_time)) if end_time else 'unknown'}"
             )
 

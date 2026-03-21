@@ -44,6 +44,7 @@ from config import (
     POLYMARKET_API_PASSPHRASE,
     POLYMARKET_PROXY_ADDRESS as _PROXY_ADDRESS_CFG,
     CHAIN_ID,
+    MIN_BET_SIZE,
 )
 
 import os
@@ -323,13 +324,14 @@ class OrderExecutor:
         neg_risk = real_neg
         decimals = TICK_DECIMALS[tick_size]
 
-        if size < 5.0:
-            logger.warning(f"Order size ${size:.2f} below $5 minimum — skipping")
+        min_size = max(MIN_BET_SIZE, 1.0)
+        if size < min_size - 0.01:
+            logger.warning(f"Order size ${size:.2f} below ${min_size:.2f} minimum — skipping")
             return None
 
         shares = size / price if price > 0 else 0
-        if shares < 5.0:
-            logger.warning(f"Order too small: ${size:.2f} / {price:.4f} = {shares:.2f} shares (min 5)")
+        if shares < 1.0:
+            logger.warning(f"Order too small: ${size:.2f} / {price:.4f} = {shares:.4f} shares (min 1)")
             return None
 
         rounded_price = round(price, decimals)
@@ -456,6 +458,25 @@ class OrderExecutor:
     ) -> str | None:
         return self.place_order(token_id, side, price, size, order_type="GTD",
                                 expiration=expiration, tick_size=tick_size, neg_risk=neg_risk)
+
+    def place_sl_sell_order(
+        self, token_id: str, shares: float, sl_price: float,
+        tick_size: str = "0.01", neg_risk: bool = False,
+    ) -> str | None:
+        """Place a GTC SELL limit order at the stop-loss price.
+        This acts as an automatic bracket order — the CLOB executes it even if the bot crashes.
+        sl_price: the price at which to sell (stop-loss level)
+        shares:   number of shares to sell
+        """
+        size_usd = shares * sl_price
+        logger.info(
+            f"[SL_ORDER] Placing GTC SELL bracket: {shares:.2f} shares @ {sl_price:.4f} "
+            f"(size=${size_usd:.2f})"
+        )
+        return self.place_order(
+            token_id, "SELL", sl_price, size_usd,
+            order_type="GTC", tick_size=tick_size, neg_risk=neg_risk,
+        )
 
     def cancel_order(self, order_id: str) -> str:
         """Cancel order. Returns status string:
