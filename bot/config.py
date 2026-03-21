@@ -37,7 +37,7 @@ TAKER_FEE = 0.01              # Polymarket taker fee per side (1%)
 TAKER_SLIPPAGE = 0.005        # Slippage on aggressive fills
 TAKER_EXEC_RISK = 0.005       # Incomplete execution risk
 TOTAL_COST_TAKER = TAKER_FEE + TAKER_SLIPPAGE + TAKER_EXEC_RISK   # ~2%
-MIN_EDGE_TAKER = 0.020        # 2% edge required for aggressive orders
+MIN_EDGE_TAKER = 0.50         # 50% edge required — effectively disables taker/FOK orders
 
 # Legacy aliases (used by EdgeModel default)
 MIN_EDGE = MIN_EDGE_TAKER
@@ -59,6 +59,22 @@ RELATED_MARKETS = [
     ("ETH_5m", "ETH_15m"),
     ("SOL_5m", "SOL_15m"),
 ]
+
+# Price sweet-spot filter — only trade where risk/reward is good for scalping
+# Target: one side (YES or NO) sits at 75–85c (clear favourite, still room to run)
+# p_yes in [0.75, 0.85]  →  buy YES
+# p_yes in [0.15, 0.25]  →  buy NO  (because p_no = 1 - p_yes is in [0.75, 0.85])
+SWEET_SPOT_HIGH_MIN = 0.75    # YES-side sweet zone: lower bound
+SWEET_SPOT_HIGH_MAX = 0.85    # YES-side sweet zone: upper bound
+SWEET_SPOT_LOW_MIN  = 1.0 - SWEET_SPOT_HIGH_MAX   # = 0.15  (NO-side mirror)
+SWEET_SPOT_LOW_MAX  = 1.0 - SWEET_SPOT_HIGH_MIN   # = 0.25  (NO-side mirror)
+
+# Kept for hard boundary checks (price sanity, not sweet-spot logic)
+PRICE_FLOOR   = SWEET_SPOT_LOW_MIN    # = 0.15
+PRICE_CEILING = SWEET_SPOT_HIGH_MAX   # = 0.85
+
+# Time filter — no new positions in last N seconds before expiry
+MIN_SECONDS_BEFORE_EXPIRY = 60  # 60s buffer avoids last-minute coinflip volatility
 
 # Stoikov model
 STOIKOV_GAMMA = 0.1           # Risk aversion coefficient

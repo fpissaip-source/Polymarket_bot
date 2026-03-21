@@ -55,6 +55,11 @@ from config import (
     TP_RATIO,
     SL_RATIO,
     TP_SL_CHECK_INTERVAL,
+    SWEET_SPOT_LOW_MIN,
+    SWEET_SPOT_LOW_MAX,
+    SWEET_SPOT_HIGH_MIN,
+    SWEET_SPOT_HIGH_MAX,
+    MIN_SECONDS_BEFORE_EXPIRY,
 )
 
 TRADES_FILE = Path(__file__).parent.parent / "trades.json"
@@ -143,7 +148,7 @@ class ArbitrageBot:
         self._tier_base_lambda = self.kelly.lambda_fraction
         self._tier_base_edge = self._current_min_edge
         self._MARKET_REFRESH_INTERVAL = 30
-        self._MARKET_WINDOW_MIN = 30
+        self._MARKET_WINDOW_MIN = MIN_SECONDS_BEFORE_EXPIRY
         self._MARKET_WINDOW_MAX = 330
 
         for m1, m2 in RELATED_MARKETS:
@@ -304,8 +309,13 @@ class ArbitrageBot:
                     continue
 
                 gamma_price_yes, gamma_price_no = extract_gamma_prices(m)
-                if gamma_price_yes is not None and not (0.05 <= gamma_price_yes <= 0.95):
-                    continue
+                if gamma_price_yes is not None:
+                    _in_spot = (
+                        (SWEET_SPOT_LOW_MIN <= gamma_price_yes <= SWEET_SPOT_LOW_MAX) or
+                        (SWEET_SPOT_HIGH_MIN <= gamma_price_yes <= SWEET_SPOT_HIGH_MAX)
+                    )
+                    if not _in_spot:
+                        continue
 
                 self.register_market(
                     market_id=market_id,
@@ -547,8 +557,13 @@ class ArbitrageBot:
                     continue
 
                 gamma_price_yes, gamma_price_no = extract_gamma_prices(m)
-                if gamma_price_yes is not None and not (0.05 <= gamma_price_yes <= 0.95):
-                    continue
+                if gamma_price_yes is not None:
+                    _in_spot = (
+                        (SWEET_SPOT_LOW_MIN <= gamma_price_yes <= SWEET_SPOT_LOW_MAX) or
+                        (SWEET_SPOT_HIGH_MIN <= gamma_price_yes <= SWEET_SPOT_HIGH_MAX)
+                    )
+                    if not _in_spot:
+                        continue
 
                 if best_market is None or (end_time > 0 and end_time > best_end):
                     best_market = (market_id, yes_token, no_token, end_time,
@@ -653,8 +668,14 @@ class ArbitrageBot:
             if p_yes is None or p_no is None:
                 market_stats.append(f"{state.asset}({state.timeframe}):NO_DATA")
                 continue
-            if p_yes > 0.95 or p_yes < 0.05:
-                market_stats.append(f"{state.asset}({state.timeframe}):RESOLVED(p={p_yes:.2f})")
+            in_sweet_spot = (
+                (SWEET_SPOT_LOW_MIN <= p_yes <= SWEET_SPOT_LOW_MAX) or
+                (SWEET_SPOT_HIGH_MIN <= p_yes <= SWEET_SPOT_HIGH_MAX)
+            )
+            if not in_sweet_spot:
+                market_stats.append(
+                    f"{state.asset}({state.timeframe}):NO_SWEET_SPOT(p={p_yes:.2f})"
+                )
                 continue
 
             ob_imbalance = yes_data["imbalance"] or 0.0
@@ -872,6 +893,16 @@ class ArbitrageBot:
             is_passive = opp.edge_result.is_passive
             exec_type = "GTC/MAKER" if is_passive else "FOK/TAKER"
 
+            # Realistic maker entry price for dry-run:
+            # YES trades fill at bid (below mid); NO trades fill at 1 - ask (below mid on NO side)
+            if side == "NO":
+                exec_price = round(1.0 - opp.stoikov_quote.ask, 6)
+            else:
+                exec_price = round(opp.stoikov_quote.bid, 6)
+            # Use true market mid (last observed p_yes/p_no) for the log comparison
+            true_mid = market.last_price if side != "NO" else market.last_price_no
+            spread_shown = round(abs(true_mid - exec_price), 6)
+
             if not self.dry_run:
                 gas_ok, gas_reason = self.gas_optimizer.should_trade(
                     edge=opp.edge_result.ev_net,
@@ -887,6 +918,10 @@ class ArbitrageBot:
                     f"[DRY RUN] {opp.market_id}: {side} ${size:.2f} @ {price:.4f} "
                     f"| EV={opp.edge_result.ev_net:.4f} | Kelly f={opp.kelly_result.f_kelly:.4f} "
                     f"| exec={exec_type}"
+                )
+                logger.info(
+                    f"[MAKER] entry={exec_price:.4f} vs mid={true_mid:.4f} "
+                    f"(spread={spread_shown:.4f})"
                 )
                 record_side = side if side != "BOTH" else "YES"
                 window_start = ""
@@ -905,7 +940,7 @@ class ArbitrageBot:
                     p=market.last_price,
                     edge=opp.edge_result.ev_net,
                     size=size,
-                    exec_price=price,
+                    exec_price=exec_price,
                     question=market.question,
                     timeframe=market.timeframe,
                     window_start=window_start,
