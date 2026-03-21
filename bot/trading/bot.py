@@ -453,65 +453,10 @@ class ArbitrageBot:
 
         logger.info(f"Auto-discovery complete: {registered} 5-min crypto markets registered")
 
-        event_count = self._discover_event_markets(gamma)
-        logger.info(f"Event markets discovered: {event_count}")
+        # Event market discovery DISABLED — bot trades 5-min crypto only
+        logger.info("Event market discovery skipped (5-min crypto mode only)")
 
         self._last_market_refresh = time.time()
-        return registered + event_count
-
-    def _discover_event_markets(self, gamma: GammaClient) -> int:
-        registered = 0
-        try:
-            event_markets = gamma.discover_event_markets(
-                limit=50, exclude_assets=POLYMARKET_ASSETS,
-            )
-            for m in event_markets:
-                question = m.get("question", "")
-                yes_token, no_token = extract_clob_tokens(m)
-                if not yes_token or not no_token:
-                    continue
-
-                market_id = m.get("conditionId") or m.get("id", "")
-                if not market_id or market_id in self._markets:
-                    continue
-
-                gamma_price_yes, gamma_price_no = extract_gamma_prices(m)
-                if gamma_price_yes is not None and not (0.10 <= gamma_price_yes <= 0.90):
-                    continue
-
-                import datetime
-                end_time = 0.0
-                end_date = (m.get("endDate") or m.get("end_date_iso") or
-                            m.get("closeTime") or m.get("expirationTime"))
-                if end_date:
-                    try:
-                        dt = datetime.datetime.fromisoformat(str(end_date).replace("Z", "+00:00"))
-                        end_time = dt.timestamp()
-                    except Exception:
-                        pass
-
-                state = MarketState(
-                    market_id=market_id,
-                    token_id_yes=yes_token,
-                    token_id_no=no_token,
-                    asset="EVENT",
-                    timeframe="event",
-                    bayesian=BayesianModel(market_id),
-                    stoikov=StoikovModel(),
-                    question=question,
-                    is_event=True,
-                    gamma_price_yes=gamma_price_yes,
-                    gamma_price_no=gamma_price_no,
-                    end_time=end_time,
-                    condition_id=str(market_id),
-                )
-                self._markets[market_id] = state
-                logger.info(f"Event market registered: {question[:60]}")
-                registered += 1
-                if registered >= 5:
-                    break
-        except Exception as e:
-            logger.warning(f"Event market discovery failed: {e}")
         return registered
 
     def _check_tp_sl(self, now: float):
