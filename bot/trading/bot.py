@@ -707,22 +707,30 @@ class ArbitrageBot:
                         import threading
                         def _place_tp_bracket(executor, tok_id, n_shares, t_price,
                                               t_size, n_risk, pos_ref, mkt_id):
-                            time.sleep(15)  # Wait for CTF token settlement
-                            try:
-                                from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
-                                _cp = BalanceAllowanceParams(
-                                    asset_type=AssetType.CONDITIONAL, token_id=tok_id
-                                )
-                                _cd = executor.client.get_balance_allowance(_cp)
-                                _cb = float(_cd.get("balance", "0") or "0") / 1_000_000
-                                if _cb < n_shares * 0.5:
-                                    logger.warning(
-                                        f"[BRACKET] CTF balance={_cb:.2f} < {n_shares:.2f} "
-                                        f"— waiting 15s more"
+                            # Wait for CTF token settlement — loop until balance arrives
+                            # (Polygon settlement can take 15–60s depending on congestion)
+                            time.sleep(15)
+                            for _bal_attempt in range(6):  # up to ~75s total wait
+                                try:
+                                    from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+                                    _cp = BalanceAllowanceParams(
+                                        asset_type=AssetType.CONDITIONAL, token_id=tok_id
                                     )
-                                    time.sleep(15)
-                            except Exception:
-                                pass
+                                    _cd = executor.client.get_balance_allowance(_cp)
+                                    _cb = float(_cd.get("balance", "0") or "0") / 1_000_000
+                                    if _cb >= n_shares * 0.5:
+                                        logger.info(
+                                            f"[BRACKET] CTF balance={_cb:.4f} ≥ {n_shares:.2f} "
+                                            f"— proceeding with TP bracket"
+                                        )
+                                        break
+                                    logger.warning(
+                                        f"[BRACKET] CTF balance={_cb:.4f} < {n_shares:.2f} "
+                                        f"— waiting 10s more (attempt {_bal_attempt+1}/6)"
+                                    )
+                                except Exception:
+                                    pass
+                                time.sleep(10)
                             tp_oid = None
                             for attempt in range(3):
                                 tp_oid = executor.place_tp_sell_order(
@@ -732,6 +740,10 @@ class ArbitrageBot:
                                 if tp_oid:
                                     break
                                 if attempt < 2:
+                                    logger.warning(
+                                        f"[BRACKET] TP attempt {attempt+1}/3 failed — "
+                                        f"retrying in {10*(attempt+1)}s"
+                                    )
                                     time.sleep(10 * (attempt + 1))
                             if tp_oid:
                                 pos_ref["tp_order_id"] = tp_oid
@@ -750,6 +762,9 @@ class ArbitrageBot:
                         ).start()
                         logger.info(f"[BRACKET] TP placement started in background thread")
                 self._save_live_positions()
+                # Skip TP/SL price check this tick — tokens just arrived, price data may
+                # be stale. Next tick will evaluate the position with fresh book data.
+                continue
 
             try:
                 data = self.data_client.get_book_data(token_id)
@@ -1107,12 +1122,12 @@ class ArbitrageBot:
         while self._running:
             try:
                 self._tick()
+                time.sleep(POLL_INTERVAL_SECONDS)
             except KeyboardInterrupt:
                 logger.info("Shutting down...")
                 self._running = False
             except Exception as e:
                 logger.error(f"Tick error: {e}", exc_info=True)
-            time.sleep(POLL_INTERVAL_SECONDS)
 
     def _tick(self):
         now = time.time()
