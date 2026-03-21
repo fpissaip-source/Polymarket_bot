@@ -670,12 +670,6 @@ class ArbitrageBot:
                     sl_price = round(entry_price * (1.0 - sl_ratio), 4)
                     tp_price = round(entry_price * (1.0 + tp_ratio), 4)
 
-                    # Wait for CTF token settlement before placing TP bracket.
-                    # Polygon tx finality can take 10-15s; 5s was too short causing
-                    # "not enough balance/allowance" on the SELL order.
-                    logger.info(f"[SETTLEMENT] Waiting 15s for CTF token settlement...")
-                    time.sleep(15)
-
                     # NOTE: SL brackets are NOT placed as GTC limit orders.
                     # On the CLOB, a GTC SELL at SL_PRICE means "sell at any price >= SL_PRICE".
                     # Since SL_PRICE < current market, it would fill IMMEDIATELY (selling at a loss).
@@ -684,46 +678,55 @@ class ArbitrageBot:
                         f"[BRACKET] SL={sl_price:.4f} ({sl_ratio:.0%}) monitored by bot price loop"
                     )
 
-                    # TP bracket — GTC SELL at TP price. Verify CTF token balance before
-                    # placing to avoid "not enough balance/allowance" errors.
+                    # TP bracket placed in background thread — avoids blocking SL monitoring.
+                    # time.sleep(15+) inside TP placement was preventing SL from firing during
+                    # the settlement wait window on fast-moving 5-minute markets.
                     if not pos.get("tp_order_id"):
-                        # Verify wallet actually holds the CTF tokens before placing SELL
-                        try:
-                            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
-                            _ctf_params = BalanceAllowanceParams(
-                                asset_type=AssetType.CONDITIONAL, token_id=token_id
-                            )
-                            _ctf_bal_data = self.executor.client.get_balance_allowance(_ctf_params)
-                            _ctf_raw = float(_ctf_bal_data.get("balance", "0") or "0") / 1_000_000
-                            if _ctf_raw < filled_shares * 0.5:
-                                logger.warning(
-                                    f"[BRACKET] CTF balance={_ctf_raw:.2f} < needed {filled_shares:.2f} "
-                                    f"— waiting 15s more for token delivery"
+                        import threading
+                        def _place_tp_bracket(executor, tok_id, n_shares, t_price,
+                                              t_size, n_risk, pos_ref, mkt_id):
+                            time.sleep(15)  # Wait for CTF token settlement
+                            try:
+                                from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+                                _cp = BalanceAllowanceParams(
+                                    asset_type=AssetType.CONDITIONAL, token_id=tok_id
                                 )
-                                time.sleep(15)
-                        except Exception as _ce:
-                            logger.debug(f"[BRACKET] CTF balance check skipped: {_ce}")
-
-                        tp_oid = None
-                        for attempt in range(3):
-                            tp_oid = self.executor.place_tp_sell_order(
-                                token_id, filled_shares, tp_price,
-                                tick_size=tick_size, neg_risk=neg_risk,
-                            )
+                                _cd = executor.client.get_balance_allowance(_cp)
+                                _cb = float(_cd.get("balance", "0") or "0") / 1_000_000
+                                if _cb < n_shares * 0.5:
+                                    logger.warning(
+                                        f"[BRACKET] CTF balance={_cb:.2f} < {n_shares:.2f} "
+                                        f"— waiting 15s more"
+                                    )
+                                    time.sleep(15)
+                            except Exception:
+                                pass
+                            tp_oid = None
+                            for attempt in range(3):
+                                tp_oid = executor.place_tp_sell_order(
+                                    tok_id, n_shares, t_price,
+                                    tick_size=t_size, neg_risk=n_risk,
+                                )
+                                if tp_oid:
+                                    break
+                                if attempt < 2:
+                                    time.sleep(10 * (attempt + 1))
                             if tp_oid:
-                                break
-                            if attempt < 2:
-                                wait = 10 * (attempt + 1)
-                                logger.info(f"[BRACKET] TP retry {attempt+2}/3 in {wait}s...")
-                                time.sleep(wait)
-                        if tp_oid:
-                            pos["tp_order_id"] = tp_oid
-                            logger.info(
-                                f"[BRACKET] TP placed: {tp_oid[:12]} | "
-                                f"{filled_shares:.2f} shares @ {tp_price:.4f} (TP={tp_ratio:.0%})"
-                            )
-                        else:
-                            logger.warning(f"[BRACKET] TP order failed after 3 attempts — bot monitors manually")
+                                pos_ref["tp_order_id"] = tp_oid
+                                logger.info(
+                                    f"[BRACKET] TP placed: {tp_oid[:12]} | "
+                                    f"{n_shares:.2f} shares @ {t_price:.4f} | {mkt_id}"
+                                )
+                            else:
+                                logger.warning(f"[BRACKET] TP failed after 3 attempts — bot monitors manually")
+
+                        threading.Thread(
+                            target=_place_tp_bracket,
+                            args=(self.executor, token_id, filled_shares, tp_price,
+                                  tick_size, neg_risk, pos, market_id),
+                            daemon=True,
+                        ).start()
+                        logger.info(f"[BRACKET] TP placement started in background thread")
                 self._save_live_positions()
 
             try:
