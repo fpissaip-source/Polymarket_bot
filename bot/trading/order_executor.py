@@ -580,6 +580,23 @@ class OrderExecutor:
         # Set ERC1155 allowance for this specific token BEFORE placing the GTC sell bracket
         self._approve_conditional_token(token_id)
 
+        # Adjust shares to actual CTF balance (tokens may not settle 1:1)
+        try:
+            bp = BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
+            bd = self.client.get_balance_allowance(bp)
+            ctf_bal = float(bd.get("balance", "0") or "0") / 1_000_000
+            if 0 < ctf_bal < shares:
+                logger.info(
+                    f"[SL_ORDER] Adjusting shares {shares:.2f} → {ctf_bal:.2f} "
+                    f"(actual CTF balance)"
+                )
+                shares = round(ctf_bal, 2)
+                if shares < 5.0:
+                    logger.warning(f"[SL_ORDER] CTF balance {shares:.2f} < 5 min — skipping")
+                    return None
+        except Exception as e:
+            logger.warning(f"[SL_ORDER] Could not check CTF balance: {e}")
+
         size_usd = shares * sl_price
         logger.info(
             f"[SL_ORDER] Placing GTC SELL bracket: {shares:.2f} shares @ {sl_price:.4f} "
@@ -611,7 +628,24 @@ class OrderExecutor:
             return None
 
         # Set ERC1155 allowance for this specific token BEFORE placing the GTC sell bracket
-        self._approve_conditional_token(token_id)
+        confirmed = self._approve_conditional_token(token_id)
+
+        # Adjust shares to actual CTF balance (tokens may not settle 1:1)
+        try:
+            bp = BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
+            bd = self.client.get_balance_allowance(bp)
+            ctf_bal = float(bd.get("balance", "0") or "0") / 1_000_000
+            if 0 < ctf_bal < shares:
+                logger.info(
+                    f"[TP_ORDER] Adjusting shares {shares:.2f} → {ctf_bal:.2f} "
+                    f"(actual CTF balance)"
+                )
+                shares = round(ctf_bal, 2)
+                if shares < 5.0:
+                    logger.warning(f"[TP_ORDER] CTF balance {shares:.2f} < 5 min — skipping")
+                    return None
+        except Exception as e:
+            logger.warning(f"[TP_ORDER] Could not check CTF balance: {e}")
 
         size_usd = shares * tp_price
         logger.info(
