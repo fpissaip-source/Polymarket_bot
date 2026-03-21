@@ -601,22 +601,32 @@ class ArbitrageBot:
                 if cancel_status == "API_ERROR":
                     logger.warning(f"[SELL] Cancel API error — proceeding with sell anyway using estimated shares")
 
-                actual_shares = self.executor.get_order_fills(order_id)
-                if actual_shares < 0:
-                    actual_shares = shares
-                    logger.warning(f"[SELL] Fill API unavailable — using estimated shares={shares:.2f}")
-                elif actual_shares <= 0:
-                    if cancel_status == "API_ERROR":
-                        logger.warning(
-                            f"[SELL] Cancel failed + zero fills confirmed — "
-                            f"BUY order may still be open, retrying next cycle"
-                        )
+                # Use pos["shares"] directly after first confirmation (avoids re-querying
+                # the BUY order which always returns TOTAL filled, not REMAINING after partial sells)
+                if pos.get("shares_confirmed"):
+                    actual_shares = shares  # Already verified + adjusted for partial sells
+                    logger.info(f"[SELL] Using confirmed remaining shares={actual_shares:.2f}")
+                else:
+                    actual_shares = self.executor.get_order_fills(order_id)
+                    if actual_shares < 0:
+                        actual_shares = shares
+                        logger.warning(f"[SELL] Fill API unavailable — using estimated shares={shares:.2f}")
+                    elif actual_shares <= 0:
+                        if cancel_status == "API_ERROR":
+                            logger.warning(
+                                f"[SELL] Cancel failed + zero fills confirmed — "
+                                f"BUY order may still be open, retrying next cycle"
+                            )
+                            continue
+                        logger.info(f"[SELL] Zero filled shares confirmed — nothing to sell")
+                        to_remove.append(order_id)
+                        self.kelly.release(entry_size)
+                        self._save_bankroll()
                         continue
-                    logger.info(f"[SELL] Zero filled shares confirmed — nothing to sell")
-                    to_remove.append(order_id)
-                    self.kelly.release(entry_size)
-                    self._save_bankroll()
-                    continue
+                    # Mark confirmed so next cycle uses pos["shares"] directly
+                    pos["shares"] = actual_shares
+                    pos["shares_confirmed"] = True
+                    self._save_live_positions()
 
                 # Dead market guard: best_bid near zero = no liquidity (market expired as loser)
                 DEAD_BID = 0.02
