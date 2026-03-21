@@ -397,17 +397,15 @@ class ArbitrageBot:
                 continue
 
             try:
-                yes_data = self.data_client.get_book_data(market.token_id_yes)
-                current_p_yes = yes_data["mid_price"]
-                if current_p_yes is None:
+                if entry.side == "YES":
+                    data = self.data_client.get_book_data(market.token_id_yes)
+                else:
+                    data = self.data_client.get_book_data(market.token_id_no)
+                current_price = data["mid_price"]
+                if current_price is None:
                     continue
             except Exception:
                 continue
-
-            if entry.side == "YES":
-                current_price = current_p_yes
-            else:
-                current_price = 1.0 - current_p_yes
 
             shares = entry.size / entry.exec_price if entry.exec_price > 0 else 0
             current_value = shares * current_price
@@ -867,9 +865,10 @@ class ArbitrageBot:
 
         for opp in opportunities:
             market = self._markets[opp.market_id]
-            price = opp.stoikov_quote.reservation_price
+            raw_price = opp.stoikov_quote.reservation_price
             size = opp.kelly_result.position_size
             side = opp.edge_result.side          # "YES", "NO", or "BOTH"
+            price = (1.0 - raw_price) if side == "NO" else raw_price
             is_passive = opp.edge_result.is_passive
             exec_type = "GTC/MAKER" if is_passive else "FOK/TAKER"
 
