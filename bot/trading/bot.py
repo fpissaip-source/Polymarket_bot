@@ -603,12 +603,24 @@ class ArbitrageBot:
                     sl_price = round(entry_price * (1.0 - sl_ratio), 4)
                     tp_price = round(entry_price * (1.0 + tp_ratio), 4)
 
-                    # SL bracket
+                    # Wait for token settlement before placing sell brackets
+                    logger.info(f"[SETTLEMENT] Waiting 5s for token settlement...")
+                    time.sleep(5)
+
+                    # SL bracket — retry up to 3 times with increasing delays
                     if not pos.get("sl_order_id"):
-                        sl_oid = self.executor.place_sl_sell_order(
-                            token_id, filled_shares, sl_price,
-                            tick_size=tick_size, neg_risk=neg_risk,
-                        ) or ""
+                        sl_oid = None
+                        for attempt in range(3):
+                            sl_oid = self.executor.place_sl_sell_order(
+                                token_id, filled_shares, sl_price,
+                                tick_size=tick_size, neg_risk=neg_risk,
+                            )
+                            if sl_oid:
+                                break
+                            if attempt < 2:
+                                wait = 5 * (attempt + 1)
+                                logger.info(f"[BRACKET] SL retry {attempt+2}/3 in {wait}s...")
+                                time.sleep(wait)
                         if sl_oid:
                             pos["sl_order_id"] = sl_oid
                             logger.info(
@@ -616,14 +628,22 @@ class ArbitrageBot:
                                 f"{filled_shares:.2f} shares @ {sl_price:.4f} (SL={sl_ratio:.0%})"
                             )
                         else:
-                            logger.warning(f"[BRACKET] SL order failed — bot monitors manually")
+                            logger.warning(f"[BRACKET] SL order failed after 3 attempts — bot monitors manually")
 
-                    # TP bracket — GTC limit sell at take-profit price, sits in CLOB book
+                    # TP bracket — retry up to 3 times with increasing delays
                     if not pos.get("tp_order_id"):
-                        tp_oid = self.executor.place_tp_sell_order(
-                            token_id, filled_shares, tp_price,
-                            tick_size=tick_size, neg_risk=neg_risk,
-                        ) or ""
+                        tp_oid = None
+                        for attempt in range(3):
+                            tp_oid = self.executor.place_tp_sell_order(
+                                token_id, filled_shares, tp_price,
+                                tick_size=tick_size, neg_risk=neg_risk,
+                            )
+                            if tp_oid:
+                                break
+                            if attempt < 2:
+                                wait = 5 * (attempt + 1)
+                                logger.info(f"[BRACKET] TP retry {attempt+2}/3 in {wait}s...")
+                                time.sleep(wait)
                         if tp_oid:
                             pos["tp_order_id"] = tp_oid
                             logger.info(
@@ -631,7 +651,7 @@ class ArbitrageBot:
                                 f"{filled_shares:.2f} shares @ {tp_price:.4f} (TP={tp_ratio:.0%})"
                             )
                         else:
-                            logger.warning(f"[BRACKET] TP order failed — bot monitors manually")
+                            logger.warning(f"[BRACKET] TP order failed after 3 attempts — bot monitors manually")
                 self._save_live_positions()
 
             try:
