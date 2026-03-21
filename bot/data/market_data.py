@@ -117,7 +117,7 @@ class PolymarketDataClient:
             logger.debug(f"Last trade price fetch failed for {token_id[:16]}...: {e}")
         return None
 
-    def get_neg_risk(self, token_id: str) -> bool:
+    def get_neg_risk(self, token_id: str) -> bool | None:
         if token_id in self._neg_risk_cache:
             return self._neg_risk_cache[token_id]
         try:
@@ -133,9 +133,9 @@ class PolymarketDataClient:
                 return val
         except Exception as e:
             logger.debug(f"neg-risk fetch failed for {token_id[:16]}...: {e}")
-        return False
+        return None
 
-    def get_tick_size(self, token_id: str) -> str:
+    def get_tick_size(self, token_id: str) -> str | None:
         if token_id in self._tick_size_cache:
             return self._tick_size_cache[token_id]
         try:
@@ -152,7 +152,7 @@ class PolymarketDataClient:
                     return ts
         except Exception as e:
             logger.debug(f"tick-size fetch failed for {token_id[:16]}...: {e}")
-        return "0.01"
+        return None
 
     def get_prices_batch(self, token_ids: list[str], side: str = "BUY") -> dict[str, float]:
         """
@@ -269,7 +269,16 @@ class PolymarketDataClient:
                     pass
 
         tick_size = self.get_tick_size(token_id)
+        if tick_size is None and book:
+            ts = book.get("tick_size") or book.get("minimum_tick_size")
+            if ts is not None and str(ts) in ("0.1", "0.01", "0.001", "0.0001"):
+                tick_size = str(ts)
+
         neg_risk = self.get_neg_risk(token_id)
+        if neg_risk is None and book:
+            nr = book.get("neg_risk")
+            if nr is not None:
+                neg_risk = bool(nr)
 
         return {
             "mid_price": mid_price,
