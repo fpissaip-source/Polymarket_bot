@@ -541,6 +541,9 @@ class ArbitrageBot:
                 current_price = data.get("mid_price") or data.get("last_price")
                 if current_price is None:
                     raise ValueError("no mid_price or last_price")
+                # Best bid = where buyers are = price we can SELL at immediately
+                bids = data.get("bids", [])
+                best_bid = float(bids[0]["price"]) if bids else current_price
             except Exception as e:
                 # No book data = market likely closed / token invalid.
                 # Purge if: expiry unknown, expiry past, or near expiry
@@ -592,8 +595,12 @@ class ArbitrageBot:
                 # 1. Try cancel (works if order is still open/unfilled)
                 cancelled = self.executor.cancel_order(order_id)
                 if not cancelled:
-                    # 2. Order filled — sell all shares via close_position (bypasses $5 min)
-                    sell_price = round(current_price, 4)
+                    # 2. Order filled — sell shares at best_bid (where buyers are)
+                    sell_price = round(best_bid, 4)
+                    logger.info(
+                        f"[SELL] mid={current_price:.4f} best_bid={best_bid:.4f} "
+                        f"selling {shares:.2f} shares @ {sell_price}"
+                    )
                     self.executor.close_position(
                         token_id, shares, sell_price,
                         tick_size=tick_size, neg_risk=neg_risk,
