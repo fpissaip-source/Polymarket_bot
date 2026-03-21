@@ -46,10 +46,60 @@ from config import (
 )
 
 import os
+import requests as _requests
 
 logger = logging.getLogger("polymarket_bot.executor")
 
 PROXY_ADDRESS = os.getenv("POLYMARKET_PROXY_ADDRESS", "").strip()
+
+_POLYGON_RPCS = [
+    "https://polygon-bor-rpc.publicnode.com",
+    "https://rpc-mainnet.matic.quiknode.pro",
+    "https://1rpc.io/matic",
+    "https://matic-mainnet.chainstacklabs.com",
+]
+_POLY_PROXY_FACTORY = "0xaB45c5A4B0c941a2F231C04C3f49182e1A254052"
+_USDC_E = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+
+
+def _eth_call(to: str, data: str) -> str | None:
+    payload = {"jsonrpc": "2.0", "method": "eth_call",
+               "params": [{"to": to, "data": data}, "latest"], "id": 1}
+    for rpc in _POLYGON_RPCS:
+        try:
+            r = _requests.post(rpc, json=payload, timeout=8)
+            result = r.json().get("result", "0x")
+            if result and result not in ("0x", "0x" + "0" * 64):
+                return result
+        except Exception:
+            continue
+    return None
+
+
+def _get_usdc_balance(address: str) -> float:
+    data = "0x70a08231000000000000000000000000" + address[2:].lower()
+    result = _eth_call(_USDC_E, data)
+    if result:
+        try:
+            return int(result, 16) / 1_000_000
+        except Exception:
+            pass
+    return 0.0
+
+
+def _find_proxy_address(eoa: str) -> str | None:
+    try:
+        from eth_hash.auto import keccak as _keccak
+        from eth_utils import to_checksum_address
+        selector = _keccak(b"getPolyProxyWalletAddress(address)")[:4].hex()
+        padded = "000000000000000000000000" + eoa[2:].lower()
+        calldata = "0x" + selector + padded
+        result = _eth_call(_POLY_PROXY_FACTORY, calldata)
+        if result:
+            return to_checksum_address("0x" + result[-40:])
+    except Exception as e:
+        logger.debug(f"[PROXY] proxy address lookup failed: {e}")
+    return None
 
 _ORDER_TYPE_MAP = {
     "GTC": OrderType.GTC,
@@ -87,14 +137,15 @@ class OrderExecutor:
 
         creds = self._resolve_credentials()
 
-        sig_type = 1 if PROXY_ADDRESS else 0
+        proxy = self._resolve_proxy(POLYMARKET_PRIVATE_KEY)
+        sig_type = 1 if proxy else 0
         self.client = ClobClient(
             host=POLYMARKET_HOST,
             key=POLYMARKET_PRIVATE_KEY,
             chain_id=CHAIN_ID,
             creds=creds,
             signature_type=sig_type,
-            funder=PROXY_ADDRESS if PROXY_ADDRESS else None,
+            funder=proxy if proxy else None,
         )
         logger.info(
             f"OrderExecutor initialized (sig_type={sig_type}, "
@@ -104,6 +155,40 @@ class OrderExecutor:
         self._tick_cache: dict[str, str] = {}
         self._neg_risk_cache: dict[str, bool] = {}
         self._check_balance_and_allowance()
+
+    def _resolve_proxy(self, private_key: str) -> str | None:
+        if PROXY_ADDRESS:
+            logger.info(f"[PROXY] Using proxy from env: {PROXY_ADDRESS}")
+            return PROXY_ADDRESS
+
+        try:
+            from eth_account import Account
+            eoa = Account.from_key(private_key).address
+
+            eoa_bal = _get_usdc_balance(eoa)
+            if eoa_bal >= 1.0:
+                logger.info(f"[PROXY] EOA {eoa} has ${eoa_bal:.2f} USDC.e — using EOA mode (sig_type=0)")
+                return None
+
+            logger.info("[PROXY] Auto-detecting Polymarket proxy wallet from on-chain factory...")
+            proxy = _find_proxy_address(eoa)
+            if proxy:
+                proxy_bal = _get_usdc_balance(proxy)
+                logger.info(f"[PROXY] Proxy={proxy} | balance=${proxy_bal:.2f} USDC.e")
+                if proxy_bal >= 1.0:
+                    logger.info(f"[PROXY] Using proxy wallet {proxy} (sig_type=1)")
+                    return proxy
+                else:
+                    logger.warning(
+                        f"[PROXY] Proxy found ({proxy}) but balance=${proxy_bal:.2f}. "
+                        f"Deposit USDC.e on Polygon to: {proxy} (or EOA: {eoa})"
+                    )
+            else:
+                logger.warning(f"[PROXY] Could not detect proxy — trying EOA mode. EOA: {eoa}")
+        except Exception as e:
+            logger.debug(f"[PROXY] _resolve_proxy error: {e}")
+
+        return None
 
     def _resolve_credentials(self) -> ApiCreds:
         if POLYMARKET_API_KEY and POLYMARKET_API_SECRET and POLYMARKET_API_PASSPHRASE:
