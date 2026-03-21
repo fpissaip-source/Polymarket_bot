@@ -89,8 +89,8 @@ GROWTH_TIERS = [
 BANKROLL_STATE_FILE = "bankroll_state.json"
 
 # Take-Profit / Stop-Loss — always equal, take small gains, cut small losses
-TP_RATIO = 0.05               # Take profit at +5% return on trade
-SL_RATIO = 0.05               # Stop loss at -5% loss on trade (same as TP!)
+TP_RATIO = 0.10               # Take profit at +10% return on trade
+SL_RATIO = 0.20               # Stop loss at -20% loss on trade
 TP_SL_CHECK_INTERVAL = 10     # Check TP/SL every 10 seconds
 
 # Monte Carlo
