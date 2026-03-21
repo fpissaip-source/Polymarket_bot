@@ -397,16 +397,35 @@ class OrderExecutor:
         return self.place_order(token_id, side, price, size, order_type="GTC",
                                 tick_size=tick_size, neg_risk=neg_risk)
 
-    def _approve_conditional_token(self, token_id: str) -> None:
+    def _approve_conditional_token(self, token_id: str) -> bool:
         """Set ERC1155 CTF allowance for a specific token_id before selling.
         Must be called before every SELL — CONDITIONAL allowances are per-token-id.
+        Polls on-chain confirmation (max 10s) instead of blind sleep.
         """
+        params = BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
         try:
-            params = BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
             self.client.update_balance_allowance(params)
-            logger.info(f"[ALLOWANCE] ✓ Approved CONDITIONAL token {token_id[:16]}...")
+            logger.info(f"[ALLOWANCE] Sent approval for CONDITIONAL token {token_id[:16]}...")
         except Exception as e:
             logger.warning(f"[ALLOWANCE] Could not approve CONDITIONAL token {token_id[:16]}...: {e}")
+            return False
+
+        # Poll for on-chain confirmation (5 × 2s = max 10s)
+        for i in range(5):
+            time.sleep(2)
+            try:
+                data = self.client.get_balance_allowance(params)
+                allowance = float(data.get("allowance", "0") or "0") / 1_000_000
+                if allowance > 0:
+                    logger.info(
+                        f"[ALLOWANCE] ✓ Confirmed on-chain after {(i+1)*2}s "
+                        f"| token={token_id[:16]}..."
+                    )
+                    return True
+            except Exception:
+                pass
+        logger.warning(f"[ALLOWANCE] ⚠ Not confirmed after 10s | token={token_id[:16]}...")
+        return False
 
     def close_position(self, token_id: str, shares: float, price: float,
                        tick_size: str = "0.01", neg_risk: bool = False) -> str | None:
@@ -551,7 +570,6 @@ class OrderExecutor:
 
         # Set ERC1155 allowance for this specific token BEFORE placing the GTC sell bracket
         self._approve_conditional_token(token_id)
-        time.sleep(3)   # Wait for Polygon tx confirmation before placing GTC order
 
         size_usd = shares * sl_price
         logger.info(
@@ -585,7 +603,6 @@ class OrderExecutor:
 
         # Set ERC1155 allowance for this specific token BEFORE placing the GTC sell bracket
         self._approve_conditional_token(token_id)
-        time.sleep(3)   # Wait for Polygon tx confirmation before placing GTC order
 
         size_usd = shares * tp_price
         logger.info(
