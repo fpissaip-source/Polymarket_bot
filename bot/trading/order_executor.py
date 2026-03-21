@@ -13,6 +13,8 @@ Per Polymarket docs, every order requires:
   - tickSize  (string: "0.1", "0.01", "0.001", "0.0001")
   - negRisk   (bool: True for multi-outcome 3+ markets)
 These are fetched dynamically from the CLOB API before each order.
+
+API credentials are auto-derived from the private key if not set.
 """
 
 import time
@@ -22,6 +24,7 @@ try:
     from py_clob_client.client import ClobClient
     from py_clob_client.clob_types import (
         ApiCreds, OrderArgs, OrderType, PartialCreateOrderOptions,
+        BalanceAllowanceParams, AssetType,
     )
     _PY_CLOB_AVAILABLE = True
 except ImportError:
@@ -81,11 +84,9 @@ class OrderExecutor:
             raise RuntimeError(
                 "py_clob_client is not installed. Run: pip install poly-market-maker"
             )
-        creds = ApiCreds(
-            api_key=POLYMARKET_API_KEY,
-            api_secret=POLYMARKET_API_SECRET,
-            api_passphrase=POLYMARKET_API_PASSPHRASE,
-        )
+
+        creds = self._resolve_credentials()
+
         sig_type = 1 if PROXY_ADDRESS else 0
         self.client = ClobClient(
             host=POLYMARKET_HOST,
@@ -95,30 +96,83 @@ class OrderExecutor:
             signature_type=sig_type,
             funder=PROXY_ADDRESS if PROXY_ADDRESS else None,
         )
-        logger.info(f"OrderExecutor initialized (sig_type={sig_type})")
+        logger.info(
+            f"OrderExecutor initialized (sig_type={sig_type}, "
+            f"signer={self.client.builder.signer.address()}, "
+            f"funder={self.client.builder.funder})"
+        )
         self._tick_cache: dict[str, str] = {}
         self._neg_risk_cache: dict[str, bool] = {}
-        self._ensure_allowance()
+        self._check_balance_and_allowance()
 
-    def _ensure_allowance(self):
+    def _resolve_credentials(self) -> ApiCreds:
+        if POLYMARKET_API_KEY and POLYMARKET_API_SECRET and POLYMARKET_API_PASSPHRASE:
+            logger.info("[AUTH] Using API credentials from environment")
+            return ApiCreds(
+                api_key=POLYMARKET_API_KEY,
+                api_secret=POLYMARKET_API_SECRET,
+                api_passphrase=POLYMARKET_API_PASSPHRASE,
+            )
+
+        logger.warning("[AUTH] No API credentials in environment — auto-deriving from private key...")
         try:
-            self.client.update_balance_allowance()
-            logger.info("[ALLOWANCE] Called update_balance_allowance to ensure approval")
+            temp_client = ClobClient(
+                host=POLYMARKET_HOST,
+                key=POLYMARKET_PRIVATE_KEY,
+                chain_id=CHAIN_ID,
+            )
+            creds = temp_client.derive_api_key()
+            if creds and creds.api_key:
+                logger.info(f"[AUTH] Successfully derived API key: {creds.api_key[:12]}...")
+                return creds
+        except Exception as e:
+            logger.error(f"[AUTH] derive_api_key failed: {e}")
+
+        try:
+            temp_client = ClobClient(
+                host=POLYMARKET_HOST,
+                key=POLYMARKET_PRIVATE_KEY,
+                chain_id=CHAIN_ID,
+            )
+            creds = temp_client.create_api_key()
+            if creds and creds.api_key:
+                logger.info(f"[AUTH] Created new API key: {creds.api_key[:12]}...")
+                return creds
+        except Exception as e:
+            logger.error(f"[AUTH] create_api_key failed: {e}")
+
+        logger.error(
+            "[AUTH] FATAL: No API credentials available. "
+            "Set POLYMARKET_API_KEY, POLYMARKET_API_SECRET, POLYMARKET_API_PASSPHRASE"
+        )
+        return ApiCreds(api_key="", api_secret="", api_passphrase="")
+
+    def _check_balance_and_allowance(self):
+        try:
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            self.client.update_balance_allowance(params)
+            logger.info("[ALLOWANCE] Called update_balance_allowance (COLLATERAL)")
         except Exception as e:
             logger.warning(f"[ALLOWANCE] update_balance_allowance failed: {e}")
+
         try:
-            bal = self.client.get_balance_allowance()
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            bal = self.client.get_balance_allowance(params)
             if bal:
-                allowance = bal.get("allowance") or bal.get("balance_allowance", {}).get("allowance")
-                balance = bal.get("balance") or bal.get("balance_allowance", {}).get("balance")
-                logger.info(f"[ALLOWANCE] balance={balance}, allowance={allowance}")
-                if allowance is not None and float(allowance) < 1.0:
+                balance = bal.get("balance", "0")
+                allowances = bal.get("allowances", {})
+                logger.info(f"[BALANCE] USDC.e balance: {balance}")
+                for addr, val in allowances.items():
+                    logger.info(f"[ALLOWANCE] {addr}: {val}")
+                if balance == "0" or float(balance) < 1_000_000:
+                    balance_usd = float(balance) / 1_000_000 if balance != "0" else 0
                     logger.warning(
-                        "[ALLOWANCE] USDC.e allowance is zero or too low! "
-                        "Orders may fail. Try running update_balance_allowance again."
+                        f"[BALANCE] USDC.e balance is ${balance_usd:.2f}! "
+                        f"Fund wallet {self.client.builder.funder} with USDC.e on Polygon. "
+                        f"Orders will fail without balance."
                     )
         except Exception as e:
-            logger.debug(f"[ALLOWANCE] Could not check balance/allowance: {e}")
+            logger.warning(f"[BALANCE] Could not check balance: {e}")
 
     def _fetch_tick_size(self, token_id: str) -> str:
         if token_id in self._tick_cache:
@@ -128,7 +182,6 @@ class OrderExecutor:
             ts_str = str(ts)
             if ts_str in VALID_TICK_SIZES:
                 self._tick_cache[token_id] = ts_str
-                logger.debug(f"[TICK] {token_id[:16]}... = {ts_str}")
                 return ts_str
         except Exception as e:
             logger.warning(f"[TICK] get_tick_size failed for {token_id[:16]}...: {e}")
@@ -141,7 +194,6 @@ class OrderExecutor:
             nr = self.client.get_neg_risk(token_id)
             val = bool(nr)
             self._neg_risk_cache[token_id] = val
-            logger.debug(f"[NEG_RISK] {token_id[:16]}... = {val}")
             return val
         except Exception as e:
             logger.warning(f"[NEG_RISK] get_neg_risk failed for {token_id[:16]}...: {e}")
@@ -185,27 +237,27 @@ class OrderExecutor:
             price=rounded_price,
             size=round(shares, 2),
             side=clob_side,
-            expiration=expiration,
+            expiration=expiration if expiration else 0,
         )
 
         options = PartialCreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk)
 
         logger.info(
-            f"[{order_type}] Placing order: {clob_side} {round(shares,2)} shares @ {rounded_price} "
-            f"| tick={tick_size} neg_risk={neg_risk} | token={token_id[:16]}..."
+            f"[{order_type}] Placing: {clob_side} {round(shares,2)} shares @ {rounded_price} "
+            f"| tick={tick_size} neg_risk={neg_risk} | maker={self.client.builder.funder}"
         )
 
         try:
             signed = self.client.create_order(order_args, options)
+            logger.debug(f"[{order_type}] Signed order: {signed}")
             resp = _post_with_retry(self.client.post_order, signed, ot)
             order_id = resp.get("orderID") or resp.get("id")
             status = resp.get("status", "unknown")
             error_msg = resp.get("errorMsg", "")
             if error_msg:
                 logger.warning(
-                    f"[{order_type}] Order response error: {error_msg} "
-                    f"| {side} {shares:.2f} shares @ {rounded_price} "
-                    f"| tick={tick_size} neg_risk={neg_risk}"
+                    f"[{order_type}] Order error: {error_msg} "
+                    f"| {side} {shares:.2f}@{rounded_price} tick={tick_size} neg={neg_risk}"
                 )
                 return None
             logger.info(
@@ -217,8 +269,7 @@ class OrderExecutor:
         except Exception as e:
             logger.error(
                 f"Failed to place {order_type} order: {e} "
-                f"| {side} {shares:.2f} shares @ {rounded_price} "
-                f"| tick={tick_size} neg_risk={neg_risk}"
+                f"| {side} {shares:.2f}@{rounded_price} tick={tick_size} neg={neg_risk}"
             )
             return None
 
