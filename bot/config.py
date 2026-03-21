@@ -109,14 +109,14 @@ GROWTH_TIERS = [
 BANKROLL_STATE_FILE = "bankroll_state.json"
 
 # Take-Profit / Stop-Loss
-TP_RATIO = 0.10               # Take profit at +10% return on trade
+TP_RATIO = 0.22               # Take profit at +22% return on trade
 SL_RATIO = 0.20               # Stop loss at -20% loss on trade
 
 # Adaptive TP/SL for low-price positions (exec_price < LOW_PRICE_THRESHOLD)
 # At prices like 0.19, a move from 0.19→0.12 is already -37% in one tick.
 # Tighter thresholds catch losses faster before they snowball.
 LOW_PRICE_THRESHOLD = 0.30    # Below this exec_price → use low-price ratios
-TP_RATIO_LOW = 0.15           # TP at +15% for low-price positions
+TP_RATIO_LOW = 0.22           # TP at +22% for low-price positions
 SL_RATIO_LOW = 0.10           # SL at -10% for low-price positions
 
 TP_SL_CHECK_INTERVAL = 1      # Check TP/SL every 1 second (fast reaction)
