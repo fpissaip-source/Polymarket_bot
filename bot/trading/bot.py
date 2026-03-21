@@ -587,6 +587,54 @@ class ArbitrageBot:
                 self._save_bankroll()
                 continue
 
+            # ── Fill detection: wait for buy to fill before placing SL bracket ──────
+            # Old positions without buy_filled field are assumed already filled (True).
+            buy_filled = pos.get("buy_filled", True)
+            if not buy_filled:
+                filled_shares = self.executor.get_order_fills(order_id)
+                if filled_shares <= 0:
+                    # Order not yet filled — check if it was cancelled without a fill
+                    try:
+                        order_info = self.executor.client.get_order(order_id)
+                        order_status = order_info.get("status", "")
+                        if order_status in ("CANCELED", "EXPIRED") and filled_shares == 0:
+                            logger.warning(
+                                f"[FILL_CHECK] {market_id} order={order_id[:8]} "
+                                f"status={order_status} with 0 fills — releasing position"
+                            )
+                            to_remove.append(order_id)
+                            self.kelly.release(entry_size)
+                            self._save_bankroll()
+                            continue
+                    except Exception:
+                        pass
+                    # Still pending — skip TP/SL this cycle (no tokens to sell yet)
+                    continue
+
+                # Buy confirmed filled — update position and place SL bracket now
+                pos["buy_filled"] = True
+                pos["shares"] = filled_shares
+                logger.info(
+                    f"[FILL_CONFIRMED] {market_id} order={order_id[:8]} "
+                    f"filled={filled_shares:.2f} shares @ {entry_price:.4f}"
+                )
+                if not pos.get("sl_order_id") and filled_shares >= 5.0:
+                    sl_ratio = SL_RATIO_LOW if entry_price < LOW_PRICE_THRESHOLD else SL_RATIO
+                    sl_price = round(entry_price * (1.0 - sl_ratio), 4)
+                    sl_oid = self.executor.place_sl_sell_order(
+                        token_id, filled_shares, sl_price,
+                        tick_size=tick_size, neg_risk=neg_risk,
+                    ) or ""
+                    if sl_oid:
+                        pos["sl_order_id"] = sl_oid
+                        logger.info(
+                            f"[BRACKET] SL placed after fill confirmed: {sl_oid[:12]} | "
+                            f"{filled_shares:.2f} shares @ {sl_price:.4f} (SL={sl_ratio:.0%})"
+                        )
+                    else:
+                        logger.warning(f"[BRACKET] SL order failed after fill — bot monitors manually")
+                self._save_live_positions()
+
             try:
                 data = self.data_client.get_book_data(token_id)
                 current_price = data.get("mid_price") or data.get("last_price")
@@ -1436,32 +1484,14 @@ class ArbitrageBot:
                 self.kelly.allocate(size)
                 self._save_bankroll()
 
-                # Immediately place a GTC SELL bracket order at SL price
-                # so the CLOB auto-liquidates even if the bot crashes
-                sl_ratio = SL_RATIO_LOW if price < LOW_PRICE_THRESHOLD else SL_RATIO
-                sl_price = round(price * (1.0 - sl_ratio), 4)
-                shares = size / price if price > 0 else 0.0
-                sl_order_id = ""
-                if not self.dry_run and shares >= 1.0:
-                    sl_order_id = self.executor.place_sl_sell_order(
-                        token_id, shares, sl_price,
-                        tick_size=market.tick_size, neg_risk=market.neg_risk,
-                    ) or ""
-                    if sl_order_id:
-                        logger.info(
-                            f"[BRACKET] SL sell order placed: {sl_order_id[:12]} | "
-                            f"{shares:.2f} shares @ {sl_price:.4f} (SL={sl_ratio:.0%})"
-                        )
-                    else:
-                        logger.warning(
-                            f"[BRACKET] SL sell order FAILED — manual TP/SL monitoring only"
-                        )
-
+                # SL bracket is placed AFTER the buy fills (not now) because placing a
+                # SELL order on tokens we don't hold yet causes 'not enough balance/allowance'.
+                # The _check_tp_sl loop detects fills and places the bracket automatically.
                 self._record_trade(
                     opp.market_id, side, size, price, order_id,
                     token_id=token_id,
                     tick_size=market.tick_size, neg_risk=market.neg_risk,
-                    end_time=market.end_time, sl_order_id=sl_order_id,
+                    end_time=market.end_time, sl_order_id="",
                 )
             else:
                 logger.warning(f"Order rejected for {opp.market_id}")
@@ -1550,14 +1580,15 @@ class ArbitrageBot:
                 "neg_risk": neg_risk,
                 "entry_time": time.time(),
                 "end_time": end_time,
-                "sl_order_id": sl_order_id,  # GTC sell bracket order (auto-liquidation)
+                "sl_order_id": sl_order_id,
+                "buy_filled": False,   # Set True once fill confirmed; SL bracket placed then
             }
             self._save_live_positions()
             logger.info(
                 f"[POSITION] Tracking live position: {market_id} {side} "
                 f"${size:.2f} @ {price:.4f} shares={shares:.2f} | "
                 f"TP={TP_RATIO:.0%} SL={SL_RATIO:.0%} | "
-                f"SL_order={'set ✓' if sl_order_id else 'NONE — manual only'} | "
+                f"Waiting for fill confirmation before SL bracket | "
                 f"expires={time.strftime('%H:%M:%S', time.localtime(end_time)) if end_time else 'unknown'}"
             )
 
