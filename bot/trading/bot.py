@@ -559,28 +559,44 @@ class ArbitrageBot:
                             continue
                     except Exception:
                         pass
-                    # Fill-wait timeout: if waiting >2 min and API keeps returning 0/-1,
-                    # assume filled with expected shares and proceed (avoids infinite wait)
+                    # ── SL guard during fill-wait: cancel unfilled buy if price already crashed ──
+                    # Prevents the order from filling into an already-losing position.
+                    try:
+                        _guard_data = self.data_client.get_book_data(token_id)
+                        _guard_price = _guard_data.get("mid_price") or _guard_data.get("last_price")
+                        if _guard_price is not None and entry_price > 0:
+                            _is_low = entry_price < LOW_PRICE_THRESHOLD
+                            _sl_guard = SL_RATIO_LOW if _is_low else SL_RATIO
+                            _sl_floor = entry_price * (1.0 - _sl_guard)
+                            if _guard_price <= _sl_floor:
+                                logger.warning(
+                                    f"[SL_GUARD] {market_id} order={order_id[:8]} "
+                                    f"price={_guard_price:.4f} already below SL floor={_sl_floor:.4f} "
+                                    f"— cancelling unfilled buy to prevent loss"
+                                )
+                                self.executor.cancel_order(order_id)
+                                to_remove.append(order_id)
+                                self.kelly.release(entry_size)
+                                self._save_bankroll()
+                                continue
+                    except Exception:
+                        pass
+
+                    # Fill-wait timeout: after >2 min cancel the order and release capital.
+                    # Do NOT assume filled — attempting to sell tokens we don't own causes
+                    # "not enough balance/allowance" errors on the CLOB.
                     wait_secs = time.time() - pos.get("entry_time", time.time())
                     if wait_secs > 120:
-                        expected_shares = pos.get("shares", 0)
-                        if expected_shares > 0:
-                            logger.warning(
-                                f"[FILL_TIMEOUT] {market_id} order={order_id[:8]} "
-                                f"waited {wait_secs:.0f}s — assuming filled with "
-                                f"{expected_shares:.2f} shares (API unresponsive)"
-                            )
-                            pos["buy_filled"] = True
-                            # fall through to TP/SL evaluation below
-                        else:
-                            logger.warning(
-                                f"[FILL_TIMEOUT] {market_id} waited {wait_secs:.0f}s "
-                                f"with 0 expected shares — releasing position"
-                            )
-                            to_remove.append(order_id)
-                            self.kelly.release(entry_size)
-                            self._save_bankroll()
-                            continue
+                        logger.warning(
+                            f"[FILL_TIMEOUT] {market_id} order={order_id[:8]} "
+                            f"waited {wait_secs:.0f}s with 0 confirmed fills — "
+                            f"cancelling unfilled order and releasing ${entry_size:.2f}"
+                        )
+                        self.executor.cancel_order(order_id)
+                        to_remove.append(order_id)
+                        self.kelly.release(entry_size)
+                        self._save_bankroll()
+                        continue
                     else:
                         # Still pending — skip TP/SL this cycle (no tokens to sell yet)
                         logger.debug(
@@ -603,9 +619,11 @@ class ArbitrageBot:
                     sl_price = round(entry_price * (1.0 - sl_ratio), 4)
                     tp_price = round(entry_price * (1.0 + tp_ratio), 4)
 
-                    # Wait for token settlement before placing TP bracket
-                    logger.info(f"[SETTLEMENT] Waiting 5s for token settlement...")
-                    time.sleep(5)
+                    # Wait for CTF token settlement before placing TP bracket.
+                    # Polygon tx finality can take 10-15s; 5s was too short causing
+                    # "not enough balance/allowance" on the SELL order.
+                    logger.info(f"[SETTLEMENT] Waiting 15s for CTF token settlement...")
+                    time.sleep(15)
 
                     # NOTE: SL brackets are NOT placed as GTC limit orders.
                     # On the CLOB, a GTC SELL at SL_PRICE means "sell at any price >= SL_PRICE".
@@ -615,9 +633,26 @@ class ArbitrageBot:
                         f"[BRACKET] SL={sl_price:.4f} ({sl_ratio:.0%}) monitored by bot price loop"
                     )
 
-                    # TP bracket — GTC SELL at TP price. Works correctly because TP_PRICE > current
-                    # price, so it sits in the book and only fills when price RISES to TP level.
+                    # TP bracket — GTC SELL at TP price. Verify CTF token balance before
+                    # placing to avoid "not enough balance/allowance" errors.
                     if not pos.get("tp_order_id"):
+                        # Verify wallet actually holds the CTF tokens before placing SELL
+                        try:
+                            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+                            _ctf_params = BalanceAllowanceParams(
+                                asset_type=AssetType.CONDITIONAL, token_id=token_id
+                            )
+                            _ctf_bal_data = self.executor.client.get_balance_allowance(_ctf_params)
+                            _ctf_raw = float(_ctf_bal_data.get("balance", "0") or "0") / 1_000_000
+                            if _ctf_raw < filled_shares * 0.5:
+                                logger.warning(
+                                    f"[BRACKET] CTF balance={_ctf_raw:.2f} < needed {filled_shares:.2f} "
+                                    f"— waiting 15s more for token delivery"
+                                )
+                                time.sleep(15)
+                        except Exception as _ce:
+                            logger.debug(f"[BRACKET] CTF balance check skipped: {_ce}")
+
                         tp_oid = None
                         for attempt in range(3):
                             tp_oid = self.executor.place_tp_sell_order(
@@ -627,7 +662,7 @@ class ArbitrageBot:
                             if tp_oid:
                                 break
                             if attempt < 2:
-                                wait = 5 * (attempt + 1)
+                                wait = 10 * (attempt + 1)
                                 logger.info(f"[BRACKET] TP retry {attempt+2}/3 in {wait}s...")
                                 time.sleep(wait)
                         if tp_oid:
