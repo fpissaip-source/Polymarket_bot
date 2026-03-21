@@ -431,7 +431,7 @@ class ArbitrageBot:
             tp = TP_RATIO_LOW if is_low_price else TP_RATIO
             sl = SL_RATIO_LOW if is_low_price else SL_RATIO
             if is_low_price:
-                logger.debug(
+                logger.info(
                     f"[SL] ADAPTIVE: exec_price={entry.exec_price:.4f} < {LOW_PRICE_THRESHOLD} "
                     f"→ using TP={tp:.0%}, SL={sl:.0%}"
                 )
