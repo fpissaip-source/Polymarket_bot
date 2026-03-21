@@ -608,8 +608,35 @@ class ArbitrageBot:
                             continue
                     except Exception:
                         pass
-                    # Still pending — skip TP/SL this cycle (no tokens to sell yet)
-                    continue
+                    # Fill-wait timeout: if waiting >2 min and API keeps returning 0/-1,
+                    # assume filled with expected shares and proceed (avoids infinite wait)
+                    wait_secs = time.time() - pos.get("entry_time", time.time())
+                    if wait_secs > 120:
+                        expected_shares = pos.get("shares", 0)
+                        if expected_shares > 0:
+                            logger.warning(
+                                f"[FILL_TIMEOUT] {market_id} order={order_id[:8]} "
+                                f"waited {wait_secs:.0f}s — assuming filled with "
+                                f"{expected_shares:.2f} shares (API unresponsive)"
+                            )
+                            pos["buy_filled"] = True
+                            # fall through to TP/SL evaluation below
+                        else:
+                            logger.warning(
+                                f"[FILL_TIMEOUT] {market_id} waited {wait_secs:.0f}s "
+                                f"with 0 expected shares — releasing position"
+                            )
+                            to_remove.append(order_id)
+                            self.kelly.release(entry_size)
+                            self._save_bankroll()
+                            continue
+                    else:
+                        # Still pending — skip TP/SL this cycle (no tokens to sell yet)
+                        logger.debug(
+                            f"[FILL_WAIT] {market_id} order={order_id[:8]} "
+                            f"— waiting for fill ({wait_secs:.0f}s)"
+                        )
+                        continue
 
                 # Buy confirmed filled — update position and place SL bracket now
                 pos["buy_filled"] = True

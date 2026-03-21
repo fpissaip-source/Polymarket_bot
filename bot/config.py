@@ -119,7 +119,7 @@ LOW_PRICE_THRESHOLD = 0.30    # Below this exec_price → use low-price ratios
 TP_RATIO_LOW = 0.15           # TP at +15% for low-price positions
 SL_RATIO_LOW = 0.10           # SL at -10% for low-price positions
 
-TP_SL_CHECK_INTERVAL = 3      # Check TP/SL every 3 seconds (was 10)
+TP_SL_CHECK_INTERVAL = 1      # Check TP/SL every 1 second (fast reaction)
 
 # Monte Carlo
 MC_SIMULATIONS = 600          # Number of simulation paths
