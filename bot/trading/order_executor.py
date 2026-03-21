@@ -312,6 +312,25 @@ class OrderExecutor:
         clob_side = BUY if side.upper() == "BUY" else SELL
         ot = _ORDER_TYPE_MAP.get(order_type.upper(), OrderType.GTC)
 
+        # ── Early guards (no API calls yet) ─────────────────────────────────
+        # CLOB enforces a hard minimum of 5 shares — check before hitting API
+        # to avoid burning rate-limit quota on doomed orders.
+        shares_preview = size / price if price > 0 else 0
+        clob_min_shares = 5.0
+        if shares_preview < clob_min_shares:
+            clob_min_usd = clob_min_shares * price
+            logger.warning(
+                f"[SKIP] ${size:.2f}/{price:.4f}={shares_preview:.2f} shares "
+                f"< CLOB min {clob_min_shares:.0f} (need ${clob_min_usd:.2f}) — skipping"
+            )
+            return None
+
+        min_size = max(MIN_BET_SIZE, 0.01)
+        if size < min_size - 0.01:
+            logger.warning(f"Order size ${size:.2f} below ${min_size:.2f} minimum — skipping")
+            return None
+
+        # ── Fetch live tick_size / neg_risk from CLOB ────────────────────────
         real_tick = self._fetch_tick_size(token_id)
         real_neg = self._fetch_neg_risk(token_id)
 
@@ -324,15 +343,7 @@ class OrderExecutor:
         neg_risk = real_neg
         decimals = TICK_DECIMALS[tick_size]
 
-        min_size = max(MIN_BET_SIZE, 1.0)
-        if size < min_size - 0.01:
-            logger.warning(f"Order size ${size:.2f} below ${min_size:.2f} minimum — skipping")
-            return None
-
-        shares = size / price if price > 0 else 0
-        if shares < 1.0:
-            logger.warning(f"Order too small: ${size:.2f} / {price:.4f} = {shares:.4f} shares (min 1)")
-            return None
+        shares = shares_preview
 
         rounded_price = round(price, decimals)
 
@@ -466,8 +477,14 @@ class OrderExecutor:
         """Place a GTC SELL limit order at the stop-loss price.
         This acts as an automatic bracket order — the CLOB executes it even if the bot crashes.
         sl_price: the price at which to sell (stop-loss level)
-        shares:   number of shares to sell
+        shares:   number of shares to sell (must be >= 5 for CLOB acceptance)
         """
+        if shares < 5.0:
+            logger.warning(
+                f"[SL_ORDER] Skipping bracket: {shares:.2f} shares < 5 (CLOB min) — "
+                f"position will be managed by bot TP/SL loop only"
+            )
+            return None
         size_usd = shares * sl_price
         logger.info(
             f"[SL_ORDER] Placing GTC SELL bracket: {shares:.2f} shares @ {sl_price:.4f} "
