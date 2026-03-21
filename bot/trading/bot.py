@@ -508,16 +508,47 @@ class ArbitrageBot:
             return
         to_remove = []
         for order_id, pos in list(self._live_positions.items()):
-            token_id = pos["token_id"]
+            token_id   = pos["token_id"]
             entry_price = pos["entry_price"]
-            entry_size = pos["entry_size"]   # USD spent
-            tick_size = pos.get("tick_size", "0.01")
-            neg_risk = pos.get("neg_risk", False)
+            entry_size  = pos["entry_size"]
+            tick_size   = pos.get("tick_size", "0.01")
+            neg_risk    = pos.get("neg_risk", False)
+            market_id   = pos.get("market_id", "")
+
+            # ── Resolve end_time: stored value, live market dict, or 0 ──
+            end_time = pos.get("end_time", 0)
+            if end_time == 0:
+                market_state = self._markets.get(market_id)
+                if market_state and market_state.end_time > 0:
+                    end_time = market_state.end_time
+                    pos["end_time"] = end_time   # update in-memory so it stays resolved
+
+            time_to_expiry = end_time - now if end_time > 0 else float("inf")
+
+            # ── Stale ghost position: market expired >2 min ago, release capital ──
+            if end_time > 0 and now > end_time + 120:
+                logger.warning(
+                    f"[GHOST_POSITION] {market_id} order={order_id[:8]} expired "
+                    f"{(now - end_time)/60:.1f} min ago — releasing ${entry_size:.2f} capital"
+                )
+                to_remove.append(order_id)
+                self.kelly.release(entry_size)
+                self._save_bankroll()
+                continue
 
             try:
                 data = self.data_client.get_book_data(token_id)
                 current_price = data.get("mid_price") or data.get("last_price")
                 if current_price is None:
+                    # If book data unavailable AND expiry is near/past, force purge
+                    if time_to_expiry < 30:
+                        logger.warning(
+                            f"[FORCE_PURGE] {market_id} order={order_id[:8]} — no book data, "
+                            f"market closing/closed ({time_to_expiry:.0f}s left)"
+                        )
+                        to_remove.append(order_id)
+                        self.kelly.release(entry_size)
+                        self._save_bankroll()
                     continue
             except Exception:
                 continue
@@ -531,9 +562,15 @@ class ArbitrageBot:
             tp = TP_RATIO_LOW if is_low_price else TP_RATIO
             sl = SL_RATIO_LOW if is_low_price else SL_RATIO
 
-            # Pre-expiry forced sell: close position 90 seconds before market ends
-            end_time = pos.get("end_time", 0)
-            time_to_expiry = end_time - now if end_time > 0 else float("inf")
+            # Periodic position heartbeat (every 30 s visible in logs)
+            if int(now) % 30 == 0:
+                logger.info(
+                    f"[POS] {market_id} {pos.get('side','')} "
+                    f"entry={entry_price:.3f} now={current_price:.3f} "
+                    f"pnl={pnl_ratio:+.1%} | {shares:.1f} shares | "
+                    f"TP={tp:.0%} SL={sl:.0%} | "
+                    f"expires={f'{time_to_expiry:.0f}s' if time_to_expiry < 9e8 else 'unknown'}"
+                )
 
             reason = None
             if pnl_ratio >= tp:
@@ -545,15 +582,14 @@ class ArbitrageBot:
 
             if reason:
                 logger.info(
-                    f"[{reason}] {pos['market_id']} order={order_id[:8]} "
+                    f"[{reason}] {market_id} order={order_id[:8]} "
                     f"entry={entry_price:.4f} now={current_price:.4f} pnl={pnl_ratio:+.1%} "
                     f"| {shares:.2f} shares | value=${current_value:.2f}"
                 )
                 # 1. Try cancel (works if order is still open/unfilled)
                 cancelled = self.executor.cancel_order(order_id)
                 if not cancelled:
-                    # 2. Order already filled — sell all shares to close position
-                    # Use close_position() which accepts shares directly, bypasses $5 minimum
+                    # 2. Order filled — sell all shares via close_position (bypasses $5 min)
                     sell_price = round(current_price, 4)
                     self.executor.close_position(
                         token_id, shares, sell_price,
