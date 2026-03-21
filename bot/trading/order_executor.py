@@ -443,22 +443,26 @@ class OrderExecutor:
         return self.place_order(token_id, side, price, size, order_type="GTD",
                                 expiration=expiration, tick_size=tick_size, neg_risk=neg_risk)
 
-    def cancel_order(self, order_id: str) -> bool:
-        """Cancel order. Returns True if order was in canceled list, False otherwise."""
+    def cancel_order(self, order_id: str) -> str:
+        """Cancel order. Returns status string:
+        'CANCELED'       — order was successfully cancelled (unfilled/partial)
+        'ALREADY_DONE'   — order not in canceled list (already filled or already cancelled)
+        'API_ERROR'      — transient failure, order may still be open
+        """
         try:
             resp = self.client.cancel(order_id)
             canceled_list = resp.get("canceled", []) if isinstance(resp, dict) else []
             not_canceled = resp.get("not_canceled", {}) if isinstance(resp, dict) else {}
             if order_id in canceled_list:
-                logger.info(f"Cancelled order {order_id}")
-                return True
+                logger.info(f"[CANCEL] Order {order_id[:8]} cancelled successfully")
+                return "CANCELED"
             else:
                 reason = not_canceled.get(order_id, "unknown")
-                logger.info(f"Order {order_id} not cancelled (likely filled): {reason}")
-                return False
+                logger.info(f"[CANCEL] Order {order_id[:8]} not cancelled (filled/done): {reason}")
+                return "ALREADY_DONE"
         except Exception as e:
-            logger.error(f"Failed to cancel order {order_id}: {e}")
-            return False
+            logger.error(f"[CANCEL] API error for {order_id[:8]}: {e}")
+            return "API_ERROR"
 
     def get_order_fills(self, order_id: str) -> float:
         """Query CLOB API for actual filled share count.

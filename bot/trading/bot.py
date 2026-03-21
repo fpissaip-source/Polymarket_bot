@@ -592,7 +592,11 @@ class ArbitrageBot:
                     f"entry={entry_price:.4f} now={current_price:.4f} pnl={pnl_ratio:+.1%} "
                     f"| {shares:.2f} shares | value=${current_value:.2f}"
                 )
-                self.executor.cancel_order(order_id)
+                cancel_status = self.executor.cancel_order(order_id)
+
+                if cancel_status == "API_ERROR":
+                    logger.warning(f"[SELL] Cancel API failed — retrying next cycle to avoid untracked exposure")
+                    continue
 
                 actual_shares = self.executor.get_order_fills(order_id)
                 if actual_shares < 0:
@@ -607,7 +611,7 @@ class ArbitrageBot:
 
                 sell_price = round(best_bid, 4)
                 logger.info(
-                    f"[SELL] mid={current_price:.4f} best_bid={best_bid:.4f} "
+                    f"[SELL] cancel={cancel_status} mid={current_price:.4f} best_bid={best_bid:.4f} "
                     f"selling {actual_shares:.2f} shares @ {sell_price}"
                 )
                 result = self.executor.close_position(
