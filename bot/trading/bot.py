@@ -1452,12 +1452,11 @@ class ArbitrageBot:
             size = opp.kelly_result.position_size
             side = opp.edge_result.side          # "YES", "NO", or "BOTH"
 
-            # 5-minute markets: use FOK for instant fill — GTC resting orders
-            # take too long, tokens don't settle before market expires → 100% loss.
-            # Aggressive taker price ensures immediate execution.
+            # 5-minute markets: use GTC at competitive price — FOK fails on thin books,
+            # GTC sits in the order book and fills when matched.
             is_passive = opp.edge_result.is_passive
             if market.timeframe == "5m":
-                is_passive = False
+                is_passive = True
                 if side == "NO":
                     price = round(1.0 - opp.stoikov_quote.bid, 6)
                 else:
