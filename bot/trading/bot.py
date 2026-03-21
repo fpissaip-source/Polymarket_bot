@@ -543,7 +543,19 @@ class ArbitrageBot:
             buy_filled = pos.get("buy_filled", True)
             if not buy_filled:
                 filled_shares = self.executor.get_order_fills(order_id)
-                if filled_shares <= 0:
+                # API error (-1): if >30s since entry, assume filled with estimated shares
+                if filled_shares < 0:
+                    _api_wait = time.time() - pos.get("entry_time", time.time())
+                    if _api_wait > 30:
+                        _est = pos.get("shares", round(entry_size / entry_price, 2) if entry_price > 0 else 0)
+                        logger.warning(
+                            f"[FILL_CHECK] {market_id} order={order_id[:8]} — "
+                            f"fill API error after {_api_wait:.0f}s, assuming {_est:.2f} shares filled"
+                        )
+                        filled_shares = _est
+                    else:
+                        continue  # Too early to assume — retry next cycle
+                if filled_shares == 0:
                     # Order not yet filled — check if it was cancelled without a fill
                     try:
                         order_info = self.executor.client.get_order(order_id)
@@ -613,15 +625,25 @@ class ArbitrageBot:
                                     _sl_em = SL_RATIO_LOW if _is_low else SL_RATIO
                                     _pnl_em = (_em_price - entry_price) / entry_price
                                     if _pnl_em >= _tp_em or _pnl_em <= -_sl_em:
-                                        logger.warning(
-                                            f"[EARLY_EXIT] {market_id} pnl={_pnl_em:+.1%} "
-                                            f"hit TP/SL threshold before fill confirmed — "
-                                            f"cancelling unfilled buy"
-                                        )
-                                        self.executor.cancel_order(order_id)
-                                        to_remove.append(order_id)
-                                        self.kelly.release(entry_size)
-                                        self._save_bankroll()
+                                        _cancel_result = self.executor.cancel_order(order_id)
+                                        if _cancel_result == "ALREADY_DONE":
+                                            # Buy was actually filled — mark filled, sell next cycle
+                                            logger.warning(
+                                                f"[EARLY_EXIT→FILLED] {market_id} pnl={_pnl_em:+.1%} "
+                                                f"cancel=ALREADY_DONE — buy confirmed filled, "
+                                                f"marking for TP/SL sell next cycle"
+                                            )
+                                            pos["buy_filled"] = True
+                                            pos.setdefault("shares", est_shares)
+                                            self._save_live_positions()
+                                        else:
+                                            logger.warning(
+                                                f"[EARLY_EXIT] {market_id} pnl={_pnl_em:+.1%} "
+                                                f"hit TP/SL — unfilled buy cancelled ({_cancel_result})"
+                                            )
+                                            to_remove.append(order_id)
+                                            self.kelly.release(entry_size)
+                                            self._save_bankroll()
                                         continue
                             except Exception:
                                 pass
