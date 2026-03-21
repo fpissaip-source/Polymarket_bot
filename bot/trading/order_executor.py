@@ -20,7 +20,9 @@ import logging
 
 try:
     from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
+    from py_clob_client.clob_types import (
+        ApiCreds, OrderArgs, OrderType, PartialCreateOrderOptions,
+    )
     _PY_CLOB_AVAILABLE = True
 except ImportError:
     _PY_CLOB_AVAILABLE = False
@@ -144,7 +146,7 @@ class OrderExecutor:
             expiration=expiration,
         )
 
-        options = {"tick_size": tick_size, "neg_risk": neg_risk}
+        options = PartialCreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk)
 
         try:
             signed = self.client.create_order(order_args, options)
