@@ -17,6 +17,8 @@ These are fetched dynamically from the CLOB API before each order.
 API credentials are auto-derived from the private key if not set.
 """
 
+from __future__ import annotations
+
 import time
 import logging
 
