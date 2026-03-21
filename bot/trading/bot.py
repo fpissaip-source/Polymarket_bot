@@ -169,6 +169,7 @@ class ArbitrageBot:
         self._tick_count = 0
         # Live position tracking for TP/SL: order_id → position dict
         self._live_positions: dict[str, dict] = {}
+        self._load_live_positions()  # Restore positions from previous session
         self.dry_run_tracker = DryRunTracker(virtual_bankroll=starting_bankroll)
         self._tier_base_lambda = self.kelly.lambda_fraction
         self._tier_base_edge = self._current_min_edge
@@ -202,6 +203,37 @@ class ArbitrageBot:
                 json.dump({"bankroll": round(self.kelly.bankroll, 4)}, f)
         except Exception as e:
             logger.warning(f"Could not save bankroll state: {e}")
+
+    # ------------------------------------------------------------------
+    # Live position persistence (survives restarts)
+    # ------------------------------------------------------------------
+    LIVE_POSITIONS_FILE = "live_positions.json"
+
+    def _save_live_positions(self):
+        try:
+            with open(self.LIVE_POSITIONS_FILE, "w") as f:
+                json.dump(self._live_positions, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Could not save live positions: {e}")
+
+    def _load_live_positions(self):
+        if not os.path.exists(self.LIVE_POSITIONS_FILE):
+            return
+        try:
+            with open(self.LIVE_POSITIONS_FILE) as f:
+                loaded = json.load(f)
+            # Only keep positions that haven't expired yet
+            now = time.time()
+            active = {oid: pos for oid, pos in loaded.items()
+                      if pos.get("end_time", 0) == 0 or pos["end_time"] > now - 60}
+            self._live_positions = active
+            if active:
+                logger.info(
+                    f"[STARTUP] Restored {len(active)} live positions from previous session: "
+                    + ", ".join(f"{p['market_id']}" for p in active.values())
+                )
+        except Exception as e:
+            logger.warning(f"Could not load live positions: {e}")
 
     # ------------------------------------------------------------------
     # Dynamic tier adjustment
@@ -490,7 +522,8 @@ class ArbitrageBot:
             except Exception:
                 continue
 
-            shares = entry_size / entry_price if entry_price > 0 else 0
+            # Use stored share count if available (exact), else compute from size/price
+            shares = pos.get("shares") or (entry_size / entry_price if entry_price > 0 else 0)
             current_value = shares * current_price
             pnl_ratio = (current_value - entry_size) / entry_size if entry_size > 0 else 0
 
@@ -498,11 +531,17 @@ class ArbitrageBot:
             tp = TP_RATIO_LOW if is_low_price else TP_RATIO
             sl = SL_RATIO_LOW if is_low_price else SL_RATIO
 
+            # Pre-expiry forced sell: close position 90 seconds before market ends
+            end_time = pos.get("end_time", 0)
+            time_to_expiry = end_time - now if end_time > 0 else float("inf")
+
             reason = None
             if pnl_ratio >= tp:
                 reason = f"TAKE_PROFIT({pnl_ratio:+.1%})"
             elif pnl_ratio <= -sl:
                 reason = f"STOP_LOSS({pnl_ratio:+.1%})"
+            elif 0 < time_to_expiry <= 90:
+                reason = f"PRE_EXPIRY({time_to_expiry:.0f}s left)"
 
             if reason:
                 logger.info(
@@ -526,6 +565,8 @@ class ArbitrageBot:
 
         for oid in to_remove:
             self._live_positions.pop(oid, None)
+        if to_remove:
+            self._save_live_positions()
 
     def _refresh_markets(self, now: float):
         """
@@ -1108,6 +1149,7 @@ class ArbitrageBot:
                     opp.market_id, side, size, price, order_id,
                     token_id=token_id,
                     tick_size=market.tick_size, neg_risk=market.neg_risk,
+                    end_time=market.end_time,
                 )
             else:
                 logger.warning(f"Order rejected for {opp.market_id}")
@@ -1140,9 +1182,11 @@ class ArbitrageBot:
             self.kelly.allocate(size)
             self._save_bankroll()
             self._record_trade(market.market_id, "YES", half, yes_price, yes_id,
-                               token_id=market.token_id_yes, tick_size=ts, neg_risk=nr)
+                               token_id=market.token_id_yes, tick_size=ts, neg_risk=nr,
+                               end_time=market.end_time)
             self._record_trade(market.market_id, "NO", half, no_price, no_id,
-                               token_id=market.token_id_no, tick_size=ts, neg_risk=nr)
+                               token_id=market.token_id_no, tick_size=ts, neg_risk=nr,
+                               end_time=market.end_time)
         elif yes_id or no_id:
             logger.warning(
                 f"Partial arb fill for {market.market_id}: "
@@ -1152,10 +1196,12 @@ class ArbitrageBot:
             self._save_bankroll()
             if yes_id:
                 self._record_trade(market.market_id, "YES", half, yes_price, yes_id,
-                                   token_id=market.token_id_yes, tick_size=ts, neg_risk=nr)
+                                   token_id=market.token_id_yes, tick_size=ts, neg_risk=nr,
+                                   end_time=market.end_time)
             if no_id:
                 self._record_trade(market.market_id, "NO", half, no_price, no_id,
-                                   token_id=market.token_id_no, tick_size=ts, neg_risk=nr)
+                                   token_id=market.token_id_no, tick_size=ts, neg_risk=nr,
+                                   end_time=market.end_time)
         else:
             logger.warning(f"Both legs rejected for {market.market_id}")
 
@@ -1175,23 +1221,30 @@ class ArbitrageBot:
 
     def _record_trade(self, market_id: str, side: str, size: float, price: float,
                       order_id: str, token_id: str = "",
-                      tick_size: str = "0.01", neg_risk: bool = False):
+                      tick_size: str = "0.01", neg_risk: bool = False,
+                      end_time: float = 0.0):
         """Append a trade record to trades.json and register live position for TP/SL."""
         # Register live position for TP/SL monitoring
         if not self.dry_run and order_id and token_id:
+            shares = size / price if price > 0 else 0
             self._live_positions[order_id] = {
                 "market_id": market_id,
                 "side": side,
                 "token_id": token_id,
                 "entry_price": price,
                 "entry_size": size,
+                "shares": shares,
                 "tick_size": tick_size,
                 "neg_risk": neg_risk,
                 "entry_time": time.time(),
+                "end_time": end_time,  # Market expiry timestamp
             }
+            self._save_live_positions()
             logger.info(
                 f"[POSITION] Tracking live position: {market_id} {side} "
-                f"${size:.2f} @ {price:.4f} | TP={TP_RATIO:.0%} SL={SL_RATIO:.0%}"
+                f"${size:.2f} @ {price:.4f} shares={shares:.2f} | "
+                f"TP={TP_RATIO:.0%} SL={SL_RATIO:.0%} | "
+                f"expires={time.strftime('%H:%M:%S', time.localtime(end_time)) if end_time else 'unknown'}"
             )
 
         try:
