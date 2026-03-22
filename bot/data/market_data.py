@@ -648,7 +648,7 @@ class GammaClient:
         matched: list[dict] = []
 
         # Fetch by volume (broad sweep) — gets the most active events first
-        for order in ("volume", "liquidity", "start_date_max"):
+        for order in ("volume", "liquidity"):
             events = self.get_events(active=True, limit=limit, order=order)
             for event in events:
                 # Event-level tag check
