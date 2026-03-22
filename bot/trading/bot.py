@@ -700,6 +700,19 @@ class ArbitrageBot:
                 # Buy confirmed filled — update position and place SL bracket now
                 pos["buy_filled"] = True
                 pos["fill_confirmed_at"] = now  # Track settlement cooldown
+
+                # CLOB cache sync: tell the server to re-read our on-chain CTF balance.
+                # Without this, the CLOB may reject sell orders with "not enough balance".
+                try:
+                    from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+                    self.executor.client.update_balance_allowance(
+                        BalanceAllowanceParams(
+                            asset_type=AssetType.CONDITIONAL, token_id=token_id
+                        )
+                    )
+                    logger.info(f"[CLOB_SYNC] ✓ Synced CONDITIONAL balance for {token_id[:16]}...")
+                except Exception as _sync_e:
+                    logger.warning(f"[CLOB_SYNC] Cache sync failed: {_sync_e}")
                 pos["shares"] = filled_shares
                 # Correct entry_size to actual cost (partial fills are common).
                 # Wrong entry_size causes fake SL: e.g. 1.59/5 shares filled →
@@ -926,6 +939,28 @@ class ArbitrageBot:
                     pos["shares"] = actual_shares
                     pos["shares_confirmed"] = True
                     self._save_live_positions()
+
+                # Clamp sell amount to actual on-chain CTF balance (fixes size mismatch
+                # when taker fees deduct from token amount: buy 5 → receive 4.95)
+                try:
+                    from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+                    _bp = BalanceAllowanceParams(
+                        asset_type=AssetType.CONDITIONAL, token_id=token_id
+                    )
+                    _bd = self.executor.client.get_balance_allowance(_bp)
+                    ctf_real = float(_bd.get("balance", "0") or "0") / 1_000_000
+                    if 0 < ctf_real < actual_shares:
+                        import math
+                        clamped = math.floor(ctf_real * 100) / 100
+                        logger.info(
+                            f"[SELL] Clamping shares {actual_shares:.2f} → {clamped:.2f} "
+                            f"(actual CTF balance={ctf_real:.6f})"
+                        )
+                        actual_shares = clamped
+                        pos["shares"] = actual_shares
+                        pos["shares_confirmed"] = True
+                except Exception as _be:
+                    logger.warning(f"[SELL] CTF balance check failed: {_be}")
 
                 # Dead market guard: best_bid near zero = no liquidity (market expired as loser)
                 DEAD_BID = 0.02
