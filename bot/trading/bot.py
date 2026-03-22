@@ -1463,15 +1463,28 @@ class ArbitrageBot:
                 # Only actively refresh within the slot budget — soonest markets first
                 # (list is sorted by end_time so we naturally fill slots with urgency).
                 _already_cached = self.event_sentiment.get_result(market_id) is not None
-                if _already_cached or _gemini_analyzed < _max_gemini_slots:
+
+                # Force-refresh when edge is very large (>15% EV) — double-check
+                # before committing capital to a high-conviction trade.
+                _raw_edge = abs(p_yes - q) if q is not None else 0.0
+                _force = _raw_edge > 0.15 and not _already_cached
+
+                if _already_cached or _gemini_analyzed < _max_gemini_slots or _force:
                     self.event_sentiment.analyze_async(
                         market_id=market_id,
                         question=state.question,
                         market_price=p_yes,
                         weather_context=weather_ctx,
+                        end_time=state.end_time,
+                        force_refresh=_force,
                     )
                     if not _already_cached:
                         _gemini_analyzed += 1
+                    if _force:
+                        logger.info(
+                            f"[GEMINI_FORCE] {market_id[:20]} edge={_raw_edge:.1%} > 15% "
+                            f"→ forcing fresh analysis before trade"
+                        )
                 gemini_prob = self.event_sentiment.get_probability(market_id)
                 gemini_conf = self.event_sentiment.get_confidence(market_id)
 

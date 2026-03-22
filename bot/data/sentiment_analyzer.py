@@ -17,6 +17,7 @@ import re
 import time
 import logging
 import threading
+import queue
 from dataclasses import dataclass, field
 from datetime import date
 
@@ -62,7 +63,7 @@ class EventSentimentAnalyzer:
     def __init__(self):
         self._cache: dict[str, EventSentimentResult] = {}
         self._lock = threading.Lock()
-        self._running: set[str] = set()
+        self._queued: set[str] = set()   # market_ids currently in queue
 
         if genai is None:
             logger.warning("google-genai not installed — event sentiment disabled")
@@ -78,6 +79,17 @@ class EventSentimentAnalyzer:
         self._client = genai.Client(api_key=api_key)
         self._enabled = True
         self._consecutive_failures = 0
+
+        # Priority queue: (priority_float, market_id, question, market_price, weather_ctx)
+        # Lower priority = analyzed first (soonest expiry = smallest end_time).
+        self._pq: queue.PriorityQueue = queue.PriorityQueue()
+
+        # Single worker thread — sequential analysis, respects rate limits
+        self._worker = threading.Thread(
+            target=self._worker_loop, daemon=True, name="gemini-worker"
+        )
+        self._worker.start()
+        logger.info("EventSentimentAnalyzer: priority-queue worker started")
         self._max_failures = 5
 
         # Try to set up Google Search Grounding tool
@@ -246,33 +258,54 @@ class EventSentimentAnalyzer:
                 self._enabled = False
         finally:
             with self._lock:
-                self._running.discard(market_id)
+                self._queued.discard(market_id)
+
+    def _worker_loop(self):
+        """
+        Single background worker: dequeues markets by priority and calls Gemini
+        one at a time. This prevents rate-limit errors from parallel API calls.
+        """
+        while True:
+            try:
+                priority, market_id, question, market_price, weather_ctx = self._pq.get(timeout=5)
+            except queue.Empty:
+                continue
+            try:
+                # Skip if cache became fresh while waiting in queue
+                with self._lock:
+                    cached = self._cache.get(market_id)
+                    self._queued.discard(market_id)
+                if cached and cached.is_fresh:
+                    continue
+                self._analyze(market_id, question, market_price, weather_ctx)
+            except Exception as e:
+                logger.warning(f"[GEMINI_WORKER] Unexpected error for {market_id}: {e}")
+            finally:
+                self._pq.task_done()
 
     def analyze_async(self, market_id: str, question: str, market_price: float = 0.5,
-                      weather_context: str = ""):
+                      weather_context: str = "", end_time: float = 0.0,
+                      force_refresh: bool = False):
         """
-        Trigger background Gemini analysis for an event market.
-        Skips if cache is fresh or already running.
-        weather_context: optional real-time weather data string from WeatherFeed.
+        Enqueue a market for Gemini analysis by priority (soonest expiry first).
+
+        end_time     : Unix timestamp of market expiry — lower = higher priority.
+        force_refresh: bypass cache (use for large-edge confirmation).
         """
         if not self._enabled:
             return
 
         with self._lock:
             cached = self._cache.get(market_id)
-            if cached and cached.is_fresh:
+            if cached and cached.is_fresh and not force_refresh:
                 return
-            if market_id in self._running:
+            if market_id in self._queued and not force_refresh:
                 return
-            self._running.add(market_id)
+            self._queued.add(market_id)
 
-        t = threading.Thread(
-            target=self._analyze,
-            args=(market_id, question, market_price, weather_context),
-            daemon=True,
-            name=f"gemini-{market_id[:12]}",
-        )
-        t.start()
+        # Priority: soonest end_time wins. Unknown (0) → analyzed last.
+        priority = end_time if end_time > 0 else float("inf")
+        self._pq.put((priority, market_id, question, market_price, weather_context))
 
     def get_probability(self, market_id: str) -> float | None:
         """
