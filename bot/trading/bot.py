@@ -1341,7 +1341,27 @@ class ArbitrageBot:
         opportunities: list[TradeOpportunity] = []
         market_stats = []  # collect for heartbeat
 
-        for market_id, state in list(self._markets.items()):
+        # Sort markets by end_time ascending (soonest expiry first).
+        # This ensures Gemini analyses near-term markets first — the ones where
+        # a decision needs to be made NOW. Unknown expiry (0) goes last.
+        # Within the same expiry tier, higher-volume markets come first.
+        _sorted_markets = sorted(
+            self._markets.items(),
+            key=lambda kv: (
+                kv[1].end_time if kv[1].end_time > 0 else float("inf"),
+            ),
+        )
+
+        # Cap how many markets Gemini actively analyses per tick based on
+        # available capital — no point analyzing 100 markets if we can only
+        # afford 3 trades.
+        _max_gemini_slots = max(
+            3,
+            int(self.kelly.available_capital / max(MIN_BET_SIZE, 1.0)) + 2,
+        )
+        _gemini_analyzed = 0
+
+        for market_id, state in _sorted_markets:
             # Skip markets outside active window — but trade freely if end_time unknown (=0)
             if state.end_time > 0:
                 remaining = state.end_time - now
@@ -1439,13 +1459,19 @@ class ArbitrageBot:
                 if weather_ctx:
                     logger.debug(f"[WEATHER:{market_id[:20]}] {weather_ctx[:80]}…")
 
-                # Trigger background Gemini analysis (cached, refreshes every 5min)
-                self.event_sentiment.analyze_async(
-                    market_id=market_id,
-                    question=state.question,
-                    market_price=p_yes,
-                    weather_context=weather_ctx,
-                )
+                # Trigger background Gemini analysis (cached, refreshes every 5min).
+                # Only actively refresh within the slot budget — soonest markets first
+                # (list is sorted by end_time so we naturally fill slots with urgency).
+                _already_cached = self.event_sentiment.get_result(market_id) is not None
+                if _already_cached or _gemini_analyzed < _max_gemini_slots:
+                    self.event_sentiment.analyze_async(
+                        market_id=market_id,
+                        question=state.question,
+                        market_price=p_yes,
+                        weather_context=weather_ctx,
+                    )
+                    if not _already_cached:
+                        _gemini_analyzed += 1
                 gemini_prob = self.event_sentiment.get_probability(market_id)
                 gemini_conf = self.event_sentiment.get_confidence(market_id)
 
@@ -1612,6 +1638,16 @@ class ArbitrageBot:
                 f"{a}:{v['regime'].split('_')[0]}(×{v['kelly_mult']})"
                 for a, v in regime_summary.items()
             )
+            # Show top-5 soonest-expiring markets for priority overview
+            _priority_log = []
+            for _mid, _st in _sorted_markets[:5]:
+                if _st.end_time > 0:
+                    _h = (_st.end_time - now) / 3600
+                    _label = (f"{_h:.1f}h" if _h < 48 else f"{_h/24:.1f}d")
+                    _priority_log.append(f"{_mid[:12]}({_label})")
+            if _priority_log:
+                logger.info(f"[PRIORITY] Soonest markets: {' > '.join(_priority_log)} | Gemini slots: {_gemini_analyzed}/{_max_gemini_slots}")
+
             logger.info(
                 f"[HEARTBEAT] tick={self._tick_count} | markets={len(self._markets)} "
                 f"({no_data} no data, {len(active)} active) | "
