@@ -133,6 +133,13 @@ MC_SIMULATIONS = 600          # Number of simulation paths
 MC_TRADES = 200               # Number of trades per simulation
 MC_MAX_DD_LIMIT = 0.30        # Stop if max drawdown exceeds 30%
 
+# Copy-trading from polybot-arena.com top bots
+# Add proxy wallet addresses (comma-separated 0x...) of top traders you want to follow.
+# Find addresses: open polymarket.com/@<username>, copy the 0x wallet shown on the profile.
+# Known top bots (Mar 2026): BoneReader (+$457k), vidarx (+$274k), vague-sourdough (+$165k)
+# Example: COPY_TRADE_WALLETS=0xabc...123,0xdef...456
+COPY_TRADE_WALLETS = os.getenv("COPY_TRADE_WALLETS", "")  # read by wallet_tracker.py
+
 # Bot loop
 POLL_INTERVAL_SECONDS = 30    # Event markets move slowly — scan every 30s
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")

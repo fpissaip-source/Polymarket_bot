@@ -1,10 +1,11 @@
 """
-Event Sentiment Analyzer (Gemini-powered)
-==========================================
+Event Sentiment Analyzer (Gemini-powered, with Google Search Grounding)
+========================================================================
 Analyzes prediction market questions: politics, elections, geopolitics,
 sports, entertainment — markets where LLMs have genuine information advantage.
 
 Uses Gemini as the PRIMARY probability estimator for event markets.
+Gemini uses live Google Search to get up-to-date information before answering.
 If Gemini thinks YES=70% and market price is 60%, that is a 10% edge → BUY.
 
 Updates each market every 5 minutes in background threads.
@@ -79,7 +80,33 @@ class EventSentimentAnalyzer:
         self._consecutive_failures = 0
         self._max_failures = 5
 
-        logger.info("EventSentimentAnalyzer initialized (gemini-2.0-flash)")
+        # Try to set up Google Search Grounding tool
+        self._search_tool = self._build_search_tool()
+        if self._search_tool:
+            logger.info("EventSentimentAnalyzer initialized (gemini-2.0-flash + Google Search Grounding)")
+        else:
+            logger.info("EventSentimentAnalyzer initialized (gemini-2.0-flash, no search grounding)")
+
+    def _build_search_tool(self):
+        """Build the Google Search Grounding tool. Returns None if unavailable."""
+        if genai is None:
+            return None
+        try:
+            from google.genai import types
+            # Try newer SDK API first (google_search_retrieval)
+            tool = types.Tool(
+                google_search_retrieval=types.GoogleSearchRetrieval()
+            )
+            return tool
+        except (AttributeError, TypeError):
+            pass
+        try:
+            from google.genai import types
+            # Fallback: newer SDK uses google_search
+            tool = types.Tool(google_search=types.GoogleSearch())
+            return tool
+        except (AttributeError, TypeError):
+            return None
 
     def _analyze(self, market_id: str, question: str, market_price: float):
         """Call Gemini for an event market. Runs in background thread."""
@@ -104,11 +131,32 @@ class EventSentimentAnalyzer:
                 f"- EDGE: BUY_YES if your prob > market+5%, BUY_NO if < market-5%, else NO_EDGE"
             )
 
-            response = self._client.models.generate_content(
-                model="gemini-2.0-flash",
-                contents=prompt,
-            )
+            # Build config with Google Search Grounding when available
+            gen_kwargs: dict = {"model": "gemini-2.0-flash", "contents": prompt}
+            if self._search_tool is not None:
+                try:
+                    from google.genai import types
+                    gen_kwargs["config"] = types.GenerateContentConfig(
+                        tools=[self._search_tool]
+                    )
+                except Exception:
+                    pass
+
+            response = self._client.models.generate_content(**gen_kwargs)
             text = response.text.strip()
+
+            # Log search grounding sources if present
+            try:
+                chunks = (
+                    response.candidates[0].grounding_metadata.grounding_chunks
+                    if response.candidates else []
+                )
+                if chunks:
+                    sources = [c.web.uri for c in chunks if getattr(c, "web", None)]
+                    if sources:
+                        logger.debug(f"[GEMINI] search sources: {sources[:3]}")
+            except Exception:
+                pass
 
             prob_match = re.search(r"PROBABILITY:\s*(0?\.\d+|[01]\.0*)", text)
             conf_match = re.search(r"CONFIDENCE:\s*(0?\.\d+|[01]\.0*)", text)

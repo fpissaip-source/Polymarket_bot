@@ -1,17 +1,31 @@
 """
-Wallet Tracker
-==============
-Tracks top-performing wallets on Polymarket and extracts trading signals.
+Wallet Tracker — Copy-Trading from Top Polymarket Bots
+=======================================================
+Monitors the top-performing bots listed on polybot-arena.com and the
+Polymarket leaderboard, then uses Gemini to evaluate whether to copy
+their trades.
 
-Strategy:
-  1. Fetch leaderboard to find consistently profitable wallets
-  2. Analyze their recent activity (which tokens, which side, timing)
-  3. Compute per-wallet win rate and confidence score
-  4. For active markets: check if smart money has a position → Bayesian boost
+Flow:
+  1. Discover top wallets  →  leaderboard API + COPY_TRADE_WALLETS env
+  2. Fetch their recent activity  →  data-api.polymarket.com/activity
+  3. Detect fresh trades (< SIGNAL_MAX_AGE seconds old)
+  4. Gemini evaluates: "is this trade worth copying?" (live search grounding)
+  5. Return a CopySignal that the bot uses to adjust q
+
+Known top bots from polybot-arena.com (add their proxy wallet addresses to
+COPY_TRADE_WALLETS in .env to start copy-trading them immediately):
+  - BoneReader  (+$457k profit, multi-timeframe)
+  - vidarx      (+$274k profit, 5-min markets)
+  - vague-sourdough (+$165k profit, 5-min markets)
+
+To find a wallet address: open polymarket.com/@<username>, copy the 0x address
+shown on the profile page, then add to COPY_TRADE_WALLETS (comma-separated).
 """
 
+import os
 import time
 import logging
+import threading
 from collections import defaultdict
 from dataclasses import dataclass, field
 
@@ -24,22 +38,43 @@ logger = logging.getLogger(__name__)
 # Only trust wallets with this many trades or more
 MIN_TRADES_FOR_SIGNAL = 10
 # Minimum win rate to be considered a "smart wallet"
-MIN_WIN_RATE = 0.58
-# How old (seconds) a trade can be and still count as a signal
-SIGNAL_MAX_AGE = 300  # 5 minutes
+MIN_WIN_RATE = 0.55
+# How old (seconds) a trade can be and still count as a copy signal
+SIGNAL_MAX_AGE = 600   # 10 minutes — event markets move slowly
 # Cache leaderboard for this many seconds before refreshing
 LEADERBOARD_TTL = 600  # 10 minutes
 # Cache wallet activity for this many seconds
-ACTIVITY_TTL = 60  # 1 minute
+ACTIVITY_TTL = 90      # 1.5 minutes
 
+
+# ---------------------------------------------------------------------------
+# Known top-bot Polymarket pseudonyms → look them up manually on polymarket.com
+# and add their 0x proxy addresses to COPY_TRADE_WALLETS in your .env file.
+# ---------------------------------------------------------------------------
+_KNOWN_BOT_LABELS = {
+    # address (lowercase) → human-readable label  (filled in at runtime from env)
+}
+
+
+def _load_env_wallets() -> list[str]:
+    """Read COPY_TRADE_WALLETS from environment (comma-separated 0x addresses)."""
+    raw = os.getenv("COPY_TRADE_WALLETS", "")
+    wallets = [w.strip() for w in raw.split(",") if w.strip().startswith("0x")]
+    return wallets
+
+
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
 
 @dataclass
 class WalletStats:
     address: str
+    label: str = ""
     total_trades: int = 0
     winning_trades: int = 0
     total_pnl: float = 0.0
-    recent_positions: list = field(default_factory=list)  # [{token_id, side, timestamp, size}]
+    recent_trades: list = field(default_factory=list)   # list of trade dicts
     last_updated: float = 0.0
 
     @property
@@ -55,21 +90,48 @@ class WalletStats:
 
 @dataclass
 class WalletSignal:
-    """Signal derived from smart wallet activity for a specific token."""
+    """Signal derived from smart wallet activity for a specific token (legacy compat)."""
     token_id: str
-    smart_wallet_count: int      # How many smart wallets hold this position
+    smart_wallet_count: int
     dominant_side: str           # "YES" or "NO"
-    avg_win_rate: float          # Average win rate of those wallets
-    confidence_boost: float      # Value in [-0.15, +0.15] to add to Bayesian prior
+    avg_win_rate: float
+    confidence_boost: float      # [-0.15, +0.15] to add to Bayesian prior
 
     @property
     def has_signal(self) -> bool:
         return self.smart_wallet_count > 0
 
 
+@dataclass
+class CopyTrade:
+    """A specific trade from a top bot that we might want to copy."""
+    wallet_address: str
+    wallet_label: str
+    token_id: str
+    condition_id: str
+    market_title: str
+    side: str           # "YES" or "NO"
+    price: float
+    size: float
+    timestamp: float
+    win_rate: float     # wallet's historical win rate
+
+    @property
+    def age_seconds(self) -> float:
+        return time.time() - self.timestamp
+
+    @property
+    def is_fresh(self) -> bool:
+        return self.age_seconds < SIGNAL_MAX_AGE
+
+
+# ---------------------------------------------------------------------------
+# Main tracker
+# ---------------------------------------------------------------------------
+
 class WalletTracker:
     """
-    Tracks profitable wallets and generates trading signals.
+    Tracks profitable wallets from polybot-arena.com and generates copy signals.
     Integrates with the Bayesian model as an additional data source.
     """
 
@@ -77,198 +139,406 @@ class WalletTracker:
         self.host = host.rstrip("/")
         self.top_n = top_n
         self._session = requests.Session()
-        self._session.headers.update({"Content-Type": "application/json"})
+        self._session.headers.update({
+            "Accept": "application/json",
+            "User-Agent": "polymarket-bot/1.0",
+        })
 
         self._wallets: dict[str, WalletStats] = {}
         self._leaderboard_cache: list[str] = []
         self._leaderboard_updated: float = 0.0
+        self._lock = threading.Lock()
 
-        # token_id → list of (address, side, timestamp)
-        self._token_positions: dict[str, list] = defaultdict(list)
+        # token_id → list of CopyTrade (fresh only)
+        self._copy_trades: dict[str, list[CopyTrade]] = defaultdict(list)
+
+        # Load configured wallets immediately
+        env_wallets = _load_env_wallets()
+        if env_wallets:
+            logger.info(f"WalletTracker: loaded {len(env_wallets)} wallets from COPY_TRADE_WALLETS")
+            for addr in env_wallets:
+                label = _KNOWN_BOT_LABELS.get(addr.lower(), addr[:10] + "...")
+                self._wallets[addr] = WalletStats(address=addr, label=label)
+                if addr not in self._leaderboard_cache:
+                    self._leaderboard_cache.append(addr)
+        else:
+            logger.info(
+                "WalletTracker: COPY_TRADE_WALLETS not set — will use leaderboard only. "
+                "Tip: add top-bot wallet addresses to .env to copy-trade polybot-arena.com bots."
+            )
+
+        # Gemini client for copy-trade evaluation (optional)
+        self._gemini = self._init_gemini()
 
     # ------------------------------------------------------------------
-    # Leaderboard
+    # Gemini setup
+    # ------------------------------------------------------------------
+    def _init_gemini(self):
+        """Return a Gemini client if available, else None."""
+        try:
+            from google import genai
+            api_key = os.getenv("GEMINI_API_KEY", "")
+            if not api_key:
+                return None
+            client = genai.Client(api_key=api_key)
+            logger.debug("WalletTracker: Gemini client ready for copy-trade evaluation")
+            return client
+        except Exception:
+            return None
+
+    def _gemini_should_copy(self, trade: CopyTrade) -> bool:
+        """
+        Ask Gemini (with Google Search) whether to copy this trade.
+        Returns True if Gemini thinks it's a good idea, False otherwise.
+        Falls back to True (trust the smart wallet) if Gemini is unavailable.
+        """
+        if self._gemini is None:
+            return True  # no Gemini → trust smart wallet blindly
+
+        try:
+            from google.genai import types
+            prompt = (
+                f"A top Polymarket trader ({trade.wallet_label}, win rate "
+                f"{trade.win_rate:.0%}) just bought {trade.side} on this market:\n\n"
+                f"  \"{trade.market_title}\"\n\n"
+                f"  Token ID: {trade.token_id}\n"
+                f"  Price paid: {trade.price:.2%}\n"
+                f"  Trade size: ${trade.size:.2f}\n"
+                f"  Trade age: {trade.age_seconds:.0f}s\n\n"
+                f"Search for the latest news about this topic. "
+                f"Then answer with exactly ONE word: COPY or SKIP.\n"
+                f"COPY = their trade makes sense given current events.\n"
+                f"SKIP = outdated info or the market already moved against them."
+            )
+
+            # Try search grounding first, fall back to plain call
+            search_tool = None
+            try:
+                search_tool = types.Tool(
+                    google_search_retrieval=types.GoogleSearchRetrieval()
+                )
+            except (AttributeError, TypeError):
+                try:
+                    search_tool = types.Tool(google_search=types.GoogleSearch())
+                except (AttributeError, TypeError):
+                    pass
+
+            gen_kwargs: dict = {
+                "model": "gemini-2.0-flash",
+                "contents": prompt,
+            }
+            if search_tool is not None:
+                gen_kwargs["config"] = types.GenerateContentConfig(
+                    tools=[search_tool]
+                )
+
+            resp = self._gemini.models.generate_content(**gen_kwargs)
+            decision = resp.text.strip().upper()
+            should_copy = "COPY" in decision
+            logger.info(
+                f"[COPY-EVAL] {trade.wallet_label} bought {trade.side} on "
+                f"\"{trade.market_title[:40]}\" → Gemini: {decision}"
+            )
+            return should_copy
+
+        except Exception as e:
+            logger.debug(f"WalletTracker: Gemini copy-eval failed: {e}")
+            return True   # fallback: trust the smart wallet
+
+    # ------------------------------------------------------------------
+    # Leaderboard discovery
     # ------------------------------------------------------------------
     def _fetch_leaderboard(self) -> list[str]:
         """Fetch top wallet addresses from Polymarket leaderboard."""
         endpoints = [
-            ("https://data-api.polymarket.com/leaderboard", {"limit": self.top_n}),
-            ("https://data-api.polymarket.com/leaderboard", {"limit": self.top_n, "window": "1m"}),
-            ("https://gamma-api.polymarket.com/leaderboard", {"limit": self.top_n}),
+            f"{self.host}/leaderboard",
+            "https://data-api.polymarket.com/leaderboard",
+            "https://gamma-api.polymarket.com/leaderboard",
         ]
-        for url, params in endpoints:
-            try:
-                r = self._session.get(url, params=params, timeout=10)
-                if r.status_code != 200:
+        params_list = [
+            {"limit": self.top_n, "window": "1m"},
+            {"limit": self.top_n, "window": "all"},
+            {"limit": self.top_n},
+        ]
+        for url in endpoints:
+            for params in params_list:
+                try:
+                    r = self._session.get(url, params=params, timeout=8)
+                    if r.status_code != 200:
+                        continue
+                    data = r.json()
+                    entries = (
+                        data if isinstance(data, list)
+                        else data.get("data", data.get("leaderboard", []))
+                    )
+                    addresses = []
+                    for entry in entries:
+                        addr = (
+                            entry.get("proxyWallet")
+                            or entry.get("proxy_wallet")
+                            or entry.get("address")
+                            or entry.get("user")
+                        )
+                        if addr and addr.startswith("0x"):
+                            addresses.append(addr)
+                    if addresses:
+                        logger.info(
+                            f"WalletTracker: fetched {len(addresses)} wallets "
+                            f"from {url} (params={params})"
+                        )
+                        return addresses
+                except Exception:
                     continue
-                data = r.json()
-                entries = data if isinstance(data, list) else data.get("data", data.get("leaderboard", []))
-                addresses = []
-                for entry in entries:
-                    addr = (entry.get("proxyWallet") or entry.get("proxy_wallet") or
-                            entry.get("address") or entry.get("user"))
-                    if addr:
-                        addresses.append(addr)
-                if addresses:
-                    logger.info(f"WalletTracker: fetched {len(addresses)} wallets from {url}")
-                    return addresses
-            except Exception:
-                continue
-        logger.debug("WalletTracker: leaderboard not available, skipping smart wallet signals")
+        logger.debug("WalletTracker: leaderboard unavailable — using configured wallets only")
         return []
 
     def _refresh_leaderboard(self):
         """Refresh leaderboard cache if stale."""
-        if time.time() - self._leaderboard_updated < LEADERBOARD_TTL:
-            return
+        with self._lock:
+            if time.time() - self._leaderboard_updated < LEADERBOARD_TTL:
+                return
         addresses = self._fetch_leaderboard()
-        if addresses:
-            self._leaderboard_cache = addresses
+        with self._lock:
+            if addresses:
+                # Merge with existing (env wallets take priority)
+                for addr in addresses:
+                    if addr not in self._leaderboard_cache:
+                        self._leaderboard_cache.append(addr)
+                    if addr not in self._wallets:
+                        self._wallets[addr] = WalletStats(address=addr, label=addr[:10] + "...")
             self._leaderboard_updated = time.time()
-            # Initialize WalletStats for new wallets
-            for addr in addresses:
-                if addr not in self._wallets:
-                    self._wallets[addr] = WalletStats(address=addr)
 
     # ------------------------------------------------------------------
     # Activity fetching
     # ------------------------------------------------------------------
     def _fetch_activity(self, address: str) -> list[dict]:
-        """Fetch recent trade activity for a wallet."""
-        try:
-            r = self._session.get(
-                f"{self.host}/activity",
-                params={"user": address, "limit": 50},
-                timeout=10,
-            )
-            if r.status_code != 200:
-                return []
-            data = r.json()
-            if isinstance(data, list):
-                return data
-            return data.get("data", [])
-        except Exception as e:
-            logger.debug(f"WalletTracker: activity fetch failed for {address[:10]}...: {e}")
-            return []
+        """Fetch recent trade activity for a wallet via Polymarket data API."""
+        for url_tmpl in [f"{self.host}/activity", "https://data-api.polymarket.com/activity"]:
+            try:
+                r = self._session.get(
+                    url_tmpl,
+                    params={"user": address, "limit": 50, "type": "TRADE"},
+                    timeout=10,
+                )
+                if r.status_code != 200:
+                    continue
+                data = r.json()
+                trades = data if isinstance(data, list) else data.get("data", [])
+                if trades:
+                    return trades
+            except Exception as e:
+                logger.debug(f"WalletTracker: activity fetch failed for {address[:10]}…: {e}")
+        return []
 
     def _fetch_positions(self, address: str) -> list[dict]:
         """Fetch current open positions for a wallet."""
-        try:
-            r = self._session.get(
-                f"{self.host}/positions",
-                params={"user": address},
-                timeout=10,
-            )
-            if r.status_code != 200:
-                return []
-            data = r.json()
-            if isinstance(data, list):
-                return data
-            return data.get("data", [])
-        except Exception as e:
-            logger.debug(f"WalletTracker: positions fetch failed for {address[:10]}...: {e}")
-            return []
+        for url_tmpl in [f"{self.host}/positions", "https://data-api.polymarket.com/positions"]:
+            try:
+                r = self._session.get(
+                    url_tmpl,
+                    params={"user": address},
+                    timeout=10,
+                )
+                if r.status_code != 200:
+                    continue
+                data = r.json()
+                positions = data if isinstance(data, list) else data.get("data", [])
+                if positions:
+                    return positions
+            except Exception as e:
+                logger.debug(f"WalletTracker: positions fetch failed for {address[:10]}…: {e}")
+        return []
 
+    # ------------------------------------------------------------------
+    # Wallet update
+    # ------------------------------------------------------------------
     def _update_wallet(self, address: str):
-        """Update stats and positions for a single wallet."""
-        stats = self._wallets.get(address)
-        if not stats:
-            stats = WalletStats(address=address)
-            self._wallets[address] = stats
-
-        # Don't refresh too often
-        if time.time() - stats.last_updated < ACTIVITY_TTL:
-            return
+        """Update stats and recent trades for a single wallet."""
+        with self._lock:
+            stats = self._wallets.get(address)
+            if not stats:
+                stats = WalletStats(address=address, label=address[:10] + "...")
+                self._wallets[address] = stats
+            if time.time() - stats.last_updated < ACTIVITY_TTL:
+                return
 
         activity = self._fetch_activity(address)
         positions = self._fetch_positions(address)
 
-        # Compute win/loss from activity
+        # Compute win/loss from historical activity
         wins = losses = 0
         total_pnl = 0.0
+        recent_trades = []
+        now = time.time()
+
         for trade in activity:
-            pnl = float(trade.get("profit", trade.get("pnl", trade.get("cashPnl", 0))) or 0)
+            pnl = float(
+                trade.get("profit")
+                or trade.get("pnl")
+                or trade.get("cashPnl")
+                or 0
+            )
             total_pnl += pnl
             if pnl > 0:
                 wins += 1
             elif pnl < 0:
                 losses += 1
 
-        if wins + losses > 0:
-            stats.total_trades = wins + losses
-            stats.winning_trades = wins
-            stats.total_pnl = total_pnl
+            # Collect recent trades for copy-signal detection
+            ts_raw = trade.get("timestamp") or trade.get("createdAt") or 0
+            ts = float(ts_raw) if ts_raw else now
+            age = now - ts
+            if age < SIGNAL_MAX_AGE:
+                recent_trades.append(trade)
 
-        # Extract recent positions with token IDs
+        with self._lock:
+            if wins + losses > 0:
+                stats.total_trades = wins + losses
+                stats.winning_trades = wins
+                stats.total_pnl = total_pnl
+            stats.recent_trades = recent_trades
+            stats.last_updated = now
+
+            if stats.is_smart and recent_trades:
+                logger.debug(
+                    f"Smart wallet {stats.label}: "
+                    f"win={stats.win_rate:.0%} trades={stats.total_trades} "
+                    f"pnl=${stats.total_pnl:.0f} fresh={len(recent_trades)}"
+                )
+
+        # Build copy trades from recent activity
+        self._extract_copy_trades(stats, recent_trades)
+
+        # Also check open positions for persistent signals
+        self._extract_position_signals(stats, positions)
+
+    def _extract_copy_trades(self, stats: WalletStats, trades: list[dict]):
+        """Parse raw activity records into CopyTrade objects."""
+        if not stats.is_smart:
+            return
         now = time.time()
-        recent = []
-        for pos in positions:
-            token_id = (pos.get("asset") or pos.get("token_id") or
-                        pos.get("tokenId") or pos.get("conditionId"))
-            outcome = str(pos.get("outcome", pos.get("side", "")) or "").upper()
-            size = float(pos.get("size", pos.get("currentValue", 0)) or 0)
-            # Use current time as proxy if no timestamp
-            ts = float(pos.get("timestamp", pos.get("createdAt", now)) or now)
-            if token_id and size > 0:
-                side = "YES" if outcome in ("YES", "1", "TRUE") else "NO"
-                recent.append({
-                    "token_id": token_id,
-                    "side": side,
-                    "timestamp": ts,
-                    "size": size,
-                })
-
-        stats.recent_positions = recent
-        stats.last_updated = now
-
-        if stats.is_smart:
-            logger.debug(
-                f"Smart wallet {address[:10]}...: "
-                f"win_rate={stats.win_rate:.1%}, trades={stats.total_trades}, "
-                f"pnl=${stats.total_pnl:.2f}, positions={len(recent)}"
+        for t in trades:
+            token_id = (
+                t.get("asset")
+                or t.get("tokenId")
+                or t.get("token_id")
             )
+            condition_id = t.get("conditionId") or t.get("condition_id") or ""
+            title = t.get("title") or t.get("name") or t.get("market") or condition_id[:20]
+            outcome = str(t.get("outcome") or t.get("side") or "").upper()
+            side = "YES" if outcome in ("YES", "1", "TRUE", "BUY") else "NO"
+            price = float(t.get("price") or 0)
+            size = float(t.get("size") or t.get("usdcSize") or 0)
+            ts_raw = t.get("timestamp") or t.get("createdAt") or now
+            ts = float(ts_raw) if ts_raw else now
+
+            if not token_id or price <= 0 or size <= 0:
+                continue
+            if now - ts > SIGNAL_MAX_AGE:
+                continue
+
+            ct = CopyTrade(
+                wallet_address=stats.address,
+                wallet_label=stats.label,
+                token_id=token_id,
+                condition_id=condition_id,
+                market_title=title,
+                side=side,
+                price=price,
+                size=size,
+                timestamp=ts,
+                win_rate=stats.win_rate,
+            )
+            with self._lock:
+                # Avoid duplicates
+                existing = self._copy_trades.get(token_id, [])
+                already = any(
+                    abs(c.timestamp - ct.timestamp) < 5
+                    and c.wallet_address == ct.wallet_address
+                    for c in existing
+                )
+                if not already:
+                    self._copy_trades[token_id].append(ct)
+
+    def _extract_position_signals(self, stats: WalletStats, positions: list[dict]):
+        """Parse current open positions as persistent copy-signals."""
+        if not stats.is_smart:
+            return
+        now = time.time()
+        for pos in positions:
+            token_id = (
+                pos.get("asset")
+                or pos.get("token_id")
+                or pos.get("tokenId")
+                or pos.get("conditionId")
+            )
+            condition_id = pos.get("conditionId") or pos.get("condition_id") or ""
+            title = pos.get("title") or pos.get("name") or pos.get("market") or condition_id[:20]
+            outcome = str(pos.get("outcome") or pos.get("side") or "").upper()
+            side = "YES" if outcome in ("YES", "1", "TRUE") else "NO"
+            size = float(pos.get("size") or pos.get("currentValue") or 0)
+            if not token_id or size <= 0:
+                continue
+
+            ct = CopyTrade(
+                wallet_address=stats.address,
+                wallet_label=stats.label,
+                token_id=token_id,
+                condition_id=condition_id,
+                market_title=title,
+                side=side,
+                price=0.0,       # no entry price in position data
+                size=size,
+                timestamp=now,   # treat as "now" so it stays fresh
+                win_rate=stats.win_rate,
+            )
+            with self._lock:
+                existing = self._copy_trades.get(token_id, [])
+                already = any(c.wallet_address == ct.wallet_address for c in existing)
+                if not already:
+                    self._copy_trades[token_id].append(ct)
 
     # ------------------------------------------------------------------
-    # Signal generation
+    # Public API
     # ------------------------------------------------------------------
     def update(self, watched_token_ids: list[str] | None = None):
         """
-        Refresh leaderboard and update a sample of smart wallets.
-        Call this periodically (e.g. every 60s) from the bot loop.
-        watched_token_ids: if provided, only update wallets holding these tokens.
+        Refresh leaderboard and update smart wallets.
+        Call every ~60s from the bot loop.
         """
         self._refresh_leaderboard()
 
-        # Update top wallets (staggered to avoid rate limits)
-        for addr in self._leaderboard_cache[:self.top_n]:
+        # Evict stale copy trades
+        cutoff = time.time() - SIGNAL_MAX_AGE
+        with self._lock:
+            for token_id in list(self._copy_trades):
+                self._copy_trades[token_id] = [
+                    ct for ct in self._copy_trades[token_id]
+                    if ct.timestamp >= cutoff
+                ]
+                if not self._copy_trades[token_id]:
+                    del self._copy_trades[token_id]
+
+        with self._lock:
+            wallets_to_update = list(self._leaderboard_cache[:self.top_n])
+
+        for addr in wallets_to_update:
             self._update_wallet(addr)
 
     def get_signal(self, token_id_yes: str, token_id_no: str) -> WalletSignal:
         """
         Return a signal for a market based on smart wallet positions.
-
-        Checks which smart wallets have recent positions in this market
-        and returns a confidence boost for the Bayesian model.
+        Compatible with bot.py's existing call signature.
         """
-        now = time.time()
-        yes_smart = []
-        no_smart = []
+        with self._lock:
+            yes_trades = [ct for ct in self._copy_trades.get(token_id_yes, []) if ct.is_fresh]
+            no_trades  = [ct for ct in self._copy_trades.get(token_id_no, [])  if ct.is_fresh]
 
-        for addr, stats in self._wallets.items():
-            if not stats.is_smart:
-                continue
-            for pos in stats.recent_positions:
-                tid = pos["token_id"]
-                age = now - pos["timestamp"]
-                if age > SIGNAL_MAX_AGE:
-                    continue
-                if tid == token_id_yes:
-                    yes_smart.append(stats.win_rate)
-                elif tid == token_id_no:
-                    no_smart.append(stats.win_rate)
+        yes_wr = [ct.win_rate for ct in yes_trades]
+        no_wr  = [ct.win_rate for ct in no_trades]
 
-        yes_count = len(yes_smart)
-        no_count = len(no_smart)
+        yes_count = len(yes_wr)
+        no_count  = len(no_wr)
 
         if yes_count == 0 and no_count == 0:
             return WalletSignal(
@@ -281,23 +551,19 @@ class WalletTracker:
 
         if yes_count >= no_count:
             dominant = "YES"
-            avg_wr = sum(yes_smart) / yes_count if yes_smart else 0.0
-            count = yes_count
-            # Positive boost: smart money says YES
-            boost = min(0.15, count * 0.03 * avg_wr)
+            avg_wr = sum(yes_wr) / yes_count
+            count  = yes_count
+            boost  = min(0.15, count * 0.03 * avg_wr)
         else:
             dominant = "NO"
-            avg_wr = sum(no_smart) / no_count if no_smart else 0.0
-            count = no_count
-            # Negative boost: smart money says NO (reduces YES probability)
-            boost = -min(0.15, count * 0.03 * avg_wr)
+            avg_wr = sum(no_wr) / no_count
+            count  = no_count
+            boost  = -min(0.15, count * 0.03 * avg_wr)
 
-        if yes_count + no_count > 0:
-            logger.info(
-                f"WalletSignal: YES={yes_count} NO={no_count} smart wallets "
-                f"→ {dominant} boost={boost:+.3f}"
-            )
-
+        logger.info(
+            f"[WALLET-SIGNAL] YES={yes_count} NO={no_count} smart wallets "
+            f"→ {dominant} boost={boost:+.3f}"
+        )
         return WalletSignal(
             token_id=token_id_yes,
             smart_wallet_count=yes_count + no_count,
@@ -306,10 +572,51 @@ class WalletTracker:
             confidence_boost=boost,
         )
 
+    def get_copy_trades(self, token_id: str) -> list[CopyTrade]:
+        """Return fresh copy-trade signals for a specific token."""
+        with self._lock:
+            return [ct for ct in self._copy_trades.get(token_id, []) if ct.is_fresh]
+
+    def evaluate_copy(self, token_id: str) -> tuple[str, float]:
+        """
+        Evaluate whether to copy smart-wallet trades on this token.
+        Returns (side, confidence_boost) where side is "YES", "NO" or "".
+        Uses Gemini to validate the signal when available.
+        """
+        trades = self.get_copy_trades(token_id)
+        if not trades:
+            return "", 0.0
+
+        # Pick the most recent trade from the highest-win-rate wallet
+        best = max(trades, key=lambda ct: (ct.win_rate, -ct.age_seconds))
+
+        if self._gemini is not None:
+            should_copy = self._gemini_should_copy(best)
+            if not should_copy:
+                logger.info(
+                    f"[COPY-SKIP] Gemini said SKIP for {best.wallet_label} "
+                    f"{best.side} on \"{best.market_title[:40]}\""
+                )
+                return "", 0.0
+
+        boost = min(0.15, best.win_rate * 0.15)
+        if best.side == "NO":
+            boost = -boost
+
+        logger.info(
+            f"[COPY-TRADE] Following {best.wallet_label} "
+            f"(win={best.win_rate:.0%}) → {best.side} boost={boost:+.3f} "
+            f"on \"{best.market_title[:50]}\""
+        )
+        return best.side, boost
+
     def summary(self) -> str:
         """Short summary of tracked wallets for logging."""
-        smart = [s for s in self._wallets.values() if s.is_smart]
+        with self._lock:
+            total = len(self._wallets)
+            smart = sum(1 for s in self._wallets.values() if s.is_smart)
+            active = sum(len(v) for v in self._copy_trades.values())
         return (
-            f"WalletTracker: {len(self._wallets)} tracked, "
-            f"{len(smart)} smart (≥{MIN_WIN_RATE:.0%} win rate)"
+            f"WalletTracker: {total} tracked, {smart} smart "
+            f"(≥{MIN_WIN_RATE:.0%} win rate), {active} fresh copy signals"
         )
