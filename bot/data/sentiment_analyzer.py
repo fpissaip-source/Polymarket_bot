@@ -95,9 +95,9 @@ class EventSentimentAnalyzer:
         # Try to set up Google Search Grounding tool
         self._search_tool = self._build_search_tool()
         if self._search_tool:
-            logger.info("EventSentimentAnalyzer initialized (gemini-3-flash + Google Search Grounding)")
+            logger.info("EventSentimentAnalyzer initialized (gemini-2.0-flash + Google Search Grounding)")
         else:
-            logger.info("EventSentimentAnalyzer initialized (gemini-3-flash, no search grounding)")
+            logger.info("EventSentimentAnalyzer initialized (gemini-2.0-flash, no search grounding)")
 
     def _build_search_tool(self):
         """Build the Google Search Grounding tool. Returns None if unavailable."""
@@ -179,7 +179,7 @@ class EventSentimentAnalyzer:
             )
 
             # Build config with Google Search Grounding when available
-            gen_kwargs: dict = {"model": "gemini-3-flash", "contents": prompt}
+            gen_kwargs: dict = {"model": "gemini-2.0-flash", "contents": prompt}
             if self._search_tool is not None:
                 try:
                     from google.genai import types
