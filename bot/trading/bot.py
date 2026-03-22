@@ -62,6 +62,8 @@ from config import (
     SL_RATIO_LOW,
     LOW_PRICE_THRESHOLD,
     TP_SL_CHECK_INTERVAL,
+    TP_MIN_TIME_REMAINING,
+    TP_NEAR_RESOLVED_THRESHOLD,
     MIN_SECONDS_BEFORE_EXPIRY,
     MIN_BET_SIZE,
     MAX_OPEN_TRADES,
@@ -546,32 +548,18 @@ class ArbitrageBot:
                 current_value = shares * current_price
                 unrealized_pnl = current_value - entry.size
                 pnl_ratio = unrealized_pnl / entry.size if entry.size > 0 else 0
-                # TP/SL depends on timeframe: 5min = fast scalp (10%/5%), 15min+ = standard (20%/10%)
-                _pos_market_id = entry.market_id
-                _is_5min = "5m" in _pos_market_id
-                if _is_5min:
-                    tp = TP_RATIO_5MIN
-                    sl = SL_RATIO_5MIN
-                else:
-                    is_low_price = entry.exec_price < LOW_PRICE_THRESHOLD
-                    tp = TP_RATIO_LOW if is_low_price else TP_RATIO
-                    sl = SL_RATIO_LOW if is_low_price else SL_RATIO
-                is_low_price = not _is_5min and entry.exec_price < LOW_PRICE_THRESHOLD
-                if is_low_price:
-                    logger.info(
-                        f"[SL] ADAPTIVE: exec_price={entry.exec_price:.4f} < {LOW_PRICE_THRESHOLD} "
-                        f"→ using TP={tp:.0%}, SL={sl:.0%}"
-                    )
-                if pnl_ratio >= tp:
+
+                # Event markets: no SL — hold until resolution or TP.
+                # TP only fires when ≥2h remaining (capital recycling worthwhile)
+                # OR when market is near-resolved (price ≥ 90% / ≤ 10%).
+                time_to_expiry = market.end_time - now if market.end_time > 0 else float("inf")
+                near_resolved = current_price >= TP_NEAR_RESOLVED_THRESHOLD or current_price <= (1.0 - TP_NEAR_RESOLVED_THRESHOLD)
+                can_tp = time_to_expiry > TP_MIN_TIME_REMAINING or near_resolved
+
+                if pnl_ratio >= TP_RATIO and can_tp:
                     self.dry_run_tracker.early_exit(
                         entry.trade_id, current_price,
                         f"TAKE_PROFIT({pnl_ratio:+.1%})"
-                    )
-                    self.kelly.bankroll = self.dry_run_tracker.virtual_bankroll
-                elif pnl_ratio <= -sl:
-                    self.dry_run_tracker.early_exit(
-                        entry.trade_id, current_price,
-                        f"STOP_LOSS({pnl_ratio:+.1%})"
                     )
                     self.kelly.bankroll = self.dry_run_tracker.virtual_bankroll
             return
@@ -651,32 +639,6 @@ class ArbitrageBot:
                             continue
                     except Exception:
                         pass
-                    # ── SL guard during fill-wait: cancel unfilled buy if price already crashed ──
-                    # Prevents the order from filling into an already-losing position.
-                    try:
-                        _guard_data = self.data_client.get_book_data(token_id)
-                        _guard_price = _guard_data.get("mid_price") or _guard_data.get("last_price")
-                        if _guard_price is not None and entry_price > 0:
-                            if "5m" in market_id:
-                                _sl_guard = SL_RATIO_5MIN
-                            else:
-                                _is_low = entry_price < LOW_PRICE_THRESHOLD
-                                _sl_guard = SL_RATIO_LOW if _is_low else SL_RATIO
-                            _sl_floor = entry_price * (1.0 - _sl_guard)
-                            if _guard_price <= _sl_floor:
-                                logger.warning(
-                                    f"[SL_GUARD] {market_id} order={order_id[:8]} "
-                                    f"price={_guard_price:.4f} already below SL floor={_sl_floor:.4f} "
-                                    f"— cancelling unfilled buy to prevent loss"
-                                )
-                                self.executor.cancel_order(order_id)
-                                to_remove.append(order_id)
-                                self.kelly.release(entry_size)
-                                self._save_bankroll()
-                                continue
-                    except Exception:
-                        pass
-
                     # Fill-wait timeout: after >2 min cancel the order and release capital.
                     # Do NOT assume filled — attempting to sell tokens we don't own causes
                     # "not enough balance/allowance" errors on the CLOB.
@@ -703,18 +665,11 @@ class ArbitrageBot:
                                 _em_data = self.data_client.get_book_data(token_id)
                                 _em_price = _em_data.get("mid_price") or _em_data.get("last_price")
                                 if _em_price is not None:
-                                    if "5m" in market_id:
-                                        _tp_em = TP_RATIO_5MIN
-                                        _sl_em = SL_RATIO_5MIN
-                                    else:
-                                        _is_low = entry_price < LOW_PRICE_THRESHOLD
-                                        _tp_em = TP_RATIO_LOW if _is_low else TP_RATIO
-                                        _sl_em = SL_RATIO_LOW if _is_low else SL_RATIO
                                     _pnl_em = (_em_price - entry_price) / entry_price
-                                    if _pnl_em >= _tp_em or _pnl_em <= -_sl_em:
+                                    if _pnl_em >= TP_RATIO:
                                         logger.warning(
                                             f"[EARLY_EXIT] {market_id} pnl={_pnl_em:+.1%} "
-                                            f"hit TP/SL threshold before fill confirmed — "
+                                            f"hit TP threshold before fill confirmed — "
                                             f"cancelling unfilled buy"
                                         )
                                         self.executor.cancel_order(order_id)
@@ -778,22 +733,13 @@ class ArbitrageBot:
                     f"actual_cost=${actual_cost:.2f}"
                 )
                 if filled_shares >= 5.0:
-                    if "5m" in market_id:
-                        tp_ratio = TP_RATIO_5MIN
-                        sl_ratio = SL_RATIO_5MIN
-                    else:
-                        is_low = entry_price < LOW_PRICE_THRESHOLD
-                        sl_ratio = SL_RATIO_LOW if is_low else SL_RATIO
-                        tp_ratio = TP_RATIO_LOW if is_low else TP_RATIO
-                    sl_price = round(entry_price * (1.0 - sl_ratio), 4)
+                    tp_ratio = TP_RATIO
                     tp_price = round(entry_price * (1.0 + tp_ratio), 4)
 
-                    # NOTE: SL brackets are NOT placed as GTC limit orders.
-                    # On the CLOB, a GTC SELL at SL_PRICE means "sell at any price >= SL_PRICE".
-                    # Since SL_PRICE < current market, it would fill IMMEDIATELY (selling at a loss).
-                    # SL is monitored by the bot's price loop instead (close_position when price drops).
+                    # No SL bracket — event markets hold to resolution.
                     logger.info(
-                        f"[BRACKET] SL={sl_price:.4f} ({sl_ratio:.0%}) monitored by bot price loop"
+                        f"[BRACKET] No SL (event market — hold to resolution). "
+                        f"TP={tp_price:.4f} (+{tp_ratio:.0%}) monitored."
                     )
 
                     # TP bracket placed in background thread — avoids blocking SL monitoring.
@@ -892,14 +838,11 @@ class ArbitrageBot:
             current_value = shares * current_price
             pnl_ratio = (current_value - entry_size) / entry_size if entry_size > 0 else 0
 
-            # TP/SL depends on timeframe: 5min = fast scalp (10%/5%), 15min+ = standard (20%/10%)
-            if "5m" in market_id:
-                tp = TP_RATIO_5MIN
-                sl = SL_RATIO_5MIN
-            else:
-                is_low_price = entry_price < LOW_PRICE_THRESHOLD
-                tp = TP_RATIO_LOW if is_low_price else TP_RATIO
-                sl = SL_RATIO_LOW if is_low_price else SL_RATIO
+            # Event markets: no SL — hold to resolution unless TP fires.
+            # TP only allowed when ≥2h remaining (capital recycling) or market near-resolved.
+            tp = TP_RATIO
+            near_resolved = current_price >= TP_NEAR_RESOLVED_THRESHOLD or current_price <= (1.0 - TP_NEAR_RESOLVED_THRESHOLD)
+            can_tp = time_to_expiry > TP_MIN_TIME_REMAINING or near_resolved
 
             # Periodic position heartbeat (every 30 s visible in logs)
             entry_time = pos.get("entry_time", now)
@@ -932,10 +875,8 @@ class ArbitrageBot:
                 continue
 
             reason = None
-            if pnl_ratio >= tp:
+            if pnl_ratio >= tp and can_tp:
                 reason = f"TAKE_PROFIT({pnl_ratio:+.1%})"
-            elif pnl_ratio <= -sl:
-                reason = f"STOP_LOSS({pnl_ratio:+.1%})"
             elif 0 < time_to_expiry <= 90:
                 reason = f"PRE_EXPIRY({time_to_expiry:.0f}s left)"
             elif hold_minutes >= MAX_POSITION_HOLD_MINUTES:

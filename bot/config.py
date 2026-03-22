@@ -155,20 +155,28 @@ GROWTH_TIERS = [
 # State file for bankroll persistence across restarts
 BANKROLL_STATE_FILE = "bankroll_state.json"
 
-# Take-Profit / Stop-Loss (event markets)
-TP_RATIO = 0.30               # Take profit at +30% — events have higher variance
-SL_RATIO = 0.15               # Stop loss at -15%
+# Take-Profit for event markets
+# SL is DISABLED for event markets — prediction markets have binary outcomes;
+# early stop-loss causes unnecessary losses and fees before resolution.
+# TP is only triggered when enough time remains to recycle capital.
+TP_RATIO = 0.30               # Take profit at +30% (when >2h left or market near resolved)
+SL_RATIO = 0.0                # DISABLED — no stop-loss for event markets
 
-# Legacy (unused, crypto-only)
+# Minimum time remaining before a TP exit is allowed (seconds).
+# With <2h left, just hold to resolution — exiting costs fees without benefit.
+TP_MIN_TIME_REMAINING = 7200  # 2 hours
+
+# A market is considered "near resolved" when price is this extreme — TP allowed regardless of time.
+TP_NEAR_RESOLVED_THRESHOLD = 0.90   # price ≥ 0.90 (YES) or ≤ 0.10 (NO) = basically done
+
+# Legacy aliases kept for import compatibility (values unused)
 TP_RATIO_5MIN = 0.10
 SL_RATIO_5MIN = 0.05
+LOW_PRICE_THRESHOLD = 0.30
+TP_RATIO_LOW = TP_RATIO
+SL_RATIO_LOW = 0.0
 
-# Adaptive TP/SL for low-price positions (exec_price < LOW_PRICE_THRESHOLD)
-LOW_PRICE_THRESHOLD = 0.30    # Below this exec_price → use low-price ratios
-TP_RATIO_LOW = 0.20           # TP at +20% for low-price positions
-SL_RATIO_LOW = 0.10           # SL at -10% for low-price positions
-
-TP_SL_CHECK_INTERVAL = 1      # Check TP/SL every 1 second (fast reaction)
+TP_SL_CHECK_INTERVAL = 1      # Check TP every 1 second
 
 # Monte Carlo
 MC_SIMULATIONS = 600          # Number of simulation paths
