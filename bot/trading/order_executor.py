@@ -821,3 +821,38 @@ class OrderExecutor:
         except Exception as e:
             logger.debug(f"get_available_balance_usd: {e}")
         return 0.0
+
+
+def fetch_live_balance_usd() -> float:
+    """
+    Read-only USDC.e balance query — no approvals, safe to call in dry-run mode.
+    Creates a minimal ClobClient just for the balance read, then discards it.
+    Returns 0.0 on any error.
+    """
+    if not _PY_CLOB_AVAILABLE:
+        return 0.0
+    try:
+        proxy = PROXY_ADDRESS.strip() if PROXY_ADDRESS else None
+        sig_type = 1 if proxy else 0
+        from py_clob_client.clob_types import ApiCreds
+        creds = ApiCreds(
+            api_key=POLYMARKET_API_KEY,
+            api_secret=POLYMARKET_API_SECRET,
+            api_passphrase=POLYMARKET_API_PASSPHRASE,
+        ) if POLYMARKET_API_KEY else None
+        client = ClobClient(
+            host=POLYMARKET_HOST,
+            key=POLYMARKET_PRIVATE_KEY,
+            chain_id=CHAIN_ID,
+            creds=creds,
+            signature_type=sig_type,
+            funder=proxy or None,
+        )
+        params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        bal = client.get_balance_allowance(params)
+        if bal:
+            raw = bal.get("balance", "0") or "0"
+            return float(raw) / 1_000_000
+    except Exception as e:
+        logger.debug(f"fetch_live_balance_usd: {e}")
+    return 0.0

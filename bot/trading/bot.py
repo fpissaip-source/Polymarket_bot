@@ -39,7 +39,7 @@ from data.wallet_tracker import WalletTracker
 from data.sentiment_analyzer import EventSentimentAnalyzer
 from data.weather_feed import WeatherFeed
 from data.dry_run_tracker import DryRunTracker
-from trading.order_executor import OrderExecutor
+from trading.order_executor import OrderExecutor, fetch_live_balance_usd
 from models.adaptive import AdaptiveLearner
 from models.rewards import is_rewarded, get_rewarded_condition_ids
 
@@ -129,6 +129,24 @@ class ArbitrageBot:
         self.spread_map = SpreadMap()
 
         starting_bankroll = DRY_RUN_BANKROLL if dry_run else self._load_bankroll()
+
+        # Always try to sync bankroll from live CLOB balance
+        live_balance = fetch_live_balance_usd()
+        if live_balance > 0:
+            if dry_run:
+                starting_bankroll = live_balance
+                logger.info(f"[STARTUP] Live CLOB balance=${live_balance:.2f} → using as dry-run bankroll")
+            else:
+                starting_bankroll = min(live_balance, BANKROLL)
+                logger.info(
+                    f"[STARTUP] CLOB balance=${live_balance:.2f} | "
+                    f"config BANKROLL=${BANKROLL:.2f} → using ${starting_bankroll:.2f}"
+                )
+        else:
+            logger.warning(
+                f"[STARTUP] Could not fetch live CLOB balance — using configured bankroll ${starting_bankroll:.2f}"
+            )
+
         kelly_lambda, self._current_min_edge = _get_tier(starting_bankroll)
         logger.info(
             f"Starting bankroll: ${starting_bankroll:.2f} ({'VIRTUAL' if dry_run else 'LIVE'}) | "
@@ -142,17 +160,16 @@ class ArbitrageBot:
         if not dry_run and self.executor:
             # Cancel leftover GTC orders from previous runs before anything else
             n_cancelled = self.executor.cancel_all_open_orders()
-            # Sync bankroll to actual CLOB available balance
+            # Re-sync bankroll after cancellations free up balance
             actual_balance = self.executor.get_available_balance_usd()
-            if actual_balance > 0:
+            if actual_balance > 0 and actual_balance != starting_bankroll:
                 effective = min(actual_balance, BANKROLL)
                 logger.info(
-                    f"[STARTUP] CLOB balance=${actual_balance:.2f} | "
-                    f"config BANKROLL=${BANKROLL:.2f} → using ${effective:.2f}"
+                    f"[STARTUP] Post-cancel CLOB balance=${actual_balance:.2f} → using ${effective:.2f}"
                 )
                 self.kelly.bankroll = effective
                 starting_bankroll = effective
-            else:
+            elif actual_balance == 0:
                 logger.warning(
                     f"[STARTUP] CLOB balance=$0 after cancelling {n_cancelled} orders. "
                     f"Check your proxy wallet has USDC.e."
