@@ -759,22 +759,39 @@ class ArbitrageBot:
                         import threading
                         def _place_tp_bracket(executor, tok_id, n_shares, t_price,
                                               t_size, n_risk, pos_ref, mkt_id):
-                            time.sleep(15)  # Wait for CTF token settlement
-                            try:
-                                from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
-                                _cp = BalanceAllowanceParams(
-                                    asset_type=AssetType.CONDITIONAL, token_id=tok_id
-                                )
-                                _cd = executor.client.get_balance_allowance(_cp)
-                                _cb = float(_cd.get("balance", "0") or "0") / 1_000_000
-                                if _cb < n_shares * 0.5:
-                                    logger.warning(
-                                        f"[BRACKET] CTF balance={_cb:.2f} < {n_shares:.2f} "
-                                        f"— waiting 15s more"
+                            # Wait for CTF tokens to settle on Polygon before placing TP bracket.
+                            # Poll balance instead of blind sleep — avoids "not enough balance" errors.
+                            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+                            settled = False
+                            for _settle_i in range(12):  # 12 × 5s = 60s max
+                                time.sleep(5)
+                                try:
+                                    _cp = BalanceAllowanceParams(
+                                        asset_type=AssetType.CONDITIONAL, token_id=tok_id
                                     )
-                                    time.sleep(15)
-                            except Exception:
-                                pass
+                                    _cd = executor.client.get_balance_allowance(_cp)
+                                    _cb = float(_cd.get("balance", "0") or "0") / 1_000_000
+                                    if _cb >= n_shares * 0.90:
+                                        logger.info(
+                                            f"[BRACKET] CTF settled: {_cb:.2f} shares "
+                                            f"after {(_settle_i+1)*5}s"
+                                        )
+                                        n_shares = _cb  # Use actual balance
+                                        settled = True
+                                        break
+                                    elif _cb > 0:
+                                        logger.info(
+                                            f"[BRACKET] Settlement {_settle_i+1}/12: "
+                                            f"CTF={_cb:.2f}/{n_shares:.2f} — waiting..."
+                                        )
+                                except Exception:
+                                    pass
+                            if not settled:
+                                logger.warning(
+                                    f"[BRACKET] CTF not settled after 60s — "
+                                    f"skipping TP bracket, bot monitors TP manually"
+                                )
+                                return
                             tp_oid = None
                             for attempt in range(3):
                                 tp_oid = executor.place_tp_sell_order(
