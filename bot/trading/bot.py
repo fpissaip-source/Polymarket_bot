@@ -1483,29 +1483,9 @@ class ArbitrageBot:
                         kelly_result, position_size=MIN_BET_SIZE
                     )
                     logger.debug(f"[MIN_BET] size clamped to ${MIN_BET_SIZE:.2f}")
-            # Dead market liquidity check: ensure there are enough bids to sell into.
-            # Without this, we buy cheap positions but can't exit (best_bid=0.01 on expiry).
-            if kelly_result.is_viable and kelly_result.position_size > 0:
-                try:
-                    _sell_token = state.token_id_yes if edge_result.side == "YES" else state.token_id_no
-                    _sell_book = self.data_client.get_book_data(_sell_token)
-                    _sell_bids = _sell_book.get("bids", [])
-                    _best_bid = float(_sell_bids[0]["price"]) if _sell_bids else 0.0
-                    _bid_depth = sum(float(b.get("size", 0)) for b in _sell_bids[:3])
-                    if _best_bid < 0.03:
-                        logger.info(
-                            f"[LIQUIDITY_SKIP] {market_id}: best_bid={_best_bid:.3f} "
-                            f"— no exit liquidity, skipping"
-                        )
-                        kelly_result = dc_replace(kelly_result, is_viable=False)
-                    elif _bid_depth < 5.0:
-                        logger.info(
-                            f"[LIQUIDITY_SKIP] {market_id}: bid_depth={_bid_depth:.1f} "
-                            f"< 5 shares in top 3 bids — too thin, skipping"
-                        )
-                        kelly_result = dc_replace(kelly_result, is_viable=False)
-                except Exception as _liq_e:
-                    logger.debug(f"[LIQUIDITY] Check failed: {_liq_e}")
+            # Liquidity pre-check disabled: CLOB bids are often empty for these
+            # short-term markets even when the AMM has liquidity. Dead market guard
+            # during sell handles truly illiquid exits.
 
             if kelly_result.is_viable and kelly_result.position_size > 0:
                 opp = TradeOpportunity(
