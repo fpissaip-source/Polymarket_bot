@@ -549,17 +549,27 @@ class ArbitrageBot:
                 unrealized_pnl = current_value - entry.size
                 pnl_ratio = unrealized_pnl / entry.size if entry.size > 0 else 0
 
-                # Event markets: no SL — hold until resolution or TP.
-                # TP only fires when ≥2h remaining (capital recycling worthwhile)
-                # OR when market is near-resolved (price ≥ 90% / ≤ 10%).
+                # 3-phase exit logic (mirrors live mode)
                 time_to_expiry = market.end_time - now if market.end_time > 0 else float("inf")
-                near_resolved = current_price >= TP_NEAR_RESOLVED_THRESHOLD or current_price <= (1.0 - TP_NEAR_RESOLVED_THRESHOLD)
-                can_tp = time_to_expiry > TP_MIN_TIME_REMAINING or near_resolved
+                from decimal import Decimal
+                _cp_dec = Decimal(str(round(current_price, 6)))
 
-                if pnl_ratio >= TP_RATIO and can_tp:
+                if time_to_expiry < 7_200:
+                    _phase = "ENDSPURT"
+                elif _cp_dec >= Decimal("0.98"):
+                    _phase = "RECYCLING"
+                else:
+                    _phase = "GROWTH"
+
+                exit_reason = None
+                if _phase == "RECYCLING":
+                    exit_reason = f"RECYCLING(price={current_price:.4f}≥0.98)"
+                elif _phase == "GROWTH" and pnl_ratio >= TP_RATIO:
+                    exit_reason = f"TAKE_PROFIT({pnl_ratio:+.1%})"
+
+                if exit_reason:
                     self.dry_run_tracker.early_exit(
-                        entry.trade_id, current_price,
-                        f"TAKE_PROFIT({pnl_ratio:+.1%})"
+                        entry.trade_id, current_price, exit_reason
                     )
                     self.kelly.bankroll = self.dry_run_tracker.virtual_bankroll
             return
@@ -838,21 +848,58 @@ class ArbitrageBot:
             current_value = shares * current_price
             pnl_ratio = (current_value - entry_size) / entry_size if entry_size > 0 else 0
 
-            # Event markets: no SL — hold to resolution unless TP fires.
-            # TP only allowed when ≥2h remaining (capital recycling) or market near-resolved.
+            # ── 3-Phase exit logic ────────────────────────────────────────────
+            # Phase 1 GROWTH    (>24h left): TP at +30%, no SL
+            # Phase 2 ENDSPURT  (<2h left) : hold to resolution, cancel TP bracket
+            # Phase 3 RECYCLING (price≥0.98): immediate exit — event factually decided
+            from decimal import Decimal, ROUND_DOWN
+
+            PHASE_ENDSPURT_SECS  = 7_200    # 2 hours
+            PHASE_GROWTH_SECS    = 86_400   # 24 hours
+            RECYCLING_THRESHOLD  = Decimal("0.98")
+            TP_SPREAD_MAX        = 0.02     # max bid-ask spread before deferring TP sell
+
+            _cp_dec = Decimal(str(round(current_price, 6)))
+            _ep_dec = Decimal(str(round(entry_price, 6)))
+
+            if time_to_expiry < PHASE_ENDSPURT_SECS:
+                market_phase = "ENDSPURT"
+            elif _cp_dec >= RECYCLING_THRESHOLD:
+                market_phase = "RECYCLING"
+            else:
+                market_phase = "GROWTH"
+
+            # Spread check helper (reuse already-fetched bids; asks fetched separately)
+            def _spread_ok() -> bool:
+                try:
+                    _asks = data.get("asks", [])
+                    if not bids or not _asks:
+                        return True  # no book → allow (will fail gracefully at sell)
+                    _bid = float(bids[0]["price"])
+                    _ask = float(_asks[0]["price"])
+                    _spread = _ask - _bid
+                    if _spread > TP_SPREAD_MAX:
+                        logger.info(
+                            f"[SPREAD_GATE] {market_id} spread={_spread:.4f} > {TP_SPREAD_MAX:.2%} "
+                            f"— deferring sell (illiquid)"
+                        )
+                        return False
+                    return True
+                except Exception:
+                    return True
+
             tp = TP_RATIO
-            near_resolved = current_price >= TP_NEAR_RESOLVED_THRESHOLD or current_price <= (1.0 - TP_NEAR_RESOLVED_THRESHOLD)
-            can_tp = time_to_expiry > TP_MIN_TIME_REMAINING or near_resolved
+            can_tp = market_phase == "GROWTH" and pnl_ratio >= tp
 
             # Periodic position heartbeat (every 30 s visible in logs)
             entry_time = pos.get("entry_time", now)
             hold_minutes = (now - entry_time) / 60.0
             if int(now) % 30 == 0:
                 logger.info(
-                    f"[POS] {market_id} {pos.get('side','')} "
+                    f"[POS:{market_phase}] {market_id} {pos.get('side','')} "
                     f"entry={entry_price:.3f} now={current_price:.3f} "
                     f"pnl={pnl_ratio:+.1%} | {shares:.1f} shares | "
-                    f"TP={tp:.0%} SL={sl:.0%} held={hold_minutes:.1f}min | "
+                    f"TP={tp:.0%} held={hold_minutes:.1f}min | "
                     f"expires={f'{time_to_expiry:.0f}s' if time_to_expiry < 9e8 else 'unknown'}"
                 )
 
@@ -874,12 +921,40 @@ class ArbitrageBot:
                     )
                 continue
 
+            # ── Phase-based exit decision ─────────────────────────────────────
             reason = None
-            if pnl_ratio >= tp and can_tp:
-                reason = f"TAKE_PROFIT({pnl_ratio:+.1%})"
-            elif 0 < time_to_expiry <= 90:
-                reason = f"PRE_EXPIRY({time_to_expiry:.0f}s left)"
-            elif hold_minutes >= MAX_POSITION_HOLD_MINUTES:
+
+            if market_phase == "RECYCLING":
+                # Phase 3: event factually decided — sell immediately at best-bid
+                if _spread_ok():
+                    reason = f"RECYCLING(price={current_price:.4f}≥0.98)"
+
+            elif market_phase == "ENDSPURT":
+                # Phase 2: <2h left — cancel any open TP bracket and hold to resolution
+                # (oracle will pay 1.00; selling now captures 0.98 - fees = worse outcome)
+                if pos.get("tp_order_id") and not pos.get("endspurt_tp_cancelled"):
+                    try:
+                        self.executor.cancel_order(pos["tp_order_id"])
+                        pos["tp_order_id"] = ""
+                        pos["endspurt_tp_cancelled"] = True
+                        self._save_live_positions()
+                        logger.info(
+                            f"[ENDSPURT] {market_id} <2h left — cancelled TP bracket, "
+                            f"holding to oracle resolution"
+                        )
+                    except Exception as _ec:
+                        logger.warning(f"[ENDSPURT] Could not cancel TP bracket: {_ec}")
+                # Force-close very close to expiry (90s) to avoid stuck positions
+                if 0 < time_to_expiry <= 90:
+                    reason = f"PRE_EXPIRY({time_to_expiry:.0f}s left)"
+
+            else:
+                # Phase 1: GROWTH — take profit at +30% if spread is OK
+                if can_tp and _spread_ok():
+                    reason = f"TAKE_PROFIT({pnl_ratio:+.1%})"
+
+            # Hard limits regardless of phase
+            if not reason and hold_minutes >= MAX_POSITION_HOLD_MINUTES:
                 reason = f"MAX_HOLD({hold_minutes:.1f}min >= {MAX_POSITION_HOLD_MINUTES:.0f}min limit)"
 
             if reason:
@@ -906,8 +981,7 @@ class ArbitrageBot:
 
                 if tp_already_filled:
                     to_remove.append(order_id)
-                    tp_ratio_val = TP_RATIO_5MIN if "5m" in market_id else (TP_RATIO_LOW if entry_price < LOW_PRICE_THRESHOLD else TP_RATIO)
-                    received = shares * (entry_price * (1.0 + tp_ratio_val))
+                    received = shares * (entry_price * (1.0 + TP_RATIO))
                     profit = received - entry_size
                     logger.info(
                         f"[BRACKET_TP] Position closed by CLOB TP bracket: "
