@@ -491,6 +491,10 @@ class ArbitrageBot:
             market_id = f"evt_{condition_id_str[:10]}"
             if market_id in self._markets:
                 continue
+            # Dedup by token ID: same YES token already registered under a different market_id
+            if any(s.token_id_yes == yes_token or s.token_id_no == no_token
+                   for s in self._markets.values()):
+                continue
 
             end_time = 0.0
             now_ts = time.time()
@@ -1799,6 +1803,9 @@ class ArbitrageBot:
             reverse=True,
         )
 
+        # Track tokens placed THIS execution cycle to block same-tick duplicates
+        _placed_tokens_this_tick: set[str] = set()
+
         for opp in opportunities:
             market = self._markets[opp.market_id]
             raw_price = opp.stoikov_quote.reservation_price
@@ -1970,9 +1977,14 @@ class ArbitrageBot:
             # Directional: BUY YES or BUY NO
             token_id = market.token_id_yes if side == "YES" else market.token_id_no
 
-            # Dedup: never open a second position for the same token.
-            # For 5min markets: YES and NO simultaneously allowed (different directions),
-            # but not the same token twice.
+            # Dedup guard 0: already placed in THIS execution cycle (same-tick duplicate)
+            if token_id in _placed_tokens_this_tick:
+                logger.info(
+                    f"[SKIP] {opp.market_id}: token {token_id[:12]}... already placed this tick"
+                )
+                continue
+
+            # Dedup guard 1: open position already tracked in live_positions
             open_token_ids = {pos["token_id"] for pos in self._live_positions.values()}
             if token_id in open_token_ids:
                 logger.info(
@@ -2015,6 +2027,7 @@ class ArbitrageBot:
 
             if order_id:
                 logger.info(f"Order accepted: {order_id}")
+                _placed_tokens_this_tick.add(token_id)  # block same-tick duplicates
                 self.kelly.allocate(size)
                 self._save_bankroll()
 

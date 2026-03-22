@@ -254,16 +254,20 @@ tr:hover td{background:#1c2128}
 .badge-yellow{background:#3a2a0a;color:#d29922}
 .badge-gray{background:#21262d;color:#8b949e}
 
-/* Gemini cards */
-.g-cards{display:flex;flex-direction:column;gap:10px}
-.g-card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px}
-.g-card.opp{border-left:3px solid #3fb950}
-.g-card.no-edge{border-left:3px solid #8b949e}
-.g-card.skip{border-left:3px solid #d29922}
-.g-card .q{font-size:13px;font-weight:600;color:#e6edf3;margin-bottom:6px;line-height:1.4}
-.g-card .meta{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:7px}
-.g-card .reasoning{font-size:12px;color:#8b949e;line-height:1.5;border-top:1px solid #21262d;padding-top:7px;margin-top:4px}
-.g-card .ts{font-size:10px;color:#484f58;margin-top:6px}
+/* Neural Network AI tab */
+.nn-wrap{background:#0a0d12;border:1px solid #30363d;border-radius:8px;overflow:hidden;margin-bottom:10px;position:relative}
+.nn-ticker{padding:7px 12px;font-size:11px;font-family:'SF Mono',Menlo,monospace;border-bottom:1px solid #21262d;display:flex;align-items:center;gap:8px;min-height:30px;background:#0d1117}
+.nn-ticker-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;transition:background .4s}
+#nn-canvas{display:block;width:100%}
+.ev-feed{display:flex;flex-direction:column;gap:5px;max-height:260px;overflow-y:auto;padding-bottom:4px}
+.ev-feed::-webkit-scrollbar{width:3px}.ev-feed::-webkit-scrollbar-thumb{background:#30363d;border-radius:2px}
+.ev-item{display:flex;align-items:flex-start;gap:8px;padding:7px 10px;background:#161b22;border-radius:6px;border-left:3px solid #30363d;transition:border-color .3s}
+.ev-item.opp{border-left-color:#3fb950}.ev-item.no-edge{border-left-color:#f85149}.ev-item.skip{border-left-color:#d29922}.ev-item.trade{border-left-color:#58a6ff}
+.ev-time{color:#484f58;flex-shrink:0;font-family:'SF Mono',Menlo,monospace;font-size:10px;padding-top:1px}
+.ev-body{flex:1;min-width:0}
+.ev-lbl{font-weight:700;font-size:10px;letter-spacing:.6px;text-transform:uppercase;margin-bottom:2px}
+.ev-q{color:#8b949e;font-size:11px;line-height:1.35;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ev-meta{margin-top:3px;display:flex;gap:4px;flex-wrap:wrap}
 
 /* Log */
 .log-box{background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:10px;font-family:'SF Mono',Menlo,monospace;font-size:11px;height:300px;overflow-y:auto;line-height:1.65}
@@ -336,13 +340,17 @@ tr:hover td{background:#1c2128}
   <div class="regime-grid" id="regime-grid"></div>
 </div>
 
-<!-- ════ TAB: GEMINI AI REASONING ════ -->
+<!-- ════ TAB: KI-REASONING (Neural Net) ════ -->
 <div id="page-gemini" class="page">
-  <p style="font-size:12px;color:#8b949e;margin-bottom:12px">
-    Letzte KI-Analysen: warum der Bot eine Wette platziert hat — oder warum nicht.
-  </p>
-  <div id="g-cards" class="g-cards">
-    <div style="color:#484f58;text-align:center;padding:40px">Noch keine Gemini-Daten</div>
+  <div class="nn-wrap">
+    <div class="nn-ticker">
+      <div class="nn-ticker-dot" id="nn-dot" style="background:#484f58"></div>
+      <span id="nn-ticker-txt" style="color:#484f58;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">Warte auf Marktdaten…</span>
+    </div>
+    <canvas id="nn-canvas" height="230"></canvas>
+  </div>
+  <div id="ev-feed" class="ev-feed">
+    <div style="color:#484f58;text-align:center;padding:24px;font-size:12px">Noch keine Ereignisse</div>
   </div>
 </div>
 
@@ -485,37 +493,9 @@ function render(s) {
     rg.innerHTML = '<div style="color:#484f58;font-size:12px">Noch keine Regime-Daten</div>';
   }
 
-  // ── Gemini AI cards ──────────────────────────────────────────────────────
-  const gc = document.getElementById('g-cards');
-  const decisions = s.gemini_decisions || [];
-  if (decisions.length === 0) {
-    gc.innerHTML = '<div style="color:#484f58;text-align:center;padding:40px">Noch keine Gemini-Analysen</div>';
-  } else {
-    gc.innerHTML = decisions.map(d => {
-      const isOpp = d.decision === 'OPPORTUNITY';
-      const isSkip = d.decision === 'SKIPPED_LOW_CONF' || d.decision === 'LOW_CONF';
-      const cls = isOpp ? 'g-card opp' : isSkip ? 'g-card skip' : 'g-card no-edge';
-      const decBadge = isOpp ? badge('WETTE PLATZIERT','green') : isSkip ? badge('SKIPPED: zu unsicher','yellow') : badge('KEIN EDGE','gray');
-      const probColor = d.gemini_prob > 0.6 ? 'green' : d.gemini_prob < 0.4 ? 'red' : 'yellow';
-      const edgeColor = d.edge_ev > 0.02 ? 'green' : d.edge_ev > 0 ? 'yellow' : 'red';
-      const buyYes = d.gemini_prob > d.market_price + 0.05;
-      const buyNo = d.gemini_prob < d.market_price - 0.05;
-      const sideBadge = isOpp ? (buyYes ? badge('BUY YES','green') : buyNo ? badge('BUY NO','red') : '') : '';
-      return `<div class="${cls}">
-        <div class="q">${esc(d.question || d.market_id)}</div>
-        <div class="meta">
-          ${decBadge}
-          ${sideBadge}
-          ${badge('p(JA)='+((d.gemini_prob||0)*100).toFixed(0)+'%', probColor)}
-          ${badge('Markt='+(((d.market_price||0))*100).toFixed(0)+'%', 'blue')}
-          ${badge('Conf='+(((d.confidence||0))*100).toFixed(0)+'%', d.confidence>=0.75?'green':'yellow')}
-          ${badge('EV='+(d.edge_ev>=0?'+':'')+((d.edge_ev||0)*100).toFixed(1)+'%', edgeColor)}
-        </div>
-        ${d.reasoning ? `<div class="reasoning">💭 ${esc(d.reasoning)}</div>` : ''}
-        <div class="ts">${esc(d.ts)} · ${esc(d.market_id.substring(0,16))}…</div>
-      </div>`;
-    }).join('');
-  }
+  // ── Neural Network update ─────────────────────────────────────────────────
+  if (typeof nnUpdate === 'function') nnUpdate(s.gemini_decisions || []);
+  if (typeof nnEvFeed === 'function') nnEvFeed(s.gemini_decisions || []);
 
   // ── Active positions ─────────────────────────────────────────────────────
   const pb = document.getElementById('pos-body');
@@ -572,6 +552,239 @@ function render(s) {
     if (wasBottom || activeTab === 'log') lb.scrollTop = lb.scrollHeight;
   }
 }
+
+// ── Neural Network Visualization ─────────────────────────────────────────
+var _nnLayers = [5, 6, 5, 3];
+var _nnLabIn  = ['Preis','Vol','KI','Flow','Zeit'];
+var _nnLabOut = ['BUY YES','BUY NO','ABLEHNEN'];
+var _nnOutClr = ['#3fb950','#58a6ff','#d29922'];
+var _nnNodes=[], _nnEdges=[], _nnActs=[], _nnParts=[];
+var _nnCtx=null, _nnCV=null, _nnW=0, _nnH=0;
+var _nnReady=false, _nnLastTs='', _nnRaf=null;
+
+function _nnBuild(){
+  _nnW = _nnCV.offsetWidth||360;
+  _nnH = parseInt(_nnCV.getAttribute('height'))||230;
+  _nnCV.width=_nnW; _nnCV.height=_nnH;
+  var px=58, py=26; _nnNodes=[]; _nnEdges=[]; _nnActs=[];
+  var total=_nnLayers.reduce(function(a,b){return a+b;},0);
+  for(var f=0;f<total;f++) _nnActs.push(0);
+  var flat=0;
+  for(var l=0;l<_nnLayers.length;l++){
+    var n=_nnLayers[l];
+    var x=px+(l/(_nnLayers.length-1))*(_nnW-px*2);
+    for(var i=0;i<n;i++){
+      var y=py+(n>1?i/(n-1):0.5)*(_nnH-py*2);
+      _nnNodes.push({x:x,y:y,l:l,i:i,f:flat++});
+    }
+  }
+  var base=0;
+  for(var l=0;l<_nnLayers.length-1;l++){
+    for(var i=0;i<_nnLayers[l];i++){
+      for(var j=0;j<_nnLayers[l+1];j++){
+        _nnEdges.push([base+i, base+_nnLayers[l]+j]);
+      }
+    }
+    base+=_nnLayers[l];
+  }
+}
+
+function _nnFire(color, outIdx){
+  var DL=300;
+  for(var l=0;l<_nnLayers.length;l++){
+    (function(layer){
+      setTimeout(function(){
+        var base=0;
+        for(var ll=0;ll<layer;ll++) base+=_nnLayers[ll];
+        for(var i=0;i<_nnLayers[layer];i++){
+          if(layer===_nnLayers.length-1 && i!==outIdx) continue;
+          var fi=base+i; _nnActs[fi]=1.0;
+          if(layer<_nnLayers.length-1){
+            var fn=_nnNodes[fi], nb=base+_nnLayers[layer];
+            for(var j=0;j<_nnLayers[layer+1];j++){
+              if(layer===_nnLayers.length-2 && j!==outIdx) continue;
+              var tn=_nnNodes[nb+j];
+              _nnParts.push({ix:fn.x,iy:fn.y,tx:tn.x,ty:tn.y,t:0,
+                s:0.014+Math.random()*0.008,c:color});
+            }
+          }
+        }
+      }, layer*DL);
+    })(l);
+  }
+}
+
+function _nnFrame(){
+  if(!_nnCtx) return;
+  var c=_nnCtx; c.clearRect(0,0,_nnW,_nnH);
+
+  // Background grid fade
+  c.fillStyle='rgba(10,13,18,0.3)'; c.fillRect(0,0,_nnW,_nnH);
+
+  // Edges
+  _nnEdges.forEach(function(e){
+    var a=_nnNodes[e[0]], b=_nnNodes[e[1]];
+    var act=(_nnActs[e[0]]+_nnActs[e[1]])*0.5;
+    c.beginPath(); c.moveTo(a.x,a.y); c.lineTo(b.x,b.y);
+    if(act>0.05){
+      c.strokeStyle='rgba(88,166,255,'+(0.07+act*0.28)+')';
+      c.lineWidth=0.8+act*0.8;
+    } else {
+      c.strokeStyle='rgba(33,38,45,0.55)'; c.lineWidth=0.5;
+    }
+    c.stroke();
+  });
+
+  // Particles
+  var keep=[];
+  _nnParts.forEach(function(p){
+    p.t=Math.min(p.t+p.s,1);
+    if(p.t>=1) return;
+    keep.push(p);
+    var px2=p.ix+(p.tx-p.ix)*p.t, py2=p.iy+(p.ty-p.iy)*p.t;
+    var alpha=p.t<0.8?1:(1-p.t)/0.2;
+    c.save();
+    c.globalAlpha=alpha;
+    c.shadowBlur=8; c.shadowColor=p.c;
+    c.fillStyle=p.c;
+    c.beginPath(); c.arc(px2,py2,2.8,0,Math.PI*2); c.fill();
+    c.restore();
+  });
+  _nnParts=keep;
+
+  // Idle dim particles
+  if(Math.random()<0.05 && _nnNodes.length>0){
+    var l2=Math.floor(Math.random()*(_nnLayers.length-1));
+    var b2=0; for(var ll=0;ll<l2;ll++) b2+=_nnLayers[ll];
+    var fi2=b2+Math.floor(Math.random()*_nnLayers[l2]);
+    var nb2=b2+_nnLayers[l2];
+    var ti2=nb2+Math.floor(Math.random()*_nnLayers[l2+1]);
+    if(_nnNodes[fi2]&&_nnNodes[ti2]){
+      _nnParts.push({ix:_nnNodes[fi2].x,iy:_nnNodes[fi2].y,
+        tx:_nnNodes[ti2].x,ty:_nnNodes[ti2].y,t:0,s:0.006,c:'#30363d'});
+    }
+  }
+
+  // Nodes
+  _nnNodes.forEach(function(n){
+    var act=_nnActs[n.f];
+    var r=n.l===0||n.l===_nnLayers.length-1?9:6;
+    var baseClr=n.l===_nnLayers.length-1?(_nnOutClr[n.i]||'#58a6ff'):'#58a6ff';
+    c.save();
+    if(act>0.05){ c.shadowBlur=20*act; c.shadowColor=baseClr; }
+    // Outer ring (activated)
+    if(act>0.3){
+      c.beginPath(); c.arc(n.x,n.y,r+4,0,Math.PI*2);
+      c.strokeStyle=baseClr; c.globalAlpha=act*0.3; c.lineWidth=1; c.stroke();
+    }
+    // Fill
+    c.beginPath(); c.arc(n.x,n.y,r,0,Math.PI*2);
+    c.fillStyle=act>0.08?baseClr:'#161b22';
+    c.globalAlpha=0.3+act*0.7; c.fill();
+    // Border
+    c.globalAlpha=1;
+    c.strokeStyle=act>0.08?baseClr:'#30363d';
+    c.lineWidth=1.5; c.stroke();
+    c.restore();
+    // Labels
+    c.font='9px -apple-system,sans-serif';
+    if(n.l===0){
+      c.fillStyle=act>0.1?'#c9d1d9':'#484f58';
+      c.textAlign='right'; c.fillText(_nnLabIn[n.i]||'',n.x-12,n.y+3);
+    }
+    if(n.l===_nnLayers.length-1){
+      c.fillStyle=act>0.1?_nnOutClr[n.i]:'#484f58';
+      c.textAlign='left'; c.fillText(_nnLabOut[n.i]||'',n.x+12,n.y+3);
+    }
+    _nnActs[n.f]*=0.972;
+  });
+
+  _nnRaf=requestAnimationFrame(_nnFrame);
+}
+
+function _nnInit(){
+  _nnCV=document.getElementById('nn-canvas');
+  if(!_nnCV) return;
+  _nnCtx=_nnCV.getContext('2d');
+  _nnBuild();
+  window.addEventListener('resize',function(){ if(_nnReady) _nnBuild(); });
+  _nnRaf=requestAnimationFrame(_nnFrame);
+  _nnReady=true;
+}
+
+function nnUpdate(decisions){
+  if(!_nnReady) _nnInit();
+  if(!decisions||!decisions.length) return;
+  var latest=decisions[0];
+  if(latest.ts===_nnLastTs) return;
+  _nnLastTs=latest.ts;
+  var d=latest.decision, color, outIdx, txt, tclr;
+  if(d==='OPPORTUNITY'){
+    var side=(latest.gemini_prob||0.5)>(latest.market_price||0.5)?0:1;
+    color='#3fb950'; outIdx=side;
+    var sideStr=side===0?'BUY YES ↑':'BUY NO ↑';
+    txt='⚡ '+sideStr+' · '+(latest.question||'').substring(0,58);
+    tclr='#3fb950';
+  } else if(d==='NO_EDGE'){
+    color='#f85149'; outIdx=2;
+    var evp=((latest.edge_ev||0)*100).toFixed(1);
+    txt='✗ KEIN EDGE (EV '+evp+'%) · '+(latest.question||'').substring(0,50);
+    tclr='#f85149';
+  } else {
+    color='#d29922'; outIdx=2;
+    var confp=Math.round((latest.confidence||0)*100);
+    txt='⚠ SKIP · KI-Konfidenz '+confp+'% < 75% · '+(latest.question||'').substring(0,45);
+    tclr='#d29922';
+  }
+  _nnFire(color,outIdx);
+  var dot=document.getElementById('nn-dot'), ttxt=document.getElementById('nn-ticker-txt');
+  if(dot) dot.style.background=tclr;
+  if(ttxt){ ttxt.style.color=tclr; ttxt.textContent=txt; }
+}
+
+function nnEvFeed(decisions){
+  var feed=document.getElementById('ev-feed');
+  if(!feed) return;
+  if(!decisions||!decisions.length){
+    feed.innerHTML='<div style="color:#484f58;text-align:center;padding:24px;font-size:12px">Noch keine Ereignisse</div>';
+    return;
+  }
+  feed.innerHTML=decisions.slice(0,12).map(function(d){
+    var isOpp=d.decision==='OPPORTUNITY';
+    var isSkip=d.decision==='SKIPPED_LOW_CONF'||d.decision==='LOW_CONF';
+    var cls=isOpp?'opp':isSkip?'skip':'no-edge';
+    var lbl=isOpp?'⚡ OPPORTUNITY':isSkip?'⚠ SKIPPED':'✗ KEIN EDGE';
+    var lclr=isOpp?'#3fb950':isSkip?'#d29922':'#f85149';
+    var prob=Math.round((d.gemini_prob||0)*100);
+    var mkt=Math.round((d.market_price||0)*100);
+    var conf=Math.round((d.confidence||0)*100);
+    var ev=((d.edge_ev||0)*100).toFixed(1);
+    var q=esc((d.question||d.market_id||'').substring(0,72));
+    var sideHint='';
+    if(isOpp){
+      sideHint=prob>mkt?badge('BUY YES','green'):badge('BUY NO','red');
+    }
+    return '<div class="ev-item '+cls+'">'
+      +'<div class="ev-time">'+esc((d.ts||'').substring(11,16))+'</div>'
+      +'<div class="ev-body">'
+        +'<div class="ev-lbl" style="color:'+lclr+'">'+lbl+'</div>'
+        +'<div class="ev-q">'+q+'</div>'
+        +'<div class="ev-meta">'
+          +(isOpp?sideHint:'')
+          +badge('KI '+prob+'%',isOpp&&prob>60?'green':prob<40?'red':'yellow')
+          +badge('Mkt '+mkt+'%','blue')
+          +badge('Conf '+conf+'%',conf>=75?'green':'yellow')
+          +badge('EV '+(d.edge_ev>=0?'+':'')+ev+'%',d.edge_ev>=0.04?'green':'red')
+        +'</div>'
+      +'</div>'
+      +'</div>';
+  }).join('');
+}
+
+// Start NN when gemini tab first clicked
+document.querySelectorAll('.tab').forEach(function(t,i){
+  if(i===1) t.addEventListener('click',function(){ if(!_nnReady) setTimeout(_nnInit,40); });
+});
 
 // ── Poll every 3 seconds ──────────────────────────────────────────────────
 async function poll() {
