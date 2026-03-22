@@ -157,6 +157,10 @@ class ArbitrageBot:
 
         self.kelly = KellyModel(bankroll=starting_bankroll, lambda_fraction=kelly_lambda)
         self.mc = MonteCarloSimulator()
+        # Initialize live_positions early so the executor block below can read pending buys
+        self._live_positions: dict[str, dict] = {}
+        self._load_live_positions()
+
         self.executor = None if dry_run else OrderExecutor()
 
         if not dry_run and self.executor:
@@ -215,9 +219,7 @@ class ArbitrageBot:
         self._last_tp_sl_check = 0.0
         self._last_allowance_refresh = 0.0
         self._tick_count = 0
-        # Live position tracking for TP/SL: order_id → position dict
-        self._live_positions: dict[str, dict] = {}
-        self._load_live_positions()  # Restore positions from previous session
+        # _live_positions already initialized and loaded earlier in __init__
         self.dry_run_tracker = DryRunTracker(virtual_bankroll=starting_bankroll)
         self._tier_base_lambda = self.kelly.lambda_fraction
         self._tier_base_edge = self._current_min_edge
