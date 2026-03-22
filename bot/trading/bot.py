@@ -34,7 +34,7 @@ from models.ofi import OFIModel
 from models.gas_optimizer import GasOptimizer
 
 from data.price_feed import PriceFeed
-from data.market_data import PolymarketDataClient, GammaClient, extract_clob_tokens, extract_gamma_prices
+from data.market_data import PolymarketDataClient, GammaClient, DataApiClient, extract_clob_tokens, extract_gamma_prices
 from data.wallet_tracker import WalletTracker
 from data.sentiment_analyzer import EventSentimentAnalyzer
 from data.weather_feed import WeatherFeed
@@ -262,8 +262,8 @@ class ArbitrageBot:
         # Step 2: Reconcile against actual on-chain token balances
         # Prevents ghost positions when bot was restarted after manual/external closure
         try:
-            gamma = GammaClient()
-            real_positions = gamma.get_positions(POLYMARKET_PROXY_ADDRESS)
+            data_api = DataApiClient()
+            real_positions = data_api.get_positions(POLYMARKET_PROXY_ADDRESS)
             # Build set of token_ids with a meaningful balance (>= 0.01 shares)
             real_token_ids: set[str] = set()
             for rp in real_positions:
@@ -1417,6 +1417,7 @@ class ArbitrageBot:
 
             # --- 3c. Gemini probability (PRIMARY signal for event markets) ---
             gemini_conf = 0.0
+            gemini_reasoning = ""
             if state.is_event and state.question:
                 # Attach real-time weather data for weather-related markets
                 weather_ctx = self.weather_feed.get_context(state.question)
@@ -1448,6 +1449,9 @@ class ArbitrageBot:
                             f"[GEMINI:{market_id[:20]}] p(YES)={gemini_prob:.3f} "
                             f"conf={gemini_conf:.2f} ✓ market={p_yes:.3f} → q={q:.3f}"
                         )
+                        _gr = self.event_sentiment.get_result(market_id)
+                        if _gr:
+                            gemini_reasoning = _gr.reasoning
                 else:
                     # No Gemini data yet — use market price so edge=0, skip this tick
                     q = p_yes
@@ -1471,6 +1475,11 @@ class ArbitrageBot:
             )
 
             if not edge_result.has_edge:
+                if state.is_event and gemini_conf > 0:
+                    self._log_gemini_decision(
+                        state, q, p_yes, gemini_conf, edge_result.ev_net,
+                        "NO_EDGE", gemini_reasoning,
+                    )
                 state.last_price = p_yes
                 state.last_price_no = p_no
                 continue
@@ -1551,6 +1560,11 @@ class ArbitrageBot:
                     end_time=state.end_time,
                 )
                 opportunities.append(opp)
+                if state.is_event:
+                    self._log_gemini_decision(
+                        state, q, p_yes, gemini_conf, edge_result.ev_net,
+                        "OPPORTUNITY", gemini_reasoning,
+                    )
                 logger.info(
                     f"OPPORTUNITY [{market_id}]: "
                     f"edge={edge_result.ev_net:.4f}, "
@@ -1608,6 +1622,40 @@ class ArbitrageBot:
 
         if opportunities:
             self._execute_opportunities(opportunities)
+
+    # ── Gemini decision journal ───────────────────────────────────────────────
+    _GEMINI_DECISIONS_FILE = Path(__file__).parent.parent / "gemini_decisions.json"
+    _GEMINI_DECISIONS_MAX = 60
+
+    def _log_gemini_decision(
+        self,
+        state: "MarketState",
+        q: float,
+        p_yes: float,
+        gemini_conf: float,
+        edge_ev: float,
+        decision: str,
+        reasoning: str,
+    ) -> None:
+        """Append one Gemini decision record to gemini_decisions.json."""
+        record = {
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "market_id": state.market_id,
+            "question": state.question[:120],
+            "gemini_prob": round(q, 3),
+            "confidence": round(gemini_conf, 2),
+            "market_price": round(p_yes, 3),
+            "edge_ev": round(edge_ev, 4),
+            "decision": decision,
+            "reasoning": reasoning,
+        }
+        try:
+            f = self._GEMINI_DECISIONS_FILE
+            existing: list = json.loads(f.read_text()) if f.exists() else []
+            existing.append(record)
+            f.write_text(json.dumps(existing[-self._GEMINI_DECISIONS_MAX:], indent=2))
+        except Exception:
+            pass
 
     @staticmethod
     def _urgency_bucket(end_time: float) -> int:

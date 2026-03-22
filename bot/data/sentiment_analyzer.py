@@ -293,6 +293,21 @@ class EventSentimentAnalyzer:
             return result.confidence
         return 0.0
 
+    def get_result(self, market_id: str) -> "EventSentimentResult | None":
+        """Full cached result including reasoning. None if no data or stale."""
+        with self._lock:
+            result = self._cache.get(market_id)
+        if result and result.is_fresh:
+            return result
+        return None
+
+    def get_all_results(self) -> list["EventSentimentResult"]:
+        """Return all fresh cached results sorted by most recently updated."""
+        with self._lock:
+            items = [r for r in self._cache.values() if r.is_fresh]
+        items.sort(key=lambda r: r.updated_at, reverse=True)
+        return items
+
     def summary(self) -> str:
         with self._lock:
             items = [r for r in self._cache.values() if r.is_fresh]
