@@ -23,7 +23,8 @@ from config import (
 logger = logging.getLogger(__name__)
 
 
-def _get_with_retry(session: requests.Session, url: str, params: dict = None, timeout: int = 10) -> dict | list:
+def _get_with_retry(session: requests.Session, url: str, params: dict = None, timeout: int = 15) -> dict | list:
+    last_exc = None
     for attempt in range(4):
         try:
             r = session.get(url, params=params, timeout=timeout)
@@ -37,8 +38,11 @@ def _get_with_retry(session: requests.Session, url: str, params: dict = None, ti
         except requests.exceptions.HTTPError:
             raise
         except Exception as e:
-            logger.error(f"Request failed ({url}): {e}")
-            return {}
+            last_exc = e
+            wait = 2 ** attempt
+            logger.warning(f"Request failed ({url}): {e} — retrying in {wait}s (attempt {attempt+1}/4)")
+            time.sleep(wait)
+    logger.error(f"Request permanently failed ({url}): {last_exc}")
     return {}
 
 
@@ -647,54 +651,91 @@ class GammaClient:
         seen_ids: set[str] = set()
         matched: list[dict] = []
 
-        # Fetch by volume (broad sweep) — gets the most active events first
-        for order in ("volume", "liquidity"):
-            events = self.get_events(active=True, limit=limit, order=order)
+        def _try_add_market(m: dict, event_tags: list) -> str | None:
+            """Returns reason string if skipped, None if added."""
+            question = m.get("question", "")
+            q_lower = question.lower()
+            if any(cpw in q_lower for cpw in crypto_price_words):
+                return "crypto_price"
+            market_tags = [
+                t.get("slug", t) if isinstance(t, dict) else str(t)
+                for t in m.get("tags", event_tags)
+            ]
+            if self._is_sports_market(question, market_tags):
+                return "sports"
+            if not m.get("active", True) or m.get("closed", False):
+                return "inactive"
+            clob_ids = _parse_json_field(m.get("clobTokenIds", []))
+            if len(clob_ids) < 2:
+                return "no_clob_tokens"
+            p_yes, _ = extract_gamma_prices(m)
+            if p_yes is not None and not (0.05 <= p_yes <= 0.95):
+                return "extreme_price"
+            market_id = m.get("id") or clob_ids[0]
+            if market_id in seen_ids:
+                return "duplicate"
+            seen_ids.add(market_id)
+            matched.append(m)
+            return None
+
+        # Strategy 1: Fetch via Events endpoint (events contain nested markets)
+        # Try without order param first (API default), then with ordering hints
+        total_events = 0
+        skip_counts: dict[str, int] = {}
+        markets_in_events = 0
+
+        for order in ("", "volume", "liquidity"):
+            try:
+                events = self.get_events(active=True, limit=limit, order=order)
+            except Exception as e:
+                logger.warning(f"Gamma events fetch failed (order={order!r}): {e}")
+                continue
+
+            if not events:
+                logger.debug(f"Gamma: 0 events returned (order={order!r})")
+                continue
+
+            total_events += len(events)
             for event in events:
-                # Event-level tag check
                 event_tags = [
                     t.get("slug", t) if isinstance(t, dict) else str(t)
                     for t in event.get("tags", [])
                 ]
-                event_title = event.get("title", "").lower()
-
                 for m in event.get("markets", []):
-                    question = m.get("question", "")
-                    q_lower = question.lower()
+                    markets_in_events += 1
+                    reason = _try_add_market(m, event_tags)
+                    if reason:
+                        skip_counts[reason] = skip_counts.get(reason, 0) + 1
 
-                    # Skip crypto price prediction markets (keep crypto regulation etc.)
-                    if any(cpw in q_lower for cpw in crypto_price_words):
-                        continue
+        logger.info(
+            f"Gamma events sweep: {total_events} events, {markets_in_events} markets "
+            f"→ {len(matched)} passed | skipped: {skip_counts}"
+        )
 
-                    # Skip sports
-                    market_tags = [
-                        t.get("slug", t) if isinstance(t, dict) else str(t)
-                        for t in m.get("tags", event_tags)
-                    ]
-                    if self._is_sports_market(question, market_tags):
-                        continue
-
-                    # Skip inactive / resolved markets
-                    if not m.get("active", True) or m.get("closed", False):
-                        continue
-
-                    # Require binary YES/NO token pair
-                    clob_ids = _parse_json_field(m.get("clobTokenIds", []))
-                    if len(clob_ids) < 2:
-                        continue
-
-                    # Skip extreme prices (already almost resolved)
-                    p_yes, _ = extract_gamma_prices(m)
-                    if p_yes is not None and not (0.05 <= p_yes <= 0.95):
-                        continue
-
-                    # Deduplicate
-                    market_id = m.get("id") or clob_ids[0]
-                    if market_id in seen_ids:
-                        continue
-                    seen_ids.add(market_id)
-
-                    matched.append(m)
+        # Strategy 2: Direct /markets endpoint fallback (if events gave nothing)
+        if not matched:
+            logger.info("Gamma: events sweep returned 0 — trying direct /markets endpoint")
+            direct_skip: dict[str, int] = {}
+            direct_total = 0
+            for offset in range(0, 300, 100):
+                try:
+                    markets = self.get_markets(active=True, limit=100, offset=offset)
+                except Exception as e:
+                    logger.warning(f"Gamma markets fetch failed (offset={offset}): {e}")
+                    break
+                if not markets:
+                    break
+                direct_total += len(markets)
+                for m in markets:
+                    reason = _try_add_market(m, [])
+                    if reason:
+                        direct_skip[reason] = direct_skip.get(reason, 0) + 1
+                if len(markets) < 100:
+                    break
+            logger.info(
+                f"Gamma direct /markets: {direct_total} markets "
+                f"→ {len(matched)} passed | skipped: {direct_skip}"
+            )
 
         logger.info(
             f"Gamma: discovered {len(matched)} event markets "

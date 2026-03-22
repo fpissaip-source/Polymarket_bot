@@ -51,8 +51,8 @@ TOTAL_COST = TOTAL_COST_TAKER
 # Event markets — ALL categories EXCEPT sports (Gemini 3 Flash powered)
 EVENT_SENTIMENT_MIN_BANKROLL = 1.0
 EVENT_SENTIMENT_REFRESH = 300          # Re-analyze every 5 minutes
-EVENT_MARKET_LIMIT = 80               # Broader discovery — more categories
-EVENT_MARKET_MIN_VOLUME = 1000.0      # Min total volume ($) for market quality
+EVENT_MARKET_LIMIT = 100              # Broader discovery — more categories
+EVENT_MARKET_MIN_VOLUME = 500.0       # Min total volume ($) for market quality
 
 # Categories the bot WILL trade (Gamma API tag slugs)
 EVENT_MARKET_TAGS = [

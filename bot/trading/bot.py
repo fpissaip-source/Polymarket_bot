@@ -431,7 +431,11 @@ class ArbitrageBot:
         registered = 0
 
         logger.info("Discovering event/question markets via Gamma API...")
-        markets = gamma.discover_event_markets(limit=EVENT_MARKET_LIMIT)
+        try:
+            markets = gamma.discover_event_markets(limit=EVENT_MARKET_LIMIT)
+        except Exception as e:
+            logger.error(f"discover_event_markets failed: {e}")
+            markets = []
 
         for m in markets:
             condition_id = (m.get("conditionId") or m.get("condition_id") or
