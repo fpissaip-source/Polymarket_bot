@@ -98,6 +98,9 @@ SPORTS_EXCLUDE_KEYWORDS = [
     "quarterback", "touchdown", "home run", "penalty",
 ]
 
+# Gemini API
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+
 # Only trade event markets when Gemini's confidence is at or above this threshold
 GEMINI_MIN_CONFIDENCE = float(os.getenv("GEMINI_MIN_CONFIDENCE", "0.75"))
 
