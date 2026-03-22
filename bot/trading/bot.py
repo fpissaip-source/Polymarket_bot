@@ -714,6 +714,7 @@ class ArbitrageBot:
                 except Exception as _sync_e:
                     logger.warning(f"[CLOB_SYNC] Cache sync failed: {_sync_e}")
                 pos["shares"] = filled_shares
+                pos["shares_confirmed"] = True  # Prevents sell path from re-querying API (which may return 0)
                 # Correct entry_size to actual cost (partial fills are common).
                 # Wrong entry_size causes fake SL: e.g. 1.59/5 shares filled →
                 # actual cost=$0.59 but entry_size=$1.85 → pnl shows -68% at same price.
