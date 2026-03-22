@@ -464,8 +464,10 @@ class OrderExecutor:
                 logger.warning(f"[CLOSE] Zero shares — nothing to sell")
                 return None
 
-            # Verify CTF (outcome) token balance before selling
-            # "Fehlende Token-Balance" = proxy wallet doesn't hold the ERC1155 tokens
+            # Verify CTF (outcome) token balance before selling.
+            # If balance is insufficient, actively wait for settlement (up to 30s)
+            # before attempting the sell — avoids the "not enough balance / allowance" error.
+            ctf_balance = 0.0
             try:
                 bal_params = BalanceAllowanceParams(
                     asset_type=AssetType.CONDITIONAL,
@@ -481,8 +483,47 @@ class OrderExecutor:
                 if ctf_balance < rounded_shares * 0.95:
                     logger.warning(
                         f"[CLOSE] ⚠ CTF balance ({ctf_balance:.4f}) < needed ({rounded_shares:.2f}) "
-                        f"— CLOB fill may not have delivered tokens yet. Attempting anyway."
+                        f"— waiting for settlement before attempting sell..."
                     )
+                    # Actively wait for CTF tokens to arrive (6 × 5s = 30s max)
+                    for settle_i in range(6):
+                        time.sleep(5)
+                        try:
+                            bal_data = self.client.get_balance_allowance(bal_params)
+                            raw_bal = bal_data.get("balance", "0") or "0"
+                            ctf_balance = float(raw_bal) / 1_000_000
+                            logger.info(
+                                f"[CLOSE] Settlement wait {settle_i+1}/6: "
+                                f"CTF balance={ctf_balance:.4f} / needed={rounded_shares:.2f}"
+                            )
+                            if ctf_balance >= rounded_shares * 0.95:
+                                logger.info(f"[CLOSE] ✓ CTF tokens settled after {(settle_i+1)*5}s")
+                                # Re-approve after settlement to ensure allowance is current
+                                self._approve_conditional_token(token_id)
+                                break
+                        except Exception as poll_e:
+                            logger.warning(f"[CLOSE] Settlement poll {settle_i+1}/6 error: {poll_e}")
+                    else:
+                        # Adjust shares down to actual balance if we have some tokens
+                        if ctf_balance >= 5.0:
+                            import math
+                            adjusted = math.floor(ctf_balance * 100) / 100
+                            logger.warning(
+                                f"[CLOSE] Settlement incomplete — adjusting sell from "
+                                f"{rounded_shares:.2f} → {adjusted:.2f} shares (actual balance)"
+                            )
+                            rounded_shares = adjusted
+                        elif ctf_balance > 0:
+                            logger.warning(
+                                f"[CLOSE] CTF balance {ctf_balance:.4f} < 5 CLOB minimum — "
+                                f"cannot sell, returning BALANCE_ERROR"
+                            )
+                            return "BALANCE_ERROR"
+                        else:
+                            logger.warning(
+                                f"[CLOSE] No CTF tokens after 30s wait — returning BALANCE_ERROR"
+                            )
+                            return "BALANCE_ERROR"
             except Exception as be:
                 logger.warning(f"[CLOSE] Could not check CTF balance: {be}")
 
@@ -499,48 +540,79 @@ class OrderExecutor:
                 price=rounded_price,
             )
 
-            # Try FOK first, fall back to FAK if FOK fails (exception or errorMsg)
-            fok_failed = False
-            try:
-                signed = self.client.create_market_order(market_args, options)
-                resp = _post_with_retry(self.client.post_order, signed, OrderType.FOK)
-                error_msg = resp.get("errorMsg", "")
-                if error_msg:
-                    logger.warning(f"[CLOSE] FOK rejected: {error_msg} — retrying as FAK")
-                    fok_failed = True
-                else:
-                    order_id = resp.get("orderID") or resp.get("id")
-                    status = resp.get("status", "unknown")
-                    logger.info(f"[CLOSE] SUCCESS (FOK) SELL {rounded_shares} shares @ {rounded_price} | status={status} | id={order_id}")
-                    return order_id
-            except Exception as fok_e:
-                fok_err = str(fok_e).lower()
-                if "not enough balance" in fok_err or "allowance" in fok_err:
-                    logger.error(f"[CLOSE] FATAL balance/allowance error: {fok_e}")
-                    return "BALANCE_ERROR"
-                logger.warning(f"[CLOSE] FOK exception: {fok_e} — retrying as FAK")
-                fok_failed = True
+            # Try FOK first, fall back to FAK, then retry once with re-approval
+            for attempt in range(2):  # attempt 0 = first try, attempt 1 = retry after re-approval
+                if attempt == 1:
+                    logger.info(f"[CLOSE] Retry attempt after re-approval...")
+                    # Rebuild market_args in case shares were adjusted
+                    market_args = MarketOrderArgs(
+                        token_id=token_id,
+                        side=SELL,
+                        amount=rounded_shares,
+                        price=rounded_price,
+                    )
 
-            # FAK fallback: fill what's available, cancel the rest (partial sell OK)
-            if fok_failed:
+                fok_failed = False
+                balance_error_hit = False
                 try:
-                    signed2 = self.client.create_market_order(market_args, options)
-                    resp2 = _post_with_retry(self.client.post_order, signed2, OrderType.FAK)
-                    error_msg2 = resp2.get("errorMsg", "")
-                    if error_msg2:
-                        logger.error(f"[CLOSE] FAK also rejected: {error_msg2} — will retry next cycle")
-                        return None
-                    order_id = resp2.get("orderID") or resp2.get("id")
-                    status = resp2.get("status", "unknown")
-                    logger.info(f"[CLOSE] SUCCESS (FAK) SELL {rounded_shares} shares @ {rounded_price} | status={status} | id={order_id}")
-                    return order_id
-                except Exception as fak_e:
-                    fak_err = str(fak_e).lower()
-                    if "not enough balance" in fak_err or "allowance" in fak_err:
-                        logger.error(f"[CLOSE] FATAL balance/allowance error: {fak_e}")
+                    signed = self.client.create_market_order(market_args, options)
+                    resp = _post_with_retry(self.client.post_order, signed, OrderType.FOK)
+                    error_msg = resp.get("errorMsg", "")
+                    if error_msg:
+                        if "not enough balance" in error_msg.lower() or "allowance" in error_msg.lower():
+                            balance_error_hit = True
+                        else:
+                            logger.warning(f"[CLOSE] FOK rejected: {error_msg} — retrying as FAK")
+                            fok_failed = True
+                    else:
+                        order_id = resp.get("orderID") or resp.get("id")
+                        status = resp.get("status", "unknown")
+                        logger.info(f"[CLOSE] SUCCESS (FOK) SELL {rounded_shares} shares @ {rounded_price} | status={status} | id={order_id}")
+                        return order_id
+                except Exception as fok_e:
+                    fok_err = str(fok_e).lower()
+                    if "not enough balance" in fok_err or "allowance" in fok_err:
+                        balance_error_hit = True
+                    else:
+                        logger.warning(f"[CLOSE] FOK exception: {fok_e} — retrying as FAK")
+                        fok_failed = True
+
+                # FAK fallback: fill what's available, cancel the rest (partial sell OK)
+                if fok_failed and not balance_error_hit:
+                    try:
+                        signed2 = self.client.create_market_order(market_args, options)
+                        resp2 = _post_with_retry(self.client.post_order, signed2, OrderType.FAK)
+                        error_msg2 = resp2.get("errorMsg", "")
+                        if error_msg2:
+                            if "not enough balance" in error_msg2.lower() or "allowance" in error_msg2.lower():
+                                balance_error_hit = True
+                            else:
+                                logger.error(f"[CLOSE] FAK also rejected: {error_msg2} — will retry next cycle")
+                                return None
+                        else:
+                            order_id = resp2.get("orderID") or resp2.get("id")
+                            status = resp2.get("status", "unknown")
+                            logger.info(f"[CLOSE] SUCCESS (FAK) SELL {rounded_shares} shares @ {rounded_price} | status={status} | id={order_id}")
+                            return order_id
+                    except Exception as fak_e:
+                        fak_err = str(fak_e).lower()
+                        if "not enough balance" in fak_err or "allowance" in fak_err:
+                            balance_error_hit = True
+                        else:
+                            logger.error(f"[CLOSE] FAK also failed: {fak_e} — will retry next cycle")
+                            return None
+
+                # On balance error: re-approve and retry once before giving up
+                if balance_error_hit:
+                    if attempt == 0:
+                        logger.warning(
+                            f"[CLOSE] Balance/allowance error — re-approving CTF token and retrying in 5s..."
+                        )
+                        time.sleep(5)
+                        self._approve_conditional_token(token_id)
+                    else:
+                        logger.error(f"[CLOSE] FATAL balance/allowance error after re-approval retry")
                         return "BALANCE_ERROR"
-                    logger.error(f"[CLOSE] FAK also failed: {fak_e} — will retry next cycle")
-                    return None
         except Exception as e:
             err_str = str(e).lower()
             if "not enough balance" in err_str or "allowance" in err_str:

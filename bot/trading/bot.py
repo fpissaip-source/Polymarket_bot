@@ -833,10 +833,13 @@ class ArbitrageBot:
                     f"expires={f'{time_to_expiry:.0f}s' if time_to_expiry < 9e8 else 'unknown'}"
                 )
 
-            # ── Settlement cooldown: CTF tokens need a few seconds to arrive on Polygon ──
+            # ── Settlement cooldown: CTF tokens need time to arrive on Polygon ──
             # Skip cooldown entirely if price moved significantly (don't miss exits).
             # The TP bracket GTC order handles selling during cooldown anyway.
-            SETTLEMENT_COOLDOWN = 5  # seconds (reduced from 20 — allowance polling handles the rest)
+            # NOTE: close_position() now has its own settlement wait, but this initial
+            # cooldown avoids even attempting the sell (and wasting 30s polling) if
+            # the fill just happened.
+            SETTLEMENT_COOLDOWN = 15  # seconds — gives Polygon time to settle CTF tokens
             fill_confirmed_at = pos.get("fill_confirmed_at", 0)
             cooldown_remaining = SETTLEMENT_COOLDOWN - (now - fill_confirmed_at) if fill_confirmed_at > 0 else 0
             if cooldown_remaining > 0 and abs(pnl_ratio) < 0.50:
@@ -949,55 +952,19 @@ class ArbitrageBot:
                     tick_size=tick_size, neg_risk=neg_risk,
                 )
                 if sell_order_id == "BALANCE_ERROR":
-                    # Active settlement wait: poll CTF balance for up to 30s before giving up.
-                    # This handles the common case where TP/SL fires right after fill but
-                    # CTF tokens haven't arrived on Polygon yet.
-                    if time_to_expiry > 30:
+                    # close_position already waited for settlement + re-approved + retried.
+                    # If we still get BALANCE_ERROR, either tokens truly don't exist or
+                    # the market is about to expire.
+                    if time_to_expiry > 60:
+                        # Still time — retry next TP/SL cycle (tokens may settle later)
                         logger.warning(
-                            f"[SELL] BALANCE_ERROR — actively waiting for CTF settlement "
-                            f"({time_to_expiry:.0f}s until expiry)"
+                            f"[SELL] BALANCE_ERROR after close_position retries — "
+                            f"will retry next cycle ({time_to_expiry:.0f}s until expiry)"
                         )
-                        settled = False
-                        for wait_attempt in range(6):  # 6 × 5s = 30s max
-                            time.sleep(5)
-                            try:
-                                from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
-                                _bp = BalanceAllowanceParams(
-                                    asset_type=AssetType.CONDITIONAL, token_id=token_id
-                                )
-                                _bd = self.executor.client.get_balance_allowance(_bp)
-                                _bal = float(_bd.get("balance", "0") or "0") / 1_000_000
-                                logger.info(
-                                    f"[SELL] Settlement check {wait_attempt+1}/6: "
-                                    f"CTF balance={_bal:.2f} / needed={actual_shares:.2f}"
-                                )
-                                if _bal >= actual_shares * 0.95:
-                                    settled = True
-                                    break
-                            except Exception as _be:
-                                logger.warning(f"[SELL] Settlement check failed: {_be}")
-                        if settled:
-                            # Re-approve and retry the sell
-                            self.executor._approve_conditional_token(token_id)
-                            time.sleep(3)
-                            sell_order_id = self.executor.close_position(
-                                token_id, actual_shares, sell_price,
-                                tick_size=tick_size, neg_risk=neg_risk,
-                            )
-                            if sell_order_id and sell_order_id != "BALANCE_ERROR":
-                                logger.info(f"[SELL] Settlement retry SUCCESS — sell placed after wait")
-                                # Fall through to fill check below
-                            else:
-                                logger.warning(f"[SELL] Settlement retry FAILED — retrying next cycle")
-                                continue
-                        else:
-                            logger.warning(
-                                f"[SELL] CTF tokens not settled after 30s — retrying next cycle"
-                            )
-                            continue
+                        continue
                     else:
                         logger.warning(
-                            f"[SELL] Balance/allowance fatal — market expired, "
+                            f"[SELL] Balance/allowance fatal — market expiring in {time_to_expiry:.0f}s, "
                             f"accepting full loss of ${entry_size:.2f} for {market_id}"
                         )
                         to_remove.append(order_id)
