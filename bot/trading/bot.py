@@ -159,8 +159,19 @@ class ArbitrageBot:
         self.executor = None if dry_run else OrderExecutor()
 
         if not dry_run and self.executor:
+            # Preserve orders that are tracked as pending buys — cancelling them would
+            # cause the position to appear as a ghost and trigger a duplicate purchase.
+            pending_buy_order_ids = {
+                oid for oid, pos in self._live_positions.items()
+                if not pos.get("buy_filled", True) and not oid.startswith("recovered_")
+            }
+            if pending_buy_order_ids:
+                logger.info(
+                    f"[STARTUP] Preserving {len(pending_buy_order_ids)} pending-buy order(s) "
+                    f"from previous session — will not cancel"
+                )
             # Cancel leftover GTC orders from previous runs before anything else
-            n_cancelled = self.executor.cancel_all_open_orders()
+            n_cancelled = self.executor.cancel_all_open_orders(skip_order_ids=pending_buy_order_ids)
             # Re-sync bankroll after cancellations free up balance
             actual_balance = self.executor.get_available_balance_usd()
             if actual_balance > 0 and actual_balance != starting_bankroll:
@@ -1953,6 +1964,24 @@ class ArbitrageBot:
                     f"[SKIP] {opp.market_id}: token {token_id[:12]}... already has an open position"
                 )
                 continue
+            # Second guard: check live CLOB for any open buy order on this token
+            # (catches the case where live_positions was cleared but order still exists)
+            if not self.dry_run and self.executor:
+                try:
+                    clob_orders = self.executor.get_open_orders()
+                    clob_token_ids = {
+                        o.get("asset_id") or o.get("tokenId") or o.get("token_id", "")
+                        for o in clob_orders
+                        if (o.get("side") or "").upper() == "BUY"
+                    }
+                    if token_id in clob_token_ids:
+                        logger.info(
+                            f"[SKIP] {opp.market_id}: open CLOB buy order already exists "
+                            f"for token {token_id[:12]}... — skipping duplicate"
+                        )
+                        continue
+                except Exception:
+                    pass
 
             logger.info(
                 f"[LIVE] Placing order: {opp.market_id} BUY {side} ${size:.2f} @ {price:.4f} "

@@ -786,16 +786,25 @@ class OrderExecutor:
             logger.error(f"Failed to fetch open orders: {e}")
             return []
 
-    def cancel_all_open_orders(self) -> int:
-        """Cancel all open GTC orders on startup. Returns number cancelled."""
+    def cancel_all_open_orders(self, skip_order_ids: set | None = None) -> int:
+        """Cancel all open GTC orders on startup. Returns number cancelled.
+
+        skip_order_ids: order IDs to preserve (e.g. tracked pending-buy positions).
+        """
         try:
             orders = self.get_open_orders()
             if not orders:
                 logger.info("[STARTUP] No open orders to cancel")
                 return 0
-            logger.info(f"[STARTUP] Found {len(orders)} open order(s) — cancelling all to free balance")
+            skip = skip_order_ids or set()
+            to_cancel = [o for o in orders
+                         if (o.get("id") or o.get("orderID") or o.get("order_id")) not in skip]
+            skipped = len(orders) - len(to_cancel)
+            if skipped:
+                logger.info(f"[STARTUP] Keeping {skipped} tracked pending-buy order(s) — not cancelling")
+            logger.info(f"[STARTUP] Found {len(orders)} open order(s) — cancelling {len(to_cancel)}")
             cancelled = 0
-            for o in orders:
+            for o in to_cancel:
                 oid = o.get("id") or o.get("orderID") or o.get("order_id")
                 if oid:
                     try:
@@ -804,7 +813,7 @@ class OrderExecutor:
                         cancelled += 1
                     except Exception as e:
                         logger.warning(f"[STARTUP] Could not cancel {oid}: {e}")
-            logger.info(f"[STARTUP] Cancelled {cancelled}/{len(orders)} orders. Balance now freed.")
+            logger.info(f"[STARTUP] Cancelled {cancelled}/{len(to_cancel)} orders. Balance now freed.")
             return cancelled
         except Exception as e:
             logger.error(f"[STARTUP] cancel_all_open_orders failed: {e}")
