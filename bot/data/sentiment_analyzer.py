@@ -81,6 +81,25 @@ class EventSentimentAnalyzer:
         self._consecutive_failures = 0
         self._model = self._detect_model()
 
+        # Priority queue: (priority_float, market_id, question, market_price, weather_ctx)
+        # Lower priority = analyzed first (soonest expiry = smallest end_time).
+        self._pq: queue.PriorityQueue = queue.PriorityQueue()
+
+        # Single worker thread — sequential analysis, respects rate limits
+        self._worker = threading.Thread(
+            target=self._worker_loop, daemon=True, name="gemini-worker"
+        )
+        self._worker.start()
+        logger.info("EventSentimentAnalyzer: priority-queue worker started")
+        self._max_failures = 5
+
+        # Try to set up Google Search Grounding tool
+        self._search_tool = self._build_search_tool()
+        if self._search_tool:
+            logger.info(f"EventSentimentAnalyzer initialized ({self._model} + Google Search Grounding)")
+        else:
+            logger.info(f"EventSentimentAnalyzer initialized ({self._model}, no search grounding)")
+
     def _detect_model(self) -> str:
         """Pick the best available Gemini flash model for this API key."""
         candidates = [
@@ -113,25 +132,6 @@ class EventSentimentAnalyzer:
         default = "gemini-2.0-flash"
         logger.info(f"Gemini model default: {default}")
         return default
-
-        # Priority queue: (priority_float, market_id, question, market_price, weather_ctx)
-        # Lower priority = analyzed first (soonest expiry = smallest end_time).
-        self._pq: queue.PriorityQueue = queue.PriorityQueue()
-
-        # Single worker thread — sequential analysis, respects rate limits
-        self._worker = threading.Thread(
-            target=self._worker_loop, daemon=True, name="gemini-worker"
-        )
-        self._worker.start()
-        logger.info("EventSentimentAnalyzer: priority-queue worker started")
-        self._max_failures = 5
-
-        # Try to set up Google Search Grounding tool
-        self._search_tool = self._build_search_tool()
-        if self._search_tool:
-            logger.info(f"EventSentimentAnalyzer initialized ({self._model} + Google Search Grounding)")
-        else:
-            logger.info(f"EventSentimentAnalyzer initialized ({self._model}, no search grounding)")
 
     def _build_search_tool(self):
         """Build the Google Search Grounding tool. Returns None if unavailable."""
