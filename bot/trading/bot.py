@@ -177,6 +177,14 @@ class ArbitrageBot:
                     f"Check your proxy wallet has USDC.e."
                 )
 
+        # Persist the live-synced bankroll so the dashboard shows the correct value immediately
+        if not dry_run and starting_bankroll > 0:
+            try:
+                with open(BANKROLL_STATE_FILE, "w") as _f:
+                    json.dump({"bankroll": round(starting_bankroll, 4)}, _f)
+            except Exception:
+                pass
+
         self.wallet_tracker = WalletTracker()
         self._last_wallet_update = 0.0
         self.event_sentiment = EventSentimentAnalyzer()
