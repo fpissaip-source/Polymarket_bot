@@ -79,6 +79,40 @@ class EventSentimentAnalyzer:
         self._client = genai.Client(api_key=api_key)
         self._enabled = True
         self._consecutive_failures = 0
+        self._model = self._detect_model()
+
+    def _detect_model(self) -> str:
+        """Pick the best available Gemini flash model for this API key."""
+        candidates = [
+            "gemini-2.5-flash-preview-04-17",
+            "gemini-2.0-flash",
+            "gemini-2.0-flash-exp",
+            "gemini-1.5-flash",
+            "gemini-1.5-flash-latest",
+        ]
+        # Override via env var
+        override = os.getenv("GEMINI_MODEL", "")
+        if override:
+            logger.info(f"Gemini model override from env: {override}")
+            return override
+        try:
+            available = {m.name for m in self._client.models.list()}
+            for candidate in candidates:
+                full = f"models/{candidate}"
+                if full in available:
+                    logger.info(f"Gemini model selected: {candidate}")
+                    return candidate
+            # Fallback: pick first flash model from the list
+            for m in self._client.models.list():
+                if "flash" in m.name.lower():
+                    name = m.name.replace("models/", "")
+                    logger.info(f"Gemini model fallback: {name}")
+                    return name
+        except Exception as e:
+            logger.warning(f"Could not list Gemini models: {e}")
+        default = "gemini-2.0-flash"
+        logger.info(f"Gemini model default: {default}")
+        return default
 
         # Priority queue: (priority_float, market_id, question, market_price, weather_ctx)
         # Lower priority = analyzed first (soonest expiry = smallest end_time).
@@ -95,9 +129,9 @@ class EventSentimentAnalyzer:
         # Try to set up Google Search Grounding tool
         self._search_tool = self._build_search_tool()
         if self._search_tool:
-            logger.info("EventSentimentAnalyzer initialized (gemini-2.0-flash + Google Search Grounding)")
+            logger.info(f"EventSentimentAnalyzer initialized ({self._model} + Google Search Grounding)")
         else:
-            logger.info("EventSentimentAnalyzer initialized (gemini-2.0-flash, no search grounding)")
+            logger.info(f"EventSentimentAnalyzer initialized ({self._model}, no search grounding)")
 
     def _build_search_tool(self):
         """Build the Google Search Grounding tool. Returns None if unavailable."""
@@ -179,7 +213,7 @@ class EventSentimentAnalyzer:
             )
 
             # Build config with Google Search Grounding when available
-            gen_kwargs: dict = {"model": "gemini-2.0-flash", "contents": prompt}
+            gen_kwargs: dict = {"model": self._model, "contents": prompt}
             if self._search_tool is not None:
                 try:
                     from google.genai import types

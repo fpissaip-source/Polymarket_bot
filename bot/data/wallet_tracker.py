@@ -174,15 +174,38 @@ class WalletTracker:
     # Gemini setup
     # ------------------------------------------------------------------
     def _init_gemini(self):
-        """Return a Gemini client if available, else None."""
+        """Return a (client, model_name) tuple if available, else None."""
         try:
             from google import genai
             api_key = os.getenv("GEMINI_API_KEY", "")
             if not api_key:
                 return None
             client = genai.Client(api_key=api_key)
-            logger.debug("WalletTracker: Gemini client ready for copy-trade evaluation")
-            return client
+            # Auto-detect model
+            model = os.getenv("GEMINI_MODEL", "")
+            if not model:
+                candidates = [
+                    "gemini-2.5-flash-preview-04-17",
+                    "gemini-2.0-flash",
+                    "gemini-2.0-flash-exp",
+                    "gemini-1.5-flash",
+                ]
+                try:
+                    available = {m.name for m in client.models.list()}
+                    for c in candidates:
+                        if f"models/{c}" in available:
+                            model = c
+                            break
+                    if not model:
+                        for m in client.models.list():
+                            if "flash" in m.name.lower():
+                                model = m.name.replace("models/", "")
+                                break
+                except Exception:
+                    pass
+                model = model or "gemini-2.0-flash"
+            logger.debug(f"WalletTracker: Gemini client ready (model={model})")
+            return client, model
         except Exception:
             return None
 
@@ -223,8 +246,9 @@ class WalletTracker:
                 except (AttributeError, TypeError):
                     pass
 
+            _gemini_client, _gemini_model = self._gemini
             gen_kwargs: dict = {
-                "model": "gemini-2.0-flash",
+                "model": _gemini_model,
                 "contents": prompt,
             }
             if search_tool is not None:
@@ -232,7 +256,7 @@ class WalletTracker:
                     tools=[search_tool]
                 )
 
-            resp = self._gemini.models.generate_content(**gen_kwargs)
+            resp = _gemini_client.models.generate_content(**gen_kwargs)
             decision = resp.text.strip().upper()
             should_copy = "COPY" in decision
             logger.info(
