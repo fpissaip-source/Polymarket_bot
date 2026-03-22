@@ -84,11 +84,11 @@ class EventSentimentAnalyzer:
     def _detect_model(self) -> str:
         """Pick the best available Gemini flash model for this API key."""
         candidates = [
+            "gemini-2.5-flash",
             "gemini-2.5-flash-preview-04-17",
             "gemini-2.0-flash",
             "gemini-2.0-flash-exp",
             "gemini-1.5-flash",
-            "gemini-1.5-flash-latest",
         ]
         # Override via env var
         override = os.getenv("GEMINI_MODEL", "")
