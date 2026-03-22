@@ -485,16 +485,16 @@ class GammaClient:
 
     def discover_5min_markets(self, asset: str) -> list[dict]:
         """
-        Discover active 5-minute Up/Down markets for a crypto asset.
-        These are series-based events with slug: {asset}-updown-5m-{unix_timestamp}.
-        New markets open every 5 minutes. We check current, next and previous window.
+        Discover active 15-minute Up/Down markets for a crypto asset.
+        These are series-based events with slug: {asset}-updown-15m-{unix_timestamp}.
+        New markets open every 15 minutes. We check current, next and previous window.
         """
         import time as _time
 
-        slug_prefix = asset.lower() + "-updown-5m"
+        slug_prefix = asset.lower() + "-updown-15m"
         now = int(_time.time())
-        current_window = (now // 300) * 300
-        windows = [current_window, current_window + 300, current_window - 300]
+        current_window = (now // 900) * 900
+        windows = [current_window, current_window + 900, current_window - 900]
 
         matched = []
         seen_ids = set()
@@ -521,9 +521,9 @@ class GammaClient:
                 matched.append(m)
 
         if matched:
-            logger.info(f"Gamma: found {len(matched)} active 5-min markets for {asset}")
+            logger.info(f"Gamma: found {len(matched)} active 15-min markets for {asset}")
         else:
-            logger.debug(f"Gamma: no active 5-min markets for {asset}")
+            logger.debug(f"Gamma: no active 15-min markets for {asset}")
         return matched
 
     def _fetch_event_by_slug(self, slug: str) -> dict | None:
