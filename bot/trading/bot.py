@@ -55,6 +55,8 @@ from config import (
     BANKROLL_STATE_FILE,
     TP_RATIO,
     SL_RATIO,
+    TP_RATIO_5MIN,
+    SL_RATIO_5MIN,
     TP_RATIO_LOW,
     SL_RATIO_LOW,
     LOW_PRICE_THRESHOLD,
@@ -521,9 +523,17 @@ class ArbitrageBot:
                 current_value = shares * current_price
                 unrealized_pnl = current_value - entry.size
                 pnl_ratio = unrealized_pnl / entry.size if entry.size > 0 else 0
-                is_low_price = entry.exec_price < LOW_PRICE_THRESHOLD
-                tp = TP_RATIO_LOW if is_low_price else TP_RATIO
-                sl = SL_RATIO_LOW if is_low_price else SL_RATIO
+                # TP/SL depends on timeframe: 5min = fast scalp (10%/5%), 15min+ = standard (20%/10%)
+                _pos_market_id = entry.market_id
+                _is_5min = "5m" in _pos_market_id
+                if _is_5min:
+                    tp = TP_RATIO_5MIN
+                    sl = SL_RATIO_5MIN
+                else:
+                    is_low_price = entry.exec_price < LOW_PRICE_THRESHOLD
+                    tp = TP_RATIO_LOW if is_low_price else TP_RATIO
+                    sl = SL_RATIO_LOW if is_low_price else SL_RATIO
+                is_low_price = not _is_5min and entry.exec_price < LOW_PRICE_THRESHOLD
                 if is_low_price:
                     logger.info(
                         f"[SL] ADAPTIVE: exec_price={entry.exec_price:.4f} < {LOW_PRICE_THRESHOLD} "
@@ -624,8 +634,11 @@ class ArbitrageBot:
                         _guard_data = self.data_client.get_book_data(token_id)
                         _guard_price = _guard_data.get("mid_price") or _guard_data.get("last_price")
                         if _guard_price is not None and entry_price > 0:
-                            _is_low = entry_price < LOW_PRICE_THRESHOLD
-                            _sl_guard = SL_RATIO_LOW if _is_low else SL_RATIO
+                            if "5m" in market_id:
+                                _sl_guard = SL_RATIO_5MIN
+                            else:
+                                _is_low = entry_price < LOW_PRICE_THRESHOLD
+                                _sl_guard = SL_RATIO_LOW if _is_low else SL_RATIO
                             _sl_floor = entry_price * (1.0 - _sl_guard)
                             if _guard_price <= _sl_floor:
                                 logger.warning(
@@ -667,9 +680,13 @@ class ArbitrageBot:
                                 _em_data = self.data_client.get_book_data(token_id)
                                 _em_price = _em_data.get("mid_price") or _em_data.get("last_price")
                                 if _em_price is not None:
-                                    _is_low = entry_price < LOW_PRICE_THRESHOLD
-                                    _tp_em = TP_RATIO_LOW if _is_low else TP_RATIO
-                                    _sl_em = SL_RATIO_LOW if _is_low else SL_RATIO
+                                    if "5m" in market_id:
+                                        _tp_em = TP_RATIO_5MIN
+                                        _sl_em = SL_RATIO_5MIN
+                                    else:
+                                        _is_low = entry_price < LOW_PRICE_THRESHOLD
+                                        _tp_em = TP_RATIO_LOW if _is_low else TP_RATIO
+                                        _sl_em = SL_RATIO_LOW if _is_low else SL_RATIO
                                     _pnl_em = (_em_price - entry_price) / entry_price
                                     if _pnl_em >= _tp_em or _pnl_em <= -_sl_em:
                                         logger.warning(
@@ -738,9 +755,13 @@ class ArbitrageBot:
                     f"actual_cost=${actual_cost:.2f}"
                 )
                 if filled_shares >= 5.0:
-                    is_low = entry_price < LOW_PRICE_THRESHOLD
-                    sl_ratio = SL_RATIO_LOW if is_low else SL_RATIO
-                    tp_ratio = TP_RATIO_LOW if is_low else TP_RATIO
+                    if "5m" in market_id:
+                        tp_ratio = TP_RATIO_5MIN
+                        sl_ratio = SL_RATIO_5MIN
+                    else:
+                        is_low = entry_price < LOW_PRICE_THRESHOLD
+                        sl_ratio = SL_RATIO_LOW if is_low else SL_RATIO
+                        tp_ratio = TP_RATIO_LOW if is_low else TP_RATIO
                     sl_price = round(entry_price * (1.0 - sl_ratio), 4)
                     tp_price = round(entry_price * (1.0 + tp_ratio), 4)
 
@@ -848,9 +869,14 @@ class ArbitrageBot:
             current_value = shares * current_price
             pnl_ratio = (current_value - entry_size) / entry_size if entry_size > 0 else 0
 
-            is_low_price = entry_price < LOW_PRICE_THRESHOLD
-            tp = TP_RATIO_LOW if is_low_price else TP_RATIO
-            sl = SL_RATIO_LOW if is_low_price else SL_RATIO
+            # TP/SL depends on timeframe: 5min = fast scalp (10%/5%), 15min+ = standard (20%/10%)
+            if "5m" in market_id:
+                tp = TP_RATIO_5MIN
+                sl = SL_RATIO_5MIN
+            else:
+                is_low_price = entry_price < LOW_PRICE_THRESHOLD
+                tp = TP_RATIO_LOW if is_low_price else TP_RATIO
+                sl = SL_RATIO_LOW if is_low_price else SL_RATIO
 
             # Periodic position heartbeat (every 30 s visible in logs)
             entry_time = pos.get("entry_time", now)
@@ -916,7 +942,7 @@ class ArbitrageBot:
 
                 if tp_already_filled:
                     to_remove.append(order_id)
-                    tp_ratio_val = TP_RATIO_LOW if entry_price < LOW_PRICE_THRESHOLD else TP_RATIO
+                    tp_ratio_val = TP_RATIO_5MIN if "5m" in market_id else (TP_RATIO_LOW if entry_price < LOW_PRICE_THRESHOLD else TP_RATIO)
                     received = shares * (entry_price * (1.0 + tp_ratio_val))
                     profit = received - entry_size
                     logger.info(
@@ -1736,7 +1762,9 @@ class ArbitrageBot:
             # Directional: BUY YES or BUY NO
             token_id = market.token_id_yes if side == "YES" else market.token_id_no
 
-            # Dedup: never open a second position for the same token
+            # Dedup: never open a second position for the same token.
+            # For 5min markets: YES and NO simultaneously allowed (different directions),
+            # but not the same token twice.
             open_token_ids = {pos["token_id"] for pos in self._live_positions.values()}
             if token_id in open_token_ids:
                 logger.info(

@@ -111,9 +111,13 @@ GROWTH_TIERS = [
 # State file for bankroll persistence across restarts
 BANKROLL_STATE_FILE = "bankroll_state.json"
 
-# Take-Profit / Stop-Loss
+# Take-Profit / Stop-Loss (15min + event markets)
 TP_RATIO = 0.20               # Take profit at +20% return on trade
 SL_RATIO = 0.10               # Stop loss at -10% loss on trade
+
+# 5min markets: fast scalping — many small wins
+TP_RATIO_5MIN = 0.10          # TP at +10% for 5min markets
+SL_RATIO_5MIN = 0.05          # SL at  -5% for 5min markets
 
 # Adaptive TP/SL for low-price positions (exec_price < LOW_PRICE_THRESHOLD)
 LOW_PRICE_THRESHOLD = 0.30    # Below this exec_price → use low-price ratios
