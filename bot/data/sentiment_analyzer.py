@@ -227,10 +227,18 @@ class EventSentimentAnalyzer:
             with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
                 _fut = _ex.submit(self._client.models.generate_content, **gen_kwargs)
                 try:
-                    response = _fut.result(timeout=45)
+                    response = _fut.result(timeout=60)
                 except _cf.TimeoutError:
-                    logger.warning(f"[GEMINI] Timeout (45s) for {market_id[:30]} — skipping")
-                    return
+                    # Search grounding timed out — retry without it (faster, no web search)
+                    logger.warning(f"[GEMINI] Search grounding timeout for {market_id[:30]} — retrying without search")
+                    plain_kwargs = {"model": self._model, "contents": prompt}
+                    with _cf.ThreadPoolExecutor(max_workers=1) as _ex2:
+                        _fut2 = _ex2.submit(self._client.models.generate_content, **plain_kwargs)
+                        try:
+                            response = _fut2.result(timeout=30)
+                        except _cf.TimeoutError:
+                            logger.warning(f"[GEMINI] Retry also timed out for {market_id[:30]} — skipping")
+                            return
             text = response.text.strip()
 
             # Log search grounding sources if present
