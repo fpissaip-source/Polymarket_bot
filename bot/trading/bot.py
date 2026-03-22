@@ -1409,10 +1409,7 @@ class ArbitrageBot:
             # --- 4. Edge check (uses dynamic MIN_EDGE from current tier) ---
             edge_result = self.edge_model.evaluate_directional(q=q, p=p_yes)
 
-            # Also check within-market arbitrage
-            within_result = self.edge_model.evaluate_within_market(p_yes, p_no)
-            if within_result.has_edge and within_result.ev_net > edge_result.ev_net:
-                edge_result = within_result
+            # Within-market arb disabled (binary markets always lose one leg)
 
             market_stats.append(
                 f"{state.asset}({state.timeframe}):q={q:.3f},p={p_yes:.3f},EV={edge_result.ev_net:+.3f}"
