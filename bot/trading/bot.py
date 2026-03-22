@@ -1715,8 +1715,11 @@ class ArbitrageBot:
                 )
                 continue
 
-            # Within-market arb: buy both YES and NO simultaneously
+            # Within-market arb disabled: binary markets always have one losing leg
             if side == "BOTH":
+                logger.debug(f"[SKIP] {opp.market_id}: arb (BOTH) disabled — directional only")
+                continue
+            if False and side == "BOTH":  # dead code, kept for reference
                 # Apply same capital + dedup guards as directional trades
                 open_token_ids_arb = {pos["token_id"] for pos in self._live_positions.values()}
                 if (market.token_id_yes in open_token_ids_arb

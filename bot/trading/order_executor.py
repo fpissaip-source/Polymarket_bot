@@ -642,9 +642,9 @@ class OrderExecutor:
         sl_price: the price at which to sell (stop-loss level)
         shares:   number of shares to sell (must be >= 5 for CLOB acceptance)
         """
-        if shares < 5.0:
+        if shares < 4.5:
             logger.warning(
-                f"[SL_ORDER] Skipping bracket: {shares:.2f} shares < 5 (CLOB min) — "
+                f"[SL_ORDER] Skipping bracket: {shares:.2f} shares < 4.5 (CLOB min) — "
                 f"position will be managed by bot TP/SL loop only"
             )
             return None
@@ -694,9 +694,9 @@ class OrderExecutor:
         tp_price: the price at which to take profit
         shares:   number of shares to sell (must be >= 5 for CLOB acceptance)
         """
-        if shares < 5.0:
+        if shares < 4.5:
             logger.warning(
-                f"[TP_ORDER] Skipping bracket: {shares:.2f} shares < 5 (CLOB min) — "
+                f"[TP_ORDER] Skipping bracket: {shares:.2f} shares < 4.5 (CLOB min) — "
                 f"position will be managed by bot TP/SL loop only"
             )
             return None
