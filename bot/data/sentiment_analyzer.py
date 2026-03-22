@@ -223,7 +223,14 @@ class EventSentimentAnalyzer:
                 except Exception:
                     pass
 
-            response = self._client.models.generate_content(**gen_kwargs)
+            import concurrent.futures as _cf
+            with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
+                _fut = _ex.submit(self._client.models.generate_content, **gen_kwargs)
+                try:
+                    response = _fut.result(timeout=45)
+                except _cf.TimeoutError:
+                    logger.warning(f"[GEMINI] Timeout (45s) for {market_id[:30]} — skipping")
+                    return
             text = response.text.strip()
 
             # Log search grounding sources if present
