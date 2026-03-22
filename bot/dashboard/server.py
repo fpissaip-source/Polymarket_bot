@@ -443,10 +443,14 @@ function render(s) {
       const decBadge = isOpp ? badge('WETTE PLATZIERT','green') : isSkip ? badge('SKIPPED: zu unsicher','yellow') : badge('KEIN EDGE','gray');
       const probColor = d.gemini_prob > 0.6 ? 'green' : d.gemini_prob < 0.4 ? 'red' : 'yellow';
       const edgeColor = d.edge_ev > 0.02 ? 'green' : d.edge_ev > 0 ? 'yellow' : 'red';
+      const buyYes = d.gemini_prob > d.market_price + 0.05;
+      const buyNo = d.gemini_prob < d.market_price - 0.05;
+      const sideBadge = isOpp ? (buyYes ? badge('BUY YES','green') : buyNo ? badge('BUY NO','red') : '') : '';
       return `<div class="${cls}">
         <div class="q">${esc(d.question || d.market_id)}</div>
         <div class="meta">
           ${decBadge}
+          ${sideBadge}
           ${badge('p(JA)='+((d.gemini_prob||0)*100).toFixed(0)+'%', probColor)}
           ${badge('Markt='+(((d.market_price||0))*100).toFixed(0)+'%', 'blue')}
           ${badge('Conf='+(((d.confidence||0))*100).toFixed(0)+'%', d.confidence>=0.75?'green':'yellow')}
