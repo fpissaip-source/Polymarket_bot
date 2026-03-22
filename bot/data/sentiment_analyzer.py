@@ -224,20 +224,29 @@ class EventSentimentAnalyzer:
                     pass
 
             import concurrent.futures as _cf
+
+            def _call_gemini(kwargs):
+                return self._client.models.generate_content(**kwargs)
+
             with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
-                _fut = _ex.submit(self._client.models.generate_content, **gen_kwargs)
+                _fut = _ex.submit(_call_gemini, gen_kwargs)
                 try:
                     response = _fut.result(timeout=60)
-                except _cf.TimeoutError:
-                    # Search grounding timed out — retry without it (faster, no web search)
-                    logger.warning(f"[GEMINI] Search grounding timeout for {market_id[:30]} — retrying without search")
+                except (_cf.TimeoutError, Exception) as _e:
+                    if self._search_tool is not None:
+                        # Search grounding failed/timed out — disable it permanently and retry
+                        logger.warning(
+                            f"[GEMINI] Search grounding failed ({type(_e).__name__}) — "
+                            f"disabling for this session, retrying without search"
+                        )
+                        self._search_tool = None
                     plain_kwargs = {"model": self._model, "contents": prompt}
                     with _cf.ThreadPoolExecutor(max_workers=1) as _ex2:
-                        _fut2 = _ex2.submit(self._client.models.generate_content, **plain_kwargs)
+                        _fut2 = _ex2.submit(_call_gemini, plain_kwargs)
                         try:
                             response = _fut2.result(timeout=30)
                         except _cf.TimeoutError:
-                            logger.warning(f"[GEMINI] Retry also timed out for {market_id[:30]} — skipping")
+                            logger.warning(f"[GEMINI] Timeout for {market_id[:30]} — skipping")
                             return
             text = response.text.strip()
 
