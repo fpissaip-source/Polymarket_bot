@@ -1464,10 +1464,11 @@ class ArbitrageBot:
                 # (list is sorted by end_time so we naturally fill slots with urgency).
                 _already_cached = self.event_sentiment.get_result(market_id) is not None
 
-                # Force-refresh when edge is very large (>15% EV) — double-check
-                # before committing capital to a high-conviction trade.
+                # Force-refresh when edge is very large (>15% EV) AND Gemini already
+                # has a cached result — re-confirm before a big trade.
+                # Never force on first analysis (no cache yet = normal queue entry).
                 _raw_edge = abs(p_yes - q) if q is not None else 0.0
-                _force = _raw_edge > 0.15 and not _already_cached
+                _force = _raw_edge > 0.15 and _already_cached
 
                 if _already_cached or _gemini_analyzed < _max_gemini_slots or _force:
                     self.event_sentiment.analyze_async(
