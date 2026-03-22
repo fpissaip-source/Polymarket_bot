@@ -32,7 +32,7 @@ MAKER_FEE = 0.000             # Polymarket maker fee
 MAKER_SLIPPAGE = 0.002        # Minimal slippage for resting limit orders
 MAKER_EXEC_RISK = 0.003       # Risk of partial fill
 TOTAL_COST_MAKER = MAKER_FEE + MAKER_SLIPPAGE + MAKER_EXEC_RISK   # ~0.5%
-MIN_EDGE_MAKER = 0.005        # 0.5% edge sufficient for passive orders
+MIN_EDGE_MAKER = 0.04         # 4% edge required — events need clearer Gemini signal
 
 # Taker (aggressive market order): fees + slippage apply
 TAKER_FEE = 0.01              # Polymarket taker fee per side (1%)
@@ -49,9 +49,11 @@ INCOMPLETE_EXEC_RISK = TAKER_EXEC_RISK
 TOTAL_COST = TOTAL_COST_TAKER
 
 # Event markets (politics, geopolitics, sports) — Gemini-powered
-EVENT_SENTIMENT_MIN_BANKROLL = 100.0   # Only active above $100 portfolio
+EVENT_SENTIMENT_MIN_BANKROLL = 1.0     # Active from day 1
 EVENT_MARKET_TAGS = ["politics", "geopolitics", "elections", "sports", "entertainment"]
-EVENT_SENTIMENT_REFRESH = 1800         # Refresh every 30 minutes
+EVENT_SENTIMENT_REFRESH = 300          # Refresh every 5 minutes
+EVENT_MARKET_LIMIT = 30               # Max event markets to discover
+EVENT_MARKET_MIN_VOLUME = 1000.0      # Min total volume ($) for market quality
 
 # Spread model
 SPREAD_ZSCORE_THRESHOLD = 2.0  # z-score threshold for arbitrage signal
@@ -71,9 +73,9 @@ SWEET_SPOT_HIGH_MAX = 0.85    # YES-side sweet zone: upper bound
 SWEET_SPOT_LOW_MIN  = 1.0 - SWEET_SPOT_HIGH_MAX   # = 0.15  (NO-side mirror)
 SWEET_SPOT_LOW_MAX  = 1.0 - SWEET_SPOT_HIGH_MIN   # = 0.25  (NO-side mirror)
 
-# Kept for hard boundary checks (price sanity, not sweet-spot logic)
-PRICE_FLOOR   = SWEET_SPOT_LOW_MIN    # = 0.15
-PRICE_CEILING = SWEET_SPOT_HIGH_MAX   # = 0.85
+# Hard price boundaries — events can sit at extreme prices legitimately
+PRICE_FLOOR   = 0.05    # Skip markets where both sides < 5¢ (dead/broken market)
+PRICE_CEILING = 0.95    # Skip markets where outcome is virtually certain
 
 # Time filter — no new positions in last N seconds before expiry
 MIN_SECONDS_BEFORE_EXPIRY = 60  # 60s buffer avoids last-minute coinflip volatility
@@ -91,12 +93,12 @@ DRY_RUN_BANKROLL = float(os.getenv("DRY_RUN_BANKROLL", "25.00"))  # Virtual capi
 # Fixed bet sizing (overrides Kelly when smaller)
 BET_SIZE_PCT = float(os.getenv("BET_SIZE_PCT", "0.20"))
 MIN_BET_SIZE = float(os.getenv("MIN_BET_SIZE", "1.00"))
-MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "15"))
-MAX_TRADES_5MIN = int(os.getenv("MAX_TRADES_5MIN", "6"))
-MAX_TRADES_15MIN = int(os.getenv("MAX_TRADES_15MIN", "5"))
-MAX_TRADES_EVENT = int(os.getenv("MAX_TRADES_EVENT", "4"))
+MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "10"))
+MAX_TRADES_5MIN = int(os.getenv("MAX_TRADES_5MIN", "0"))   # disabled
+MAX_TRADES_15MIN = int(os.getenv("MAX_TRADES_15MIN", "0")) # disabled
+MAX_TRADES_EVENT = int(os.getenv("MAX_TRADES_EVENT", "10"))
 MAX_TOTAL_EXPOSURE_PCT = float(os.getenv("MAX_TOTAL_EXPOSURE_PCT", "0.85"))
-MAX_POSITION_HOLD_MINUTES = float(os.getenv("MAX_POSITION_HOLD_MINUTES", "20.0"))  # Force-sell after this
+MAX_POSITION_HOLD_MINUTES = float(os.getenv("MAX_POSITION_HOLD_MINUTES", "10080.0"))  # 7 days — events resolve slowly
 MIN_BANKROLL_FLOOR = float(os.getenv("MIN_BANKROLL_FLOOR", "3.0"))
 
 # Growth tiers: (min_balance, max_balance, kelly_lambda, min_edge)
@@ -111,13 +113,13 @@ GROWTH_TIERS = [
 # State file for bankroll persistence across restarts
 BANKROLL_STATE_FILE = "bankroll_state.json"
 
-# Take-Profit / Stop-Loss (15min + event markets)
-TP_RATIO = 0.20               # Take profit at +20% return on trade
-SL_RATIO = 0.10               # Stop loss at -10% loss on trade
+# Take-Profit / Stop-Loss (event markets)
+TP_RATIO = 0.30               # Take profit at +30% — events have higher variance
+SL_RATIO = 0.15               # Stop loss at -15%
 
-# 5min markets: fast scalping — many small wins
-TP_RATIO_5MIN = 0.10          # TP at +10% for 5min markets
-SL_RATIO_5MIN = 0.05          # SL at  -5% for 5min markets
+# Legacy (unused, crypto-only)
+TP_RATIO_5MIN = 0.10
+SL_RATIO_5MIN = 0.05
 
 # Adaptive TP/SL for low-price positions (exec_price < LOW_PRICE_THRESHOLD)
 LOW_PRICE_THRESHOLD = 0.30    # Below this exec_price → use low-price ratios
@@ -132,5 +134,5 @@ MC_TRADES = 200               # Number of trades per simulation
 MC_MAX_DD_LIMIT = 0.30        # Stop if max drawdown exceeds 30%
 
 # Bot loop
-POLL_INTERVAL_SECONDS = 2     # How often to scan markets (2s for 15-min markets)
+POLL_INTERVAL_SECONDS = 30    # Event markets move slowly — scan every 30s
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")

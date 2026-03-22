@@ -1,14 +1,14 @@
 """
 Event Sentiment Analyzer (Gemini-powered)
 ==========================================
-Analyzes NON-crypto event markets: politics, elections, geopolitics,
+Analyzes prediction market questions: politics, elections, geopolitics,
 sports, entertainment — markets where LLMs have genuine information advantage.
 
-NOT used for 5-minute crypto price markets (Gemini cannot predict short-term
-price movements better than math).
+Uses Gemini as the PRIMARY probability estimator for event markets.
+If Gemini thinks YES=70% and market price is 60%, that is a 10% edge → BUY.
 
-Only activates when portfolio >= EVENT_SENTIMENT_MIN_BANKROLL ($100).
-Updates each market every 30 minutes in background threads.
+Updates each market every 5 minutes in background threads.
+Active from bankroll $1+.
 """
 
 import os
@@ -17,6 +17,7 @@ import time
 import logging
 import threading
 from dataclasses import dataclass, field
+from datetime import date
 
 try:
     from google import genai
@@ -24,7 +25,7 @@ except ImportError:
     genai = None
     logging.getLogger(__name__).warning("google-genai not installed — EventSentiment disabled")
 
-from config import EVENT_SENTIMENT_MIN_BANKROLL, EVENT_SENTIMENT_REFRESH
+from config import EVENT_SENTIMENT_REFRESH
 
 logger = logging.getLogger(__name__)
 
@@ -46,20 +47,15 @@ class EventSentimentResult:
     def is_fresh(self) -> bool:
         return self.age_seconds < EVENT_SENTIMENT_REFRESH * 1.5
 
-    @property
-    def boost(self) -> float:
-        """Probability adjustment: distance from 0.5, scaled by confidence."""
-        return (self.probability_yes - 0.5) * self.confidence * 0.15
-
 
 class EventSentimentAnalyzer:
     """
     Uses Gemini to estimate probabilities for event/political/sports markets.
+    Gemini's probability IS the primary q — not just a boost.
 
     Usage:
-        analyzer.analyze_async(market_id, question, bankroll)
-        boost = analyzer.get_boost(market_id)       # instant, cached
-        prob  = analyzer.get_probability(market_id) # None if no data
+        analyzer.analyze_async(market_id, question, market_price)
+        prob = analyzer.get_probability(market_id)   # None if no data yet
     """
 
     def __init__(self):
@@ -83,54 +79,63 @@ class EventSentimentAnalyzer:
         self._consecutive_failures = 0
         self._max_failures = 5
 
-        logger.info("EventSentimentAnalyzer initialized (gemini-1.5-flash, event markets only)")
+        logger.info("EventSentimentAnalyzer initialized (gemini-2.0-flash)")
 
-    def _analyze(self, market_id: str, question: str):
+    def _analyze(self, market_id: str, question: str, market_price: float):
         """Call Gemini for an event market. Runs in background thread."""
         try:
+            today = date.today().isoformat()
             prompt = (
-                f"You are a prediction market analyst. Estimate the probability of the following event.\n\n"
-                f"Market question: {question}\n\n"
-                f"Answer in exactly this format (two lines):\n"
+                f"Today is {today}. You are an expert prediction market analyst.\n\n"
+                f"Market question: {question}\n"
+                f"Current market consensus price: YES = {market_price:.0%}\n\n"
+                f"Your task: estimate the TRUE probability that the answer resolves YES.\n"
+                f"Compare your estimate to the market price — divergence = edge.\n\n"
+                f"Respond in EXACTLY this format (4 lines, nothing else):\n"
                 f"PROBABILITY: 0.XX\n"
-                f"CONFIDENCE: 0.XX\n\n"
+                f"CONFIDENCE: 0.XX\n"
+                f"REASONING: one sentence explaining your estimate\n"
+                f"EDGE: BUY_YES / BUY_NO / NO_EDGE\n\n"
                 f"Rules:\n"
-                f"- PROBABILITY: your best estimate that the answer is YES (0.00 to 1.00)\n"
-                f"- CONFIDENCE: how confident you are in this estimate (0.00=guess, 1.00=certain)\n"
-                f"- Use only your training knowledge, no real-time data\n"
-                f"- If you have no relevant knowledge, set CONFIDENCE to 0.10\n"
-                f"- No other text"
+                f"- PROBABILITY: your best estimate that the answer resolves YES (0.00–1.00)\n"
+                f"- CONFIDENCE: how reliable your estimate is (0.10=pure guess, 0.90=well-informed)\n"
+                f"  Set low (0.10–0.20) if the question is about a very recent event you lack data on\n"
+                f"- REASONING: key fact or logic behind your estimate (max 20 words)\n"
+                f"- EDGE: BUY_YES if your prob > market+5%, BUY_NO if < market-5%, else NO_EDGE"
             )
 
             response = self._client.models.generate_content(
-                model="gemini-1.5-flash",
+                model="gemini-2.0-flash",
                 contents=prompt,
             )
             text = response.text.strip()
 
             prob_match = re.search(r"PROBABILITY:\s*(0?\.\d+|[01]\.0*)", text)
             conf_match = re.search(r"CONFIDENCE:\s*(0?\.\d+|[01]\.0*)", text)
+            reason_match = re.search(r"REASONING:\s*(.+)", text)
 
             if not prob_match or not conf_match:
-                logger.warning(f"Gemini event response unparseable for {market_id}: {text!r}")
+                logger.warning(f"Gemini response unparseable for {market_id}: {text!r}")
                 return
 
             prob = max(0.0, min(1.0, float(prob_match.group(1))))
             conf = max(0.0, min(1.0, float(conf_match.group(1))))
+            reasoning = reason_match.group(1).strip() if reason_match else ""
 
             result = EventSentimentResult(
                 market_id=market_id,
                 question=question,
                 probability_yes=prob,
                 confidence=conf,
-                reasoning=f"p(YES)={prob:.2f} conf={conf:.2f} boost={((prob-0.5)*conf*0.15):+.3f}",
+                reasoning=reasoning,
             )
             with self._lock:
                 self._cache[market_id] = result
 
+            edge_dir = "→ BUY YES" if prob > market_price + 0.05 else ("→ BUY NO" if prob < market_price - 0.05 else "→ no edge")
             logger.info(
-                f"EventSentiment [{market_id[:20]}...]: "
-                f"p(YES)={prob:.2f} conf={conf:.2f} → boost={result.boost:+.3f}"
+                f"[GEMINI] {market_id[:30]}: "
+                f"p(YES)={prob:.2f} conf={conf:.2f} market={market_price:.2f} {edge_dir} | {reasoning}"
             )
             self._consecutive_failures = 0
 
@@ -145,15 +150,13 @@ class EventSentimentAnalyzer:
             with self._lock:
                 self._running.discard(market_id)
 
-    def analyze_async(self, market_id: str, question: str, bankroll: float):
+    def analyze_async(self, market_id: str, question: str, market_price: float = 0.5):
         """
-        Trigger background analysis for an event market.
-        Skips if bankroll < $100, cache is fresh, or already running.
+        Trigger background Gemini analysis for an event market.
+        Skips if cache is fresh or already running.
         """
         if not self._enabled:
             return
-        if bankroll < EVENT_SENTIMENT_MIN_BANKROLL:
-            return  # Not active until $100
 
         with self._lock:
             cached = self._cache.get(market_id)
@@ -165,34 +168,38 @@ class EventSentimentAnalyzer:
 
         t = threading.Thread(
             target=self._analyze,
-            args=(market_id, question),
+            args=(market_id, question, market_price),
             daemon=True,
-            name=f"eventsent-{market_id[:12]}",
+            name=f"gemini-{market_id[:12]}",
         )
         t.start()
 
-    def get_boost(self, market_id: str) -> float:
-        """Cached probability boost. Returns 0.0 if no data or stale."""
-        if not self._enabled:
-            return 0.0
-        with self._lock:
-            result = self._cache.get(market_id)
-        if result and result.is_fresh:
-            return result.boost
-        return 0.0
-
     def get_probability(self, market_id: str) -> float | None:
-        """Cached Gemini probability estimate. None if not available."""
+        """
+        Gemini's probability estimate for YES. None if not available yet.
+        Callers should fall back to market price (→ no edge) when None.
+        """
         with self._lock:
             result = self._cache.get(market_id)
         if result and result.is_fresh:
             return result.probability_yes
         return None
 
+    def get_confidence(self, market_id: str) -> float:
+        """Gemini's confidence for cached result. 0.0 if no data."""
+        with self._lock:
+            result = self._cache.get(market_id)
+        if result and result.is_fresh:
+            return result.confidence
+        return 0.0
+
     def summary(self) -> str:
         with self._lock:
             items = [r for r in self._cache.values() if r.is_fresh]
         if not items:
-            return "EventSentiment: no data"
-        parts = [f"{r.market_id[:15]}={r.probability_yes:.2f}(conf={r.confidence:.1f})" for r in items]
-        return f"EventSentiment: {', '.join(parts)}"
+            return "Gemini: no data yet"
+        parts = [
+            f"{r.market_id[:20]}=p{r.probability_yes:.2f}(c{r.confidence:.1f})"
+            for r in items
+        ]
+        return f"Gemini[{len(items)}]: {', '.join(parts)}"

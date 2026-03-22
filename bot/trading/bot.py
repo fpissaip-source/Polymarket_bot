@@ -373,6 +373,8 @@ class ArbitrageBot:
         condition_id: str = "",
         neg_risk: bool = False,
         tick_size: str = "0.01",
+        question: str = "",
+        is_event: bool = False,
     ):
         spot = 0.0
         if hasattr(self, '_last_prices') and asset.upper() in (self._last_prices or {}):
@@ -398,6 +400,8 @@ class ArbitrageBot:
             condition_id=condition_id,
             neg_risk=neg_risk,
             tick_size=tick_size,
+            question=question,
+            is_event=is_event,
         )
         # Auto-register spread pairs: any two markets with the same asset
         for existing_id, existing in self._markets.items():
@@ -412,90 +416,83 @@ class ArbitrageBot:
 
     def auto_discover_markets(self):
         """
-        Discover active markets using ONLY Gamma API.
-        Per docs: Use events endpoint → extract markets → get clobTokenIds.
-        CLOB is used only for live data (book, midpoint, price).
+        Discover high-volume event/prediction markets via Gamma API.
+        No crypto time markets — this bot trades question predictions only.
+        Gemini estimates the true probability; divergence from market price = edge.
         """
         import datetime
+        from config import EVENT_MARKET_LIMIT, EVENT_MARKET_MIN_VOLUME
         gamma = GammaClient()
-        assets = POLYMARKET_ASSETS
         registered = 0
 
-        for asset in assets:
-            logger.info(f"Discovering {asset} markets via Gamma API...")
-            markets = gamma.discover_5min_markets(asset)
-            if not markets:
-                logger.warning(f"No 15-min markets found for {asset} on Gamma — skipping")
+        logger.info("Discovering event/question markets via Gamma API...")
+        markets = gamma.discover_event_markets(limit=EVENT_MARKET_LIMIT)
+
+        for m in markets:
+            condition_id = (m.get("conditionId") or m.get("condition_id") or
+                            m.get("id") or "unknown")
+
+            # Volume quality filter
+            volume = float(m.get("volume", m.get("volumeNum", 0)) or 0)
+            if volume < EVENT_MARKET_MIN_VOLUME:
                 continue
 
-            registered_for_asset = 0
-            for m in markets:
-                if registered_for_asset >= 3:
-                    break
+            yes_token, no_token = extract_clob_tokens(m)
+            if not yes_token or not no_token:
+                continue
 
-                condition_id = (m.get("conditionId") or m.get("condition_id") or
-                                m.get("id") or "unknown")
+            condition_id_str = str(condition_id)
+            market_id = f"evt_{condition_id_str[:10]}"
+            if market_id in self._markets:
+                continue
 
-                yes_token, no_token = extract_clob_tokens(m)
-                if not yes_token or not no_token:
-                    logger.warning(
-                        f"{asset}: Could not extract clobTokenIds from Gamma market. "
-                        f"Keys: {list(m.keys())}"
-                    )
-                    continue
+            end_time = 0.0
+            now_ts = time.time()
+            end_date = (m.get("endDate") or m.get("end_date_iso") or
+                        m.get("closeTime") or m.get("close_time") or
+                        m.get("expirationTime") or m.get("expiration"))
+            if end_date:
+                try:
+                    dt = datetime.datetime.fromisoformat(str(end_date).replace("Z", "+00:00"))
+                    ts = dt.timestamp()
+                    if ts > now_ts - 86400:
+                        end_time = ts
+                except Exception:
+                    pass
 
-                market_id = f"{asset}_15m_{str(condition_id)[:8]}"
+            if end_time > 0 and end_time < now_ts:
+                continue
 
-                end_time = 0.0
-                now_ts = time.time()
-                end_date = (m.get("endDate") or m.get("end_date_iso") or
-                            m.get("closeTime") or m.get("close_time") or
-                            m.get("expirationTime") or m.get("expiration"))
-                if end_date:
-                    try:
-                        dt = datetime.datetime.fromisoformat(str(end_date).replace("Z", "+00:00"))
-                        ts = dt.timestamp()
-                        if ts > now_ts - 86400:
-                            end_time = ts
-                    except Exception:
-                        pass
+            gamma_price_yes, gamma_price_no = extract_gamma_prices(m)
+            market_neg_risk = bool(m.get("negRisk", m.get("neg_risk", False)))
+            market_tick_size = str(m.get("minimumTickSize", m.get("minimum_tick_size", "0.01")))
+            if market_tick_size not in ("0.1", "0.01", "0.001", "0.0001"):
+                market_tick_size = "0.01"
 
-                if end_time > 0 and end_time < now_ts:
-                    continue
+            question_text = m.get("question", "")
+            days_left = round((end_time - now_ts) / 86400, 1) if end_time > 0 else "?"
+            logger.info(
+                f"[EVENT] registered {market_id} | vol=${volume:.0f} | "
+                f"{days_left}d left | q='{question_text[:60]}'"
+            )
+            self.register_market(
+                market_id=market_id,
+                token_id_yes=yes_token,
+                token_id_no=no_token,
+                asset="EVENT",
+                timeframe="event",
+                end_time=end_time,
+                gamma_price_yes=gamma_price_yes,
+                gamma_price_no=gamma_price_no,
+                condition_id=condition_id_str,
+                neg_risk=market_neg_risk,
+                tick_size=market_tick_size,
+                question=question_text,
+                is_event=True,
+            )
+            registered += 1
 
-                gamma_price_yes, gamma_price_no = extract_gamma_prices(m)
-                market_neg_risk = bool(m.get("negRisk", m.get("neg_risk", False)))
-                market_tick_size = str(m.get("minimumTickSize", m.get("minimum_tick_size", "0.01")))
-                if market_tick_size not in ("0.1", "0.01", "0.001", "0.0001"):
-                    market_tick_size = "0.01"
-
-                question_text = m.get("question", "")[:60]
-                mins_left = round((end_time - time.time()) / 60, 1) if end_time > 0 else "?"
-                logger.info(
-                    f"[15m] {asset}: registered {market_id} | "
-                    f"{mins_left}m left | q='{question_text}'"
-                )
-                self.register_market(
-                    market_id=market_id,
-                    token_id_yes=yes_token,
-                    token_id_no=no_token,
-                    asset=asset,
-                    timeframe="15m",
-                    end_time=end_time,
-                    gamma_price_yes=gamma_price_yes,
-                    gamma_price_no=gamma_price_no,
-                    condition_id=str(condition_id),
-                    neg_risk=market_neg_risk,
-                    tick_size=market_tick_size,
-                )
-                registered += 1
-                registered_for_asset += 1
-
-        logger.info(f"Auto-discovery complete: {registered} 15-min crypto markets registered")
-
-        # Event market discovery DISABLED — bot trades 15-min crypto only
-        logger.info("Event market discovery skipped (5-min crypto mode only)")
-
+        logger.info(f"Auto-discovery complete: {registered} event markets registered")
         self._last_market_refresh = time.time()
         return registered
 
@@ -1159,83 +1156,89 @@ class ArbitrageBot:
                         f"MIN_EDGE={new_edge:.4f}"
                     )
 
+        # Event market refresh: add newly listed markets, prune expired ones
+        import datetime
+        from config import EVENT_MARKET_LIMIT, EVENT_MARKET_MIN_VOLUME
         gamma = GammaClient()
         new_count = 0
-        for asset in POLYMARKET_ASSETS:
-            has_active = any(
-                s.asset == asset and s.end_time > 0 and
-                self._MARKET_WINDOW_MIN <= (s.end_time - now) <= self._MARKET_WINDOW_MAX
-                for s in self._markets.values()
-            )
-            if has_active:
+
+        # Prune expired markets (end_time passed by >60s and no open position)
+        to_remove = []
+        for mid, state in list(self._markets.items()):
+            if state.end_time > 0 and state.end_time < now - 60:
+                has_position = any(
+                    p.get("market_id") == mid for p in self._live_positions.values()
+                )
+                if not has_position:
+                    to_remove.append(mid)
+        for mid in to_remove:
+            del self._markets[mid]
+            logger.info(f"[REFRESH] Pruned expired market {mid}")
+
+        # Discover new event markets not yet tracked
+        try:
+            markets = gamma.discover_event_markets(limit=EVENT_MARKET_LIMIT)
+        except Exception as e:
+            logger.warning(f"[REFRESH] Event market discovery failed: {e}")
+            markets = []
+
+        for m in markets:
+            condition_id = (m.get("conditionId") or m.get("condition_id") or
+                            m.get("id") or "")
+            if not condition_id:
+                continue
+            volume = float(m.get("volume", m.get("volumeNum", 0)) or 0)
+            if volume < EVENT_MARKET_MIN_VOLUME:
                 continue
 
-            markets = gamma.discover_5min_markets(asset)
-            best_market = None
-            best_end = 0.0
-            for m in markets:
-                import datetime
-                condition_id = m.get("conditionId") or m.get("id", "")
-                if not condition_id:
-                    continue
-                market_id = f"{asset}_15m_{str(condition_id)[:8]}"
-                if market_id in self._markets:
-                    continue
+            market_id = f"evt_{str(condition_id)[:10]}"
+            if market_id in self._markets:
+                continue
 
-                end_time = 0.0
-                end_date = (m.get("endDate") or m.get("end_date_iso") or
-                            m.get("closeTime") or m.get("expirationTime"))
-                if end_date:
-                    try:
-                        dt = datetime.datetime.fromisoformat(str(end_date).replace("Z", "+00:00"))
-                        ts = dt.timestamp()
-                        if ts > now - 86400:
-                            end_time = ts
-                    except Exception:
-                        pass
+            yes_token, no_token = extract_clob_tokens(m)
+            if not yes_token or not no_token:
+                continue
 
-                if end_time > 0 and end_time < now:
-                    continue
+            end_time = 0.0
+            end_date = (m.get("endDate") or m.get("end_date_iso") or
+                        m.get("closeTime") or m.get("expirationTime"))
+            if end_date:
+                try:
+                    dt = datetime.datetime.fromisoformat(str(end_date).replace("Z", "+00:00"))
+                    ts = dt.timestamp()
+                    if ts > now - 86400:
+                        end_time = ts
+                except Exception:
+                    pass
+            if end_time > 0 and end_time < now:
+                continue
 
-                remaining = end_time - now if end_time > 0 else 999
-                if remaining > self._MARKET_WINDOW_MAX:
-                    continue
+            gamma_price_yes, gamma_price_no = extract_gamma_prices(m)
+            market_neg_risk = bool(m.get("negRisk", m.get("neg_risk", False)))
+            market_tick_size = str(m.get("minimumTickSize", m.get("minimum_tick_size", "0.01")))
+            if market_tick_size not in ("0.1", "0.01", "0.001", "0.0001"):
+                market_tick_size = "0.01"
+            question_text = m.get("question", "")
 
-                yes_token, no_token = extract_clob_tokens(m)
-                if not yes_token or not no_token:
-                    continue
-
-                gamma_price_yes, gamma_price_no = extract_gamma_prices(m)
-                market_neg_risk = bool(m.get("negRisk", m.get("neg_risk", False)))
-                market_tick_size = str(m.get("minimumTickSize", m.get("minimum_tick_size", "0.01")))
-                if market_tick_size not in ("0.1", "0.01", "0.001", "0.0001"):
-                    market_tick_size = "0.01"
-
-                if best_market is None or (end_time > 0 and end_time > best_end):
-                    best_market = (market_id, yes_token, no_token, end_time,
-                                   gamma_price_yes, gamma_price_no, str(condition_id),
-                                   market_neg_risk, market_tick_size)
-                    best_end = end_time
-
-            if best_market:
-                mid, yt, nt, et, gpy, gpn, cid, nr, ts = best_market
-                self.register_market(
-                    market_id=mid,
-                    token_id_yes=yt,
-                    token_id_no=nt,
-                    asset=asset,
-                    timeframe="15m",
-                    end_time=et,
-                    gamma_price_yes=gpy,
-                    gamma_price_no=gpn,
-                    condition_id=cid,
-                    neg_risk=nr,
-                    tick_size=ts,
-                )
-                new_count += 1
+            self.register_market(
+                market_id=market_id,
+                token_id_yes=yes_token,
+                token_id_no=no_token,
+                asset="EVENT",
+                timeframe="event",
+                end_time=end_time,
+                gamma_price_yes=gamma_price_yes,
+                gamma_price_no=gamma_price_no,
+                condition_id=str(condition_id),
+                neg_risk=market_neg_risk,
+                tick_size=market_tick_size,
+                question=question_text,
+                is_event=True,
+            )
+            new_count += 1
 
         if new_count:
-            logger.info(f"[REFRESH] +{new_count} new markets | total={len(self._markets)}")
+            logger.info(f"[REFRESH] +{new_count} new event markets | total={len(self._markets)}")
 
     def run(self):
         if not self.validate_with_monte_carlo():
@@ -1386,17 +1389,28 @@ class ArbitrageBot:
             if wallet_signal.has_signal:
                 q = max(0.01, min(0.99, q + wallet_signal.confidence_boost))
 
-            # --- 3c. Event sentiment boost (only for non-crypto markets, only above $100) ---
+            # --- 3c. Gemini probability (PRIMARY signal for event markets) ---
             if state.is_event and state.question:
+                # Trigger background Gemini analysis (cached, refreshes every 5min)
                 self.event_sentiment.analyze_async(
                     market_id=market_id,
                     question=state.question,
-                    bankroll=self.kelly.bankroll,
+                    market_price=p_yes,
                 )
-                sentiment_boost = self.event_sentiment.get_boost(market_id)
-                if sentiment_boost != 0.0:
-                    q = max(0.01, min(0.99, q + sentiment_boost))
-                    logger.debug(f"[{market_id}] EventSentiment boost={sentiment_boost:+.3f} → q={q:.3f}")
+                gemini_prob = self.event_sentiment.get_probability(market_id)
+                if gemini_prob is not None:
+                    # Gemini IS the primary probability estimate — overrides Bayesian
+                    # OFI and wallet signal can still fine-tune it below
+                    q = gemini_prob
+                    logger.debug(
+                        f"[GEMINI:{market_id[:20]}] p(YES)={gemini_prob:.3f} "
+                        f"conf={self.event_sentiment.get_confidence(market_id):.2f} "
+                        f"market={p_yes:.3f} → q={q:.3f}"
+                    )
+                else:
+                    # No Gemini data yet — use market price so edge=0, skip this tick
+                    q = p_yes
+                    logger.debug(f"[GEMINI:{market_id[:20]}] awaiting first estimate → q=market")
 
             # --- 3d. OFI signal: refine q with live order-flow pressure ---
             if ofi_result.q_adjustment != 0.0:
@@ -1627,32 +1641,18 @@ class ArbitrageBot:
                     logger.info(f"[GAS SKIP] {opp.market_id}: {gas_reason}")
                     continue
 
-                # Per-timeframe slot limits: 6 × 5min, 5 × 15min, 4 × event
-                from config import MAX_TRADES_5MIN, MAX_TRADES_15MIN, MAX_TRADES_EVENT
+                # Position slot limits — event markets only
+                from config import MAX_TRADES_EVENT
                 n_open = len(self._live_positions)
                 if n_open >= MAX_OPEN_TRADES:
                     logger.info(
-                        f"[SKIP] {opp.market_id}: {n_open}/{MAX_OPEN_TRADES} total positions — full"
+                        f"[SKIP] {opp.market_id}: {n_open}/{MAX_OPEN_TRADES} positions — full"
                     )
                     continue
-                # Count positions per timeframe
-                _market_state = self._markets.get(opp.market_id)
-                _tf = _market_state.timeframe if _market_state else "15m"
-                _is_event = _market_state.is_event if _market_state else False
-                _n_5m = sum(1 for p in self._live_positions.values()
-                            if "5m" in p.get("market_id", ""))
-                _n_15m = sum(1 for p in self._live_positions.values()
-                             if "15m" in p.get("market_id", "") and not p.get("is_event"))
-                _n_event = sum(1 for p in self._live_positions.values()
-                               if p.get("is_event"))
-                if _tf == "5m" and _n_5m >= MAX_TRADES_5MIN and side != "BOTH":
-                    logger.info(f"[SKIP] {opp.market_id}: {_n_5m}/{MAX_TRADES_5MIN} 5min slots used")
-                    continue
-                if _tf == "15m" and not _is_event and _n_15m >= MAX_TRADES_15MIN and side != "BOTH":
-                    logger.info(f"[SKIP] {opp.market_id}: {_n_15m}/{MAX_TRADES_15MIN} 15min slots used")
-                    continue
-                if _is_event and _n_event >= MAX_TRADES_EVENT:
-                    logger.info(f"[SKIP] {opp.market_id}: {_n_event}/{MAX_TRADES_EVENT} event slots used")
+                if n_open >= MAX_TRADES_EVENT:
+                    logger.info(
+                        f"[SKIP] {opp.market_id}: {n_open}/{MAX_TRADES_EVENT} event slots used"
+                    )
                     continue
 
                 # Hard cap: never exceed MAX_TOTAL_EXPOSURE_PCT of bankroll
