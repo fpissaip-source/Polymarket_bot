@@ -1309,6 +1309,12 @@ class ArbitrageBot:
             if p_yes > 0.95 or p_yes < 0.05:
                 market_stats.append(f"{state.asset}({state.timeframe}):RESOLVED(p={p_yes:.2f})")
                 continue
+            # Enforce minimum price floor — avoid buying at 5¢ where there's no
+            # liquidity to sell on the losing side (dead market on expiry)
+            from config import PRICE_FLOOR, PRICE_CEILING
+            if p_yes < PRICE_FLOOR and p_no is not None and p_no < PRICE_FLOOR:
+                market_stats.append(f"{state.asset}({state.timeframe}):TOO_CHEAP(p={p_yes:.2f})")
+                continue
 
             ob_imbalance = yes_data["imbalance"] or 0.0
             ob_depth = yes_data["depth"] if yes_data["depth"] else 0.5
@@ -1451,6 +1457,30 @@ class ArbitrageBot:
                         kelly_result, position_size=MIN_BET_SIZE
                     )
                     logger.debug(f"[MIN_BET] size clamped to ${MIN_BET_SIZE:.2f}")
+            # Dead market liquidity check: ensure there are enough bids to sell into.
+            # Without this, we buy cheap positions but can't exit (best_bid=0.01 on expiry).
+            if kelly_result.is_viable and kelly_result.position_size > 0:
+                try:
+                    _sell_token = state.token_id_yes if edge_result.side == "YES" else state.token_id_no
+                    _sell_book = self.data_client.get_book_data(_sell_token)
+                    _sell_bids = _sell_book.get("bids", [])
+                    _best_bid = float(_sell_bids[0]["price"]) if _sell_bids else 0.0
+                    _bid_depth = sum(float(b.get("size", 0)) for b in _sell_bids[:3])
+                    if _best_bid < 0.03:
+                        logger.info(
+                            f"[LIQUIDITY_SKIP] {market_id}: best_bid={_best_bid:.3f} "
+                            f"— no exit liquidity, skipping"
+                        )
+                        kelly_result = dc_replace(kelly_result, is_viable=False)
+                    elif _bid_depth < 5.0:
+                        logger.info(
+                            f"[LIQUIDITY_SKIP] {market_id}: bid_depth={_bid_depth:.1f} "
+                            f"< 5 shares in top 3 bids — too thin, skipping"
+                        )
+                        kelly_result = dc_replace(kelly_result, is_viable=False)
+                except Exception as _liq_e:
+                    logger.debug(f"[LIQUIDITY] Check failed: {_liq_e}")
+
             if kelly_result.is_viable and kelly_result.position_size > 0:
                 opp = TradeOpportunity(
                     market_id=market_id,
@@ -1594,21 +1624,32 @@ class ArbitrageBot:
                     logger.info(f"[GAS SKIP] {opp.market_id}: {gas_reason}")
                     continue
 
-                # Hard cap: reserve 2 slots for arbitrage, directional trades use rest
+                # Per-timeframe slot limits: 6 × 5min, 5 × 15min, 4 × event
+                from config import MAX_TRADES_5MIN, MAX_TRADES_15MIN, MAX_TRADES_EVENT
                 n_open = len(self._live_positions)
-                ARB_RESERVED_SLOTS = 2
-                directional_limit = MAX_OPEN_TRADES - ARB_RESERVED_SLOTS
-                if n_open >= directional_limit and side != "BOTH":
-                    logger.info(
-                        f"[SKIP] {opp.market_id}: {n_open}/{directional_limit} directional slots used — "
-                        f"reserving {ARB_RESERVED_SLOTS} for arb"
-                    )
-                    continue
                 if n_open >= MAX_OPEN_TRADES:
                     logger.info(
-                        f"[SKIP] {opp.market_id}: {n_open}/{MAX_OPEN_TRADES} positions open — "
-                        f"waiting for TP/SL/expiry before opening more"
+                        f"[SKIP] {opp.market_id}: {n_open}/{MAX_OPEN_TRADES} total positions — full"
                     )
+                    continue
+                # Count positions per timeframe
+                _market_state = self._markets.get(opp.market_id)
+                _tf = _market_state.timeframe if _market_state else "15m"
+                _is_event = _market_state.is_event if _market_state else False
+                _n_5m = sum(1 for p in self._live_positions.values()
+                            if "5m" in p.get("market_id", ""))
+                _n_15m = sum(1 for p in self._live_positions.values()
+                             if "15m" in p.get("market_id", "") and not p.get("is_event"))
+                _n_event = sum(1 for p in self._live_positions.values()
+                               if p.get("is_event"))
+                if _tf == "5m" and _n_5m >= MAX_TRADES_5MIN and side != "BOTH":
+                    logger.info(f"[SKIP] {opp.market_id}: {_n_5m}/{MAX_TRADES_5MIN} 5min slots used")
+                    continue
+                if _tf == "15m" and not _is_event and _n_15m >= MAX_TRADES_15MIN and side != "BOTH":
+                    logger.info(f"[SKIP] {opp.market_id}: {_n_15m}/{MAX_TRADES_15MIN} 15min slots used")
+                    continue
+                if _is_event and _n_event >= MAX_TRADES_EVENT:
+                    logger.info(f"[SKIP] {opp.market_id}: {_n_event}/{MAX_TRADES_EVENT} event slots used")
                     continue
 
                 # Hard cap: never exceed MAX_TOTAL_EXPOSURE_PCT of bankroll

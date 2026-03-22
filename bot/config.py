@@ -91,7 +91,10 @@ DRY_RUN_BANKROLL = float(os.getenv("DRY_RUN_BANKROLL", "25.00"))  # Virtual capi
 # Fixed bet sizing (overrides Kelly when smaller)
 BET_SIZE_PCT = float(os.getenv("BET_SIZE_PCT", "0.20"))
 MIN_BET_SIZE = float(os.getenv("MIN_BET_SIZE", "1.00"))
-MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "4"))
+MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "15"))
+MAX_TRADES_5MIN = int(os.getenv("MAX_TRADES_5MIN", "6"))
+MAX_TRADES_15MIN = int(os.getenv("MAX_TRADES_15MIN", "5"))
+MAX_TRADES_EVENT = int(os.getenv("MAX_TRADES_EVENT", "4"))
 MAX_TOTAL_EXPOSURE_PCT = float(os.getenv("MAX_TOTAL_EXPOSURE_PCT", "0.85"))
 MAX_POSITION_HOLD_MINUTES = float(os.getenv("MAX_POSITION_HOLD_MINUTES", "20.0"))  # Force-sell after this
 MIN_BANKROLL_FLOOR = float(os.getenv("MIN_BANKROLL_FLOOR", "3.0"))
@@ -109,14 +112,12 @@ GROWTH_TIERS = [
 BANKROLL_STATE_FILE = "bankroll_state.json"
 
 # Take-Profit / Stop-Loss
-TP_RATIO = 0.10               # Take profit at +10% return on trade
-SL_RATIO = 0.20               # Stop loss at -20% loss on trade
+TP_RATIO = 0.20               # Take profit at +20% return on trade
+SL_RATIO = 0.10               # Stop loss at -10% loss on trade
 
 # Adaptive TP/SL for low-price positions (exec_price < LOW_PRICE_THRESHOLD)
-# At prices like 0.19, a move from 0.19→0.12 is already -37% in one tick.
-# Tighter thresholds catch losses faster before they snowball.
 LOW_PRICE_THRESHOLD = 0.30    # Below this exec_price → use low-price ratios
-TP_RATIO_LOW = 0.15           # TP at +15% for low-price positions
+TP_RATIO_LOW = 0.20           # TP at +20% for low-price positions
 SL_RATIO_LOW = 0.10           # SL at -10% for low-price positions
 
 TP_SL_CHECK_INTERVAL = 1      # Check TP/SL every 1 second (fast reaction)
