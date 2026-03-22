@@ -139,10 +139,9 @@ class ArbitrageBot:
                 starting_bankroll = live_balance
                 logger.info(f"[STARTUP] Live CLOB balance=${live_balance:.2f} → using as dry-run bankroll")
             else:
-                starting_bankroll = min(live_balance, BANKROLL)
+                starting_bankroll = live_balance
                 logger.info(
-                    f"[STARTUP] CLOB balance=${live_balance:.2f} | "
-                    f"config BANKROLL=${BANKROLL:.2f} → using ${starting_bankroll:.2f}"
+                    f"[STARTUP] CLOB balance=${live_balance:.2f} → using as live bankroll"
                 )
         else:
             logger.warning(
@@ -165,12 +164,11 @@ class ArbitrageBot:
             # Re-sync bankroll after cancellations free up balance
             actual_balance = self.executor.get_available_balance_usd()
             if actual_balance > 0 and actual_balance != starting_bankroll:
-                effective = min(actual_balance, BANKROLL)
                 logger.info(
-                    f"[STARTUP] Post-cancel CLOB balance=${actual_balance:.2f} → using ${effective:.2f}"
+                    f"[STARTUP] Post-cancel CLOB balance=${actual_balance:.2f} → using as bankroll"
                 )
-                self.kelly.bankroll = effective
-                starting_bankroll = effective
+                self.kelly.bankroll = actual_balance
+                starting_bankroll = actual_balance
             elif actual_balance == 0:
                 logger.warning(
                     f"[STARTUP] CLOB balance=$0 after cancelling {n_cancelled} orders. "
@@ -1680,6 +1678,16 @@ class ArbitrageBot:
                 logger.info(f"[HEARTBEAT] Regimes: {regime_info}")
             if active:
                 logger.info(f"[HEARTBEAT] Market status: {' | '.join(active)}")
+            # Re-sync bankroll from live CLOB every 10 ticks (live mode only)
+            if not self.dry_run and self._tick_count % 10 == 0 and self.executor:
+                try:
+                    synced = self.executor.get_available_balance_usd()
+                    if synced > 0 and abs(synced - self.kelly.bankroll) > 0.05:
+                        logger.info(f"[SYNC] CLOB balance=${synced:.2f} (was ${self.kelly.bankroll:.2f}) → updated")
+                        self.kelly.bankroll = synced
+                        self._save_bankroll()
+                except Exception:
+                    pass
             # Persist regime + gas state for dashboard
             try:
                 regime_file = Path(__file__).parent.parent / "regime_state.json"
