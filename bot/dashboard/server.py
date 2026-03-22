@@ -737,6 +737,7 @@ function nnUpdate(decisions){
     tclr='#d29922';
   }
   _nnFire(color,outIdx);
+  _nnLastFire=Date.now();
   var dot=document.getElementById('nn-dot'), ttxt=document.getElementById('nn-ticker-txt');
   if(dot) dot.style.background=tclr;
   if(ttxt){ ttxt.style.color=tclr; ttxt.textContent=txt; }
@@ -781,10 +782,22 @@ function nnEvFeed(decisions){
   }).join('');
 }
 
-// Start NN when gemini tab first clicked
-document.querySelectorAll('.tab').forEach(function(t,i){
-  if(i===1) t.addEventListener('click',function(){ if(!_nnReady) setTimeout(_nnInit,40); });
-});
+// Auto-start NN on page load (runs in background loop even on other tabs)
+setTimeout(_nnInit, 80);
+
+// Idle loop: fire random neuron pattern every 4s when no real trade is active
+var _nnIdleColors = ['#58a6ff','#3fb950','#d29922','#58a6ff','#a371f7'];
+var _nnLastFire = 0;
+setInterval(function(){
+  if(!_nnReady) return;
+  var now = Date.now();
+  // Only idle-fire if no real signal in last 6s
+  if(now - _nnLastFire < 6000) return;
+  var outIdx = Math.floor(Math.random()*3);
+  var clr = _nnIdleColors[Math.floor(Math.random()*_nnIdleColors.length)];
+  _nnFire(clr, outIdx);
+  _nnLastFire = now;
+}, 4000);
 
 // ── Poll every 3 seconds ──────────────────────────────────────────────────
 async function poll() {
