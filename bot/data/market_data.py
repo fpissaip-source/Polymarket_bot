@@ -15,7 +15,10 @@ import json
 import time
 import logging
 import requests
-from config import POLYMARKET_HOST, GAMMA_API_HOST, DATA_API_HOST
+from config import (
+    POLYMARKET_HOST, GAMMA_API_HOST, DATA_API_HOST,
+    SPORTS_EXCLUDE_TAGS, SPORTS_EXCLUDE_KEYWORDS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -617,33 +620,86 @@ class GammaClient:
             logger.info(f"Gamma: no active markets found for {asset}")
         return matched
 
-    def discover_event_markets(self, limit: int = 50, exclude_assets: list[str] = None) -> list[dict]:
+    def _is_sports_market(self, question: str, tags: list[str]) -> bool:
+        """Returns True if the market is sports-related and should be excluded."""
+        q = question.lower()
+        # Check tags returned by Gamma
+        for t in tags:
+            if t.lower() in SPORTS_EXCLUDE_TAGS:
+                return True
+        # Keyword scan on the question text
+        return any(kw in q for kw in SPORTS_EXCLUDE_KEYWORDS)
+
+    def discover_event_markets(self, limit: int = 80, exclude_assets: list[str] = None) -> list[dict]:
         """
-        Discover high-volume non-crypto event markets (politics, sports, etc.)
-        using the events endpoint.
+        Discover high-volume non-crypto, non-sports event markets.
+        Covers politics, geopolitics, economics, weather, science, tech, law, etc.
+        Sports markets are explicitly excluded per config.SPORTS_EXCLUDE_*.
         """
         exclude = [a.lower() for a in (exclude_assets or [])]
-        crypto_words = ["bitcoin", "ethereum", "solana", "btc", "eth", "sol", "xrp", "doge", "bnb", "hype", "crypto"]
+        crypto_price_words = [
+            "bitcoin price", "ethereum price", "solana price",
+            "btc price", "eth price", "sol price",
+            "will btc", "will eth", "will sol",
+            "reach $", "above $", "below $", "hit $",
+        ]
 
-        matched = []
-        events = self.get_events(active=True, limit=limit, order="volume")
-        for event in events:
-            event_markets = event.get("markets", [])
-            for m in event_markets:
-                question = m.get("question", "").lower()
-                if any(cw in question for cw in crypto_words):
-                    continue
-                if not m.get("active", True) or m.get("closed", False):
-                    continue
-                clob_ids = _parse_json_field(m.get("clobTokenIds", []))
-                if len(clob_ids) < 2:
-                    continue
-                p_yes, _ = extract_gamma_prices(m)
-                if p_yes is not None and not (0.05 <= p_yes <= 0.95):
-                    continue
-                matched.append(m)
+        seen_ids: set[str] = set()
+        matched: list[dict] = []
 
-        logger.info(f"Gamma: found {len(matched)} event markets")
+        # Fetch by volume (broad sweep) — gets the most active events first
+        for order in ("volume", "liquidity", "start_date_max"):
+            events = self.get_events(active=True, limit=limit, order=order)
+            for event in events:
+                # Event-level tag check
+                event_tags = [
+                    t.get("slug", t) if isinstance(t, dict) else str(t)
+                    for t in event.get("tags", [])
+                ]
+                event_title = event.get("title", "").lower()
+
+                for m in event.get("markets", []):
+                    question = m.get("question", "")
+                    q_lower = question.lower()
+
+                    # Skip crypto price prediction markets (keep crypto regulation etc.)
+                    if any(cpw in q_lower for cpw in crypto_price_words):
+                        continue
+
+                    # Skip sports
+                    market_tags = [
+                        t.get("slug", t) if isinstance(t, dict) else str(t)
+                        for t in m.get("tags", event_tags)
+                    ]
+                    if self._is_sports_market(question, market_tags):
+                        continue
+
+                    # Skip inactive / resolved markets
+                    if not m.get("active", True) or m.get("closed", False):
+                        continue
+
+                    # Require binary YES/NO token pair
+                    clob_ids = _parse_json_field(m.get("clobTokenIds", []))
+                    if len(clob_ids) < 2:
+                        continue
+
+                    # Skip extreme prices (already almost resolved)
+                    p_yes, _ = extract_gamma_prices(m)
+                    if p_yes is not None and not (0.05 <= p_yes <= 0.95):
+                        continue
+
+                    # Deduplicate
+                    market_id = m.get("id") or clob_ids[0]
+                    if market_id in seen_ids:
+                        continue
+                    seen_ids.add(market_id)
+
+                    matched.append(m)
+
+        logger.info(
+            f"Gamma: discovered {len(matched)} event markets "
+            f"(politics/geopolitics/economics/weather/science/tech/… — sports excluded)"
+        )
         return matched
 
 

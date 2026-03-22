@@ -114,28 +114,56 @@ class EventSentimentAnalyzer:
         try:
             today = date.today().isoformat()
             weather_block = (
-                f"\nReal-time weather data:\n{weather_context}\n"
+                f"\nVerified real-time weather sensor data:\n{weather_context}\n"
                 if weather_context else ""
             )
             prompt = (
-                f"Today is {today}. You are an expert prediction market analyst.\n\n"
-                f"Market question: {question}\n"
-                f"Current market consensus price: YES = {market_price:.0%}\n"
+                f"Today is {today}. You are a professional prediction market analyst "
+                f"with access to live internet search.\n\n"
+                f"═══ MARKET QUESTION ═══\n"
+                f"{question}\n"
+                f"Current market price: YES = {market_price:.0%}\n"
                 f"{weather_block}\n"
-                f"Your task: estimate the TRUE probability that the answer resolves YES.\n"
-                f"Search Google for the latest news on this topic, then answer.\n"
-                f"Compare your estimate to the market price — divergence = edge.\n\n"
-                f"Respond in EXACTLY this format (4 lines, nothing else):\n"
+                f"═══ RESEARCH PROTOCOL ═══\n"
+                f"Before answering, conduct multi-source research in this order:\n\n"
+                f"1. OFFICIAL SOURCES — Search for statements from governments, "
+                f"central banks, courts, scientific institutions, WHO, UN, NASA, etc. "
+                f"These carry the highest credibility weight.\n\n"
+                f"2. ESTABLISHED NEWS — Search major outlets: Reuters, AP, BBC, "
+                f"Bloomberg, FT, NYT, Der Spiegel, Le Monde. Require multiple "
+                f"independent sources confirming the same fact.\n\n"
+                f"3. REDDIT SENTIMENT — Search reddit.com for discussion threads "
+                f"about this topic (e.g. site:reddit.com {question[:60]}). "
+                f"Note the dominant sentiment and volume of discussion, "
+                f"but treat as soft signal only.\n\n"
+                f"4. X / TWITTER SENTIMENT — Search twitter.com or x.com for "
+                f"recent posts about this topic from verified accounts. "
+                f"Note expert/analyst opinions vs. general public sentiment.\n\n"
+                f"═══ FAKE NEWS FILTER (apply strictly) ═══\n"
+                f"DISCARD any claim that:\n"
+                f"- Comes from only ONE source with no independent corroboration\n"
+                f"- Originates from anonymous accounts, tabloids, or known partisan outlets\n"
+                f"- Contains extreme/sensational language without evidence\n"
+                f"- Is older than 7 days for fast-moving events\n"
+                f"- Shows 'echo chamber' pattern (many accounts repeating ONE original claim)\n"
+                f"- Contradicts official data (e.g. government statistics, court documents)\n"
+                f"If X/Reddit sentiment CONTRADICTS verified news → trust verified news.\n"
+                f"If X/Reddit sentiment CONFIRMS verified news → slight confidence boost.\n\n"
+                f"═══ OUTPUT FORMAT (4 lines, nothing else) ═══\n"
                 f"PROBABILITY: 0.XX\n"
                 f"CONFIDENCE: 0.XX\n"
-                f"REASONING: one sentence explaining your estimate\n"
+                f"REASONING: <one sentence, cite your strongest verified source>\n"
                 f"EDGE: BUY_YES / BUY_NO / NO_EDGE\n\n"
-                f"Rules:\n"
-                f"- PROBABILITY: your best estimate that the answer resolves YES (0.00–1.00)\n"
-                f"- CONFIDENCE: how reliable your estimate is (0.10=pure guess, 0.90=very informed)\n"
-                f"  Only set ≥0.75 if you found concrete recent data; set low otherwise\n"
-                f"- REASONING: key fact or logic behind your estimate (max 20 words)\n"
-                f"- EDGE: BUY_YES if your prob > market+5%, BUY_NO if < market-5%, else NO_EDGE"
+                f"Scoring rules:\n"
+                f"- PROBABILITY: true probability that the question resolves YES (0.00–1.00)\n"
+                f"- CONFIDENCE: how certain you are (0.10=no reliable data found, "
+                f"0.90=multiple independent verified sources agree)\n"
+                f"  • ≥0.75 only if: ≥2 independent credible sources confirm the key fact\n"
+                f"  • 0.50–0.74: some evidence but conflicting signals or limited data\n"
+                f"  • <0.50: speculation, fast-moving situation, or no recent data found\n"
+                f"- REASONING: include the key fact + source type (e.g. 'Reuters reports…', "
+                f"'Official govt. data shows…', 'Reddit/X consensus is…')\n"
+                f"- EDGE: BUY_YES if prob > market+5%, BUY_NO if prob < market-5%, else NO_EDGE"
             )
 
             # Build config with Google Search Grounding when available
@@ -153,15 +181,28 @@ class EventSentimentAnalyzer:
             text = response.text.strip()
 
             # Log search grounding sources if present
+            grounding_sources: list[str] = []
             try:
                 chunks = (
                     response.candidates[0].grounding_metadata.grounding_chunks
                     if response.candidates else []
                 )
                 if chunks:
-                    sources = [c.web.uri for c in chunks if getattr(c, "web", None)]
-                    if sources:
-                        logger.debug(f"[GEMINI] search sources: {sources[:3]}")
+                    grounding_sources = [
+                        c.web.uri for c in chunks if getattr(c, "web", None)
+                    ]
+                    if grounding_sources:
+                        has_reddit = any("reddit" in u for u in grounding_sources)
+                        has_x = any("x.com" in u or "twitter" in u for u in grounding_sources)
+                        flags = []
+                        if has_reddit:
+                            flags.append("Reddit✓")
+                        if has_x:
+                            flags.append("X✓")
+                        logger.debug(
+                            f"[GEMINI] {len(grounding_sources)} sources "
+                            f"{' '.join(flags)}: {grounding_sources[:4]}"
+                        )
             except Exception:
                 pass
 
@@ -188,9 +229,11 @@ class EventSentimentAnalyzer:
                 self._cache[market_id] = result
 
             edge_dir = "→ BUY YES" if prob > market_price + 0.05 else ("→ BUY NO" if prob < market_price - 0.05 else "→ no edge")
+            src_info = f" [{len(grounding_sources)} sources]" if grounding_sources else ""
             logger.info(
                 f"[GEMINI] {market_id[:30]}: "
-                f"p(YES)={prob:.2f} conf={conf:.2f} market={market_price:.2f} {edge_dir} | {reasoning}"
+                f"p(YES)={prob:.2f} conf={conf:.2f} market={market_price:.2f} {edge_dir}"
+                f"{src_info} | {reasoning}"
             )
             self._consecutive_failures = 0
 

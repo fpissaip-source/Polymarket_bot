@@ -48,12 +48,52 @@ SLIPPAGE_ESTIMATE = TAKER_SLIPPAGE
 INCOMPLETE_EXEC_RISK = TAKER_EXEC_RISK
 TOTAL_COST = TOTAL_COST_TAKER
 
-# Event markets (politics, geopolitics, sports, weather) — Gemini 3 Flash powered
-EVENT_SENTIMENT_MIN_BANKROLL = 1.0     # Active from day 1
-EVENT_MARKET_TAGS = ["politics", "geopolitics", "elections", "sports", "entertainment", "weather"]
-EVENT_SENTIMENT_REFRESH = 300          # Refresh every 5 minutes
-EVENT_MARKET_LIMIT = 30               # Max event markets to discover
+# Event markets — ALL categories EXCEPT sports (Gemini 3 Flash powered)
+EVENT_SENTIMENT_MIN_BANKROLL = 1.0
+EVENT_SENTIMENT_REFRESH = 300          # Re-analyze every 5 minutes
+EVENT_MARKET_LIMIT = 80               # Broader discovery — more categories
 EVENT_MARKET_MIN_VOLUME = 1000.0      # Min total volume ($) for market quality
+
+# Categories the bot WILL trade (Gamma API tag slugs)
+EVENT_MARKET_TAGS = [
+    "politics",
+    "geopolitics",
+    "elections",
+    "economics",
+    "finance",
+    "science",
+    "technology",
+    "climate",
+    "weather",
+    "environment",
+    "health",
+    "law",
+    "ai",
+    "crypto",       # non-price crypto events (regulations, ETF approvals, etc.)
+    "business",
+    "culture",
+    "entertainment",
+    "media",
+    "international",
+]
+
+# Categories and keywords the bot will NEVER trade (sports exclusion)
+SPORTS_EXCLUDE_TAGS = [
+    "sports", "football", "soccer", "basketball", "baseball",
+    "hockey", "tennis", "golf", "racing", "boxing", "mma", "ufc",
+    "olympics", "esports",
+]
+SPORTS_EXCLUDE_KEYWORDS = [
+    "nfl", "nba", "mlb", "nhl", "nascar", "f1", "formula 1", "formula one",
+    "premier league", "bundesliga", "la liga", "serie a", "ligue 1", "champions league",
+    "world cup", "superbowl", "super bowl", "stanley cup", "world series",
+    "wimbledon", "us open", "french open", "australian open",
+    "ufc", "boxing", "mma", "wrestl",
+    "match", "game 1", "game 2", "game 3", "game 4", "game 5", "game 6", "game 7",
+    "score", "winner of the", "championship",
+    "quarterback", "touchdown", "home run", "penalty",
+]
+
 # Only trade event markets when Gemini's confidence is at or above this threshold
 GEMINI_MIN_CONFIDENCE = float(os.getenv("GEMINI_MIN_CONFIDENCE", "0.75"))
 
