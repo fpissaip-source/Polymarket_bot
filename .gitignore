@@ -48,3 +48,9 @@ Thumbs.db
 .cache/
 .local/
 __pycache__/
+
+# Environment variables (contains private keys - NEVER commit!)
+.env
+*.env
+.env.*
+!.env.example
