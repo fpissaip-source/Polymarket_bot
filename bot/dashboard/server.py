@@ -12,6 +12,7 @@ Neu in v2:
 
 import json
 import os
+import sys
 import time
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -28,6 +29,38 @@ REGIME_FILE  = BOT_ROOT / "regime_state.json"
 
 PORT = 8080
 
+# ---------------------------------------------------------------------------
+# Live CLOB balance cache (updated every 30s in background thread)
+# ---------------------------------------------------------------------------
+_live_balance: float = 0.0
+_live_balance_lock = threading.Lock()
+_live_balance_ts: float = 0.0
+
+
+def _update_live_balance():
+    """Background thread: fetch real CLOB balance every 30 seconds."""
+    global _live_balance, _live_balance_ts
+    # Add bot root to sys.path so we can import bot modules
+    bot_root_str = str(BOT_ROOT)
+    if bot_root_str not in sys.path:
+        sys.path.insert(0, bot_root_str)
+    while True:
+        try:
+            from trading.order_executor import fetch_live_balance_usd
+            bal = fetch_live_balance_usd()
+            if bal > 0:
+                with _live_balance_lock:
+                    _live_balance = bal
+                    _live_balance_ts = time.time()
+        except Exception:
+            pass
+        time.sleep(30)
+
+
+# Start background balance-updater as daemon thread
+_balance_thread = threading.Thread(target=_update_live_balance, daemon=True, name="live-balance")
+_balance_thread.start()
+
 
 # ---------------------------------------------------------------------------
 # State helpers
@@ -43,6 +76,12 @@ def _safe_read(path: Path, default):
 
 
 def load_bankroll() -> float:
+    """Return live CLOB balance if fresh (< 90s), else fall back to JSON state file."""
+    with _live_balance_lock:
+        bal = _live_balance
+        ts = _live_balance_ts
+    if bal > 0 and (time.time() - ts) < 90:
+        return bal
     data = _safe_read(STATE_FILE, {})
     return float(data.get("bankroll", 0.0))
 
@@ -79,12 +118,16 @@ def load_recent_logs(n: int = 80) -> list:
 
 
 def get_dashboard_state() -> dict:
-    bankroll  = load_bankroll()
+    bankroll  = load_bankroll()   # free CLOB cash (live from API)
     trades    = load_trades()
     positions = load_positions()
     gemini    = load_gemini_decisions()
     regime    = load_regime()
     logs      = load_recent_logs(80)
+
+    # Committed capital: sum of entry sizes in open positions
+    committed = sum(float(p.get("size") or p.get("entry_size") or 0) for p in positions)
+    total_portfolio = bankroll + committed  # free cash + locked in positions
 
     total_trades = len(trades)
     wins   = [t for t in trades if t.get("pnl", 0) > 0]
@@ -123,6 +166,10 @@ def get_dashboard_state() -> dict:
 
     return {
         "bankroll":    round(bankroll, 2),
+        "free_cash":   round(bankroll, 2),
+        "committed":   round(committed, 2),
+        "total_portfolio": round(total_portfolio, 2),
+        "balance_fresh": (time.time() - _live_balance_ts) < 90 and _live_balance > 0,
         "total_trades": total_trades,
         "wins":        len(wins),
         "losses":      len(losses),
@@ -256,7 +303,9 @@ tr:hover td{background:#1c2128}
 <!-- ════ TAB: PORTFOLIO ════ -->
 <div id="page-portfolio" class="page active">
   <div class="grid">
-    <div class="card"><div class="lbl">Kontostand</div><div class="val blue" id="bankroll">$0.00</div></div>
+    <div class="card"><div class="lbl">Portfolio <span id="bal-fresh" style="font-size:9px;color:#3fb950"></span></div><div class="val blue" id="total_portfolio">$0.00</div></div>
+    <div class="card"><div class="lbl">Freies Cash</div><div class="val blue" id="bankroll">$0.00</div></div>
+    <div class="card"><div class="lbl">In Positionen</div><div class="val yellow" id="committed">$0.00</div></div>
     <div class="card"><div class="lbl">Gesamt PnL</div><div class="val" id="total_pnl">$0.00</div></div>
     <div class="card"><div class="lbl">Win Rate</div><div class="val" id="win_rate">0%</div></div>
     <div class="card"><div class="lbl">Trades</div><div class="val" id="total_trades">0</div></div>
@@ -393,7 +442,12 @@ function render(s) {
 
   // Portfolio metrics
   const br = s.bankroll;
+  const portfolio = s.total_portfolio || br;
+  document.getElementById('total_portfolio').textContent = '$' + portfolio.toFixed(2);
   document.getElementById('bankroll').textContent = '$' + br.toFixed(2);
+  document.getElementById('committed').textContent = '$' + (s.committed || 0).toFixed(2);
+  const freshEl = document.getElementById('bal-fresh');
+  if (freshEl) freshEl.textContent = s.balance_fresh ? '● LIVE' : '○ cached';
   const pnlEl = document.getElementById('total_pnl');
   pnlEl.textContent = (s.total_pnl>=0?'+':'')+'$'+s.total_pnl.toFixed(4);
   pnlEl.className = 'val ' + (s.total_pnl>=0?'green':'red');
@@ -404,13 +458,14 @@ function render(s) {
   document.getElementById('biggest_win').textContent = '+$'+s.biggest_win.toFixed(4);
   document.getElementById('biggest_loss').textContent = '$'+s.biggest_loss.toFixed(4);
 
-  // Goal bars
-  document.getElementById('g1bar').style.width = pct(br, 5.27, 100)+'%';
-  document.getElementById('g1lbl').textContent = br<100 ? '→ $100 ('+pct(br,5.27,100)+'%)' : '✅ ERREICHT';
-  document.getElementById('g2bar').style.width = pct(br, 100, 1000)+'%';
-  document.getElementById('g2lbl').textContent = br<1000 ? '→ $1.000 ('+pct(br,100,1000)+'%)' : '✅ ERREICHT';
-  document.getElementById('g3bar').style.width = pct(br, 1000, 10000)+'%';
-  document.getElementById('g3lbl').textContent = br<10000 ? '→ $10.000 ('+pct(br,1000,10000)+'%)' : '✅ ERREICHT';
+  // Goal bars — use total portfolio (cash + positions)
+  const tp = portfolio;
+  document.getElementById('g1bar').style.width = pct(tp, 5.27, 100)+'%';
+  document.getElementById('g1lbl').textContent = tp<100 ? '→ $100 ('+pct(tp,5.27,100)+'%)' : '✅ ERREICHT';
+  document.getElementById('g2bar').style.width = pct(tp, 100, 1000)+'%';
+  document.getElementById('g2lbl').textContent = tp<1000 ? '→ $1.000 ('+pct(tp,100,1000)+'%)' : '✅ ERREICHT';
+  document.getElementById('g3bar').style.width = pct(tp, 1000, 10000)+'%';
+  document.getElementById('g3lbl').textContent = tp<10000 ? '→ $10.000 ('+pct(tp,1000,10000)+'%)' : '✅ ERREICHT';
 
   // Equity curve
   drawChart('eqChart', s.equity_curve);

@@ -111,6 +111,7 @@ class TradeOpportunity:
     q: float = 0.0               # Bayesian probability estimate
     gemini_confidence: float = 0.0  # Gemini confidence (0–1); 0 = no data
     end_time: float = 0.0        # Market expiry (Unix); 0 = unknown
+    best_ask: float = 0.0        # Best ask price for the traded token (used for GTC limit orders)
     timestamp: float = field(default_factory=time.time)
 
 
@@ -1621,6 +1622,13 @@ class ArbitrageBot:
             # during sell handles truly illiquid exits.
 
             if kelly_result.is_viable and kelly_result.position_size > 0:
+                # Extract best ask for the side being traded (for competitive GTC limit orders)
+                if edge_result.side == "NO":
+                    _ask_list = no_data.get("asks", [])
+                else:
+                    _ask_list = yes_data.get("asks", [])
+                _best_ask = float(_ask_list[0]["price"]) if _ask_list else 0.0
+
                 opp = TradeOpportunity(
                     market_id=market_id,
                     edge_result=edge_result,
@@ -1630,6 +1638,7 @@ class ArbitrageBot:
                     q=q,
                     gemini_confidence=gemini_conf,
                     end_time=state.end_time,
+                    best_ask=_best_ask,
                 )
                 opportunities.append(opp)
                 if state.is_event:
@@ -1806,7 +1815,13 @@ class ArbitrageBot:
                 else:
                     price = round(opp.stoikov_quote.ask, 6)
             else:
-                price = (1.0 - raw_price) if side == "NO" else raw_price
+                # For event markets: use the actual ask price so the GTC limit order
+                # fills immediately instead of sitting below the ask (never executing).
+                # Fall back to Stoikov reservation price if ask is unavailable.
+                if opp.best_ask > 0 and 0.01 <= opp.best_ask <= 0.99:
+                    price = round(opp.best_ask, 6)
+                else:
+                    price = (1.0 - raw_price) if side == "NO" else raw_price
 
             exec_type = "GTC/MAKER" if is_passive else "FOK/TAKER"
             has_rewards = is_rewarded(market.condition_id)
