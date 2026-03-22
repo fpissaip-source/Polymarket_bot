@@ -181,7 +181,7 @@ class ArbitrageBot:
         self._tier_base_edge = self._current_min_edge
         self._MARKET_REFRESH_INTERVAL = 30
         self._MARKET_WINDOW_MIN = MIN_SECONDS_BEFORE_EXPIRY
-        self._MARKET_WINDOW_MAX = 930  # 15min + 30s buffer
+        self._MARKET_WINDOW_MAX = 330  # 5min + 30s buffer
 
         for m1, m2 in RELATED_MARKETS:
             self.spread_map.register_pair(m1, m2)
@@ -444,7 +444,7 @@ class ArbitrageBot:
                     )
                     continue
 
-                market_id = f"{asset}_15m_{str(condition_id)[:8]}"
+                market_id = f"{asset}_5m_{str(condition_id)[:8]}"
 
                 end_time = 0.0
                 now_ts = time.time()
@@ -472,7 +472,7 @@ class ArbitrageBot:
                 question_text = m.get("question", "")[:60]
                 mins_left = round((end_time - time.time()) / 60, 1) if end_time > 0 else "?"
                 logger.info(
-                    f"[15m] {asset}: registered {market_id} | "
+                    f"[5m] {asset}: registered {market_id} | "
                     f"{mins_left}m left | q='{question_text}'"
                 )
                 self.register_market(
@@ -480,7 +480,7 @@ class ArbitrageBot:
                     token_id_yes=yes_token,
                     token_id_no=no_token,
                     asset=asset,
-                    timeframe="15m",
+                    timeframe="5m",
                     end_time=end_time,
                     gamma_price_yes=gamma_price_yes,
                     gamma_price_no=gamma_price_no,
@@ -1178,7 +1178,7 @@ class ArbitrageBot:
                 condition_id = m.get("conditionId") or m.get("id", "")
                 if not condition_id:
                     continue
-                market_id = f"{asset}_15m_{str(condition_id)[:8]}"
+                market_id = f"{asset}_5m_{str(condition_id)[:8]}"
                 if market_id in self._markets:
                     continue
 
@@ -1224,7 +1224,7 @@ class ArbitrageBot:
                     token_id_yes=yt,
                     token_id_no=nt,
                     asset=asset,
-                    timeframe="15m",
+                    timeframe="5m",
                     end_time=et,
                     gamma_price_yes=gpy,
                     gamma_price_no=gpn,
