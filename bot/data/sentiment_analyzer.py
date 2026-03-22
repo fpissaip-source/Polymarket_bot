@@ -139,20 +139,29 @@ class EventSentimentAnalyzer:
             return None
         try:
             from google.genai import types
-            # Try newer SDK API first (google_search_retrieval)
+            # Preferred: dynamic retrieval (only searches when needed, threshold=0.3)
             tool = types.Tool(
-                google_search_retrieval=types.GoogleSearchRetrieval()
+                google_search_retrieval=types.GoogleSearchRetrieval(
+                    dynamic_retrieval_config=types.DynamicRetrievalConfig(
+                        mode=types.DynamicRetrievalConfig.Mode.MODE_DYNAMIC,
+                        dynamic_threshold=0.3,
+                    )
+                )
             )
+            logger.info("Search tool: GoogleSearchRetrieval with dynamic retrieval")
             return tool
         except (AttributeError, TypeError):
             pass
         try:
             from google.genai import types
-            # Fallback: newer SDK uses google_search
+            # Fallback: always-on search (newer SDK style)
             tool = types.Tool(google_search=types.GoogleSearch())
+            logger.info("Search tool: GoogleSearch (always-on)")
             return tool
         except (AttributeError, TypeError):
-            return None
+            pass
+        logger.warning("Search tool: unavailable (SDK too old or incompatible)")
+        return None
 
     def _analyze(self, market_id: str, question: str, market_price: float,
                  weather_context: str = ""):
