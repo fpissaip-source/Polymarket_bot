@@ -83,9 +83,9 @@ class EventSentimentAnalyzer:
         # Try to set up Google Search Grounding tool
         self._search_tool = self._build_search_tool()
         if self._search_tool:
-            logger.info("EventSentimentAnalyzer initialized (gemini-2.0-flash + Google Search Grounding)")
+            logger.info("EventSentimentAnalyzer initialized (gemini-3-flash + Google Search Grounding)")
         else:
-            logger.info("EventSentimentAnalyzer initialized (gemini-2.0-flash, no search grounding)")
+            logger.info("EventSentimentAnalyzer initialized (gemini-3-flash, no search grounding)")
 
     def _build_search_tool(self):
         """Build the Google Search Grounding tool. Returns None if unavailable."""
@@ -108,15 +108,22 @@ class EventSentimentAnalyzer:
         except (AttributeError, TypeError):
             return None
 
-    def _analyze(self, market_id: str, question: str, market_price: float):
+    def _analyze(self, market_id: str, question: str, market_price: float,
+                 weather_context: str = ""):
         """Call Gemini for an event market. Runs in background thread."""
         try:
             today = date.today().isoformat()
+            weather_block = (
+                f"\nReal-time weather data:\n{weather_context}\n"
+                if weather_context else ""
+            )
             prompt = (
                 f"Today is {today}. You are an expert prediction market analyst.\n\n"
                 f"Market question: {question}\n"
-                f"Current market consensus price: YES = {market_price:.0%}\n\n"
+                f"Current market consensus price: YES = {market_price:.0%}\n"
+                f"{weather_block}\n"
                 f"Your task: estimate the TRUE probability that the answer resolves YES.\n"
+                f"Search Google for the latest news on this topic, then answer.\n"
                 f"Compare your estimate to the market price — divergence = edge.\n\n"
                 f"Respond in EXACTLY this format (4 lines, nothing else):\n"
                 f"PROBABILITY: 0.XX\n"
@@ -125,14 +132,14 @@ class EventSentimentAnalyzer:
                 f"EDGE: BUY_YES / BUY_NO / NO_EDGE\n\n"
                 f"Rules:\n"
                 f"- PROBABILITY: your best estimate that the answer resolves YES (0.00–1.00)\n"
-                f"- CONFIDENCE: how reliable your estimate is (0.10=pure guess, 0.90=well-informed)\n"
-                f"  Set low (0.10–0.20) if the question is about a very recent event you lack data on\n"
+                f"- CONFIDENCE: how reliable your estimate is (0.10=pure guess, 0.90=very informed)\n"
+                f"  Only set ≥0.75 if you found concrete recent data; set low otherwise\n"
                 f"- REASONING: key fact or logic behind your estimate (max 20 words)\n"
                 f"- EDGE: BUY_YES if your prob > market+5%, BUY_NO if < market-5%, else NO_EDGE"
             )
 
             # Build config with Google Search Grounding when available
-            gen_kwargs: dict = {"model": "gemini-2.0-flash", "contents": prompt}
+            gen_kwargs: dict = {"model": "gemini-3-flash", "contents": prompt}
             if self._search_tool is not None:
                 try:
                     from google.genai import types
@@ -198,10 +205,12 @@ class EventSentimentAnalyzer:
             with self._lock:
                 self._running.discard(market_id)
 
-    def analyze_async(self, market_id: str, question: str, market_price: float = 0.5):
+    def analyze_async(self, market_id: str, question: str, market_price: float = 0.5,
+                      weather_context: str = ""):
         """
         Trigger background Gemini analysis for an event market.
         Skips if cache is fresh or already running.
+        weather_context: optional real-time weather data string from WeatherFeed.
         """
         if not self._enabled:
             return
@@ -216,7 +225,7 @@ class EventSentimentAnalyzer:
 
         t = threading.Thread(
             target=self._analyze,
-            args=(market_id, question, market_price),
+            args=(market_id, question, market_price, weather_context),
             daemon=True,
             name=f"gemini-{market_id[:12]}",
         )

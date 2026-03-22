@@ -224,7 +224,7 @@ class WalletTracker:
                     pass
 
             gen_kwargs: dict = {
-                "model": "gemini-2.0-flash",
+                "model": "gemini-3-flash",
                 "contents": prompt,
             }
             if search_tool is not None:

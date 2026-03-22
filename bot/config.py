@@ -48,12 +48,14 @@ SLIPPAGE_ESTIMATE = TAKER_SLIPPAGE
 INCOMPLETE_EXEC_RISK = TAKER_EXEC_RISK
 TOTAL_COST = TOTAL_COST_TAKER
 
-# Event markets (politics, geopolitics, sports) — Gemini-powered
+# Event markets (politics, geopolitics, sports, weather) — Gemini 3 Flash powered
 EVENT_SENTIMENT_MIN_BANKROLL = 1.0     # Active from day 1
-EVENT_MARKET_TAGS = ["politics", "geopolitics", "elections", "sports", "entertainment"]
+EVENT_MARKET_TAGS = ["politics", "geopolitics", "elections", "sports", "entertainment", "weather"]
 EVENT_SENTIMENT_REFRESH = 300          # Refresh every 5 minutes
 EVENT_MARKET_LIMIT = 30               # Max event markets to discover
 EVENT_MARKET_MIN_VOLUME = 1000.0      # Min total volume ($) for market quality
+# Only trade event markets when Gemini's confidence is at or above this threshold
+GEMINI_MIN_CONFIDENCE = float(os.getenv("GEMINI_MIN_CONFIDENCE", "0.75"))
 
 # Spread model
 SPREAD_ZSCORE_THRESHOLD = 2.0  # z-score threshold for arbitrage signal

@@ -37,6 +37,7 @@ from data.price_feed import PriceFeed
 from data.market_data import PolymarketDataClient, GammaClient, extract_clob_tokens, extract_gamma_prices
 from data.wallet_tracker import WalletTracker
 from data.sentiment_analyzer import EventSentimentAnalyzer
+from data.weather_feed import WeatherFeed
 from data.dry_run_tracker import DryRunTracker
 from trading.order_executor import OrderExecutor
 from models.adaptive import AdaptiveLearner
@@ -67,6 +68,7 @@ from config import (
     MAX_TOTAL_EXPOSURE_PCT,
     MAX_POSITION_HOLD_MINUTES,
     POLYMARKET_PROXY_ADDRESS,
+    GEMINI_MIN_CONFIDENCE,
 )
 
 TRADES_FILE = Path(__file__).parent.parent / "trades.json"
@@ -104,7 +106,9 @@ class TradeOpportunity:
     spread_signal: SpreadSignal | None
     stoikov_quote: StoikovQuote
     kelly_result: KellyResult
-    q: float = 0.0      # Bayesian probability estimate
+    q: float = 0.0               # Bayesian probability estimate
+    gemini_confidence: float = 0.0  # Gemini confidence (0–1); 0 = no data
+    end_time: float = 0.0        # Market expiry (Unix); 0 = unknown
     timestamp: float = field(default_factory=time.time)
 
 
@@ -157,6 +161,7 @@ class ArbitrageBot:
         self.wallet_tracker = WalletTracker()
         self._last_wallet_update = 0.0
         self.event_sentiment = EventSentimentAnalyzer()
+        self.weather_feed = WeatherFeed()
         self.adaptive = AdaptiveLearner()
         self.regime = RegimeDetector()
         self.ofi_model = OFIModel()
@@ -1390,23 +1395,38 @@ class ArbitrageBot:
                 q = max(0.01, min(0.99, q + wallet_signal.confidence_boost))
 
             # --- 3c. Gemini probability (PRIMARY signal for event markets) ---
+            gemini_conf = 0.0
             if state.is_event and state.question:
+                # Attach real-time weather data for weather-related markets
+                weather_ctx = self.weather_feed.get_context(state.question)
+                if weather_ctx:
+                    logger.debug(f"[WEATHER:{market_id[:20]}] {weather_ctx[:80]}…")
+
                 # Trigger background Gemini analysis (cached, refreshes every 5min)
                 self.event_sentiment.analyze_async(
                     market_id=market_id,
                     question=state.question,
                     market_price=p_yes,
+                    weather_context=weather_ctx,
                 )
                 gemini_prob = self.event_sentiment.get_probability(market_id)
+                gemini_conf = self.event_sentiment.get_confidence(market_id)
+
                 if gemini_prob is not None:
-                    # Gemini IS the primary probability estimate — overrides Bayesian
-                    # OFI and wallet signal can still fine-tune it below
-                    q = gemini_prob
-                    logger.debug(
-                        f"[GEMINI:{market_id[:20]}] p(YES)={gemini_prob:.3f} "
-                        f"conf={self.event_sentiment.get_confidence(market_id):.2f} "
-                        f"market={p_yes:.3f} → q={q:.3f}"
-                    )
+                    # --- Confidence gate: only trade when Gemini is well-informed ---
+                    if gemini_conf < GEMINI_MIN_CONFIDENCE:
+                        q = p_yes   # treat as no-edge until confidence rises
+                        logger.debug(
+                            f"[GEMINI:{market_id[:20]}] conf={gemini_conf:.2f} "
+                            f"< {GEMINI_MIN_CONFIDENCE} → skipping (not confident enough)"
+                        )
+                    else:
+                        # Gemini IS the primary probability estimate — overrides Bayesian
+                        q = gemini_prob
+                        logger.debug(
+                            f"[GEMINI:{market_id[:20]}] p(YES)={gemini_prob:.3f} "
+                            f"conf={gemini_conf:.2f} ✓ market={p_yes:.3f} → q={q:.3f}"
+                        )
                 else:
                     # No Gemini data yet — use market price so edge=0, skip this tick
                     q = p_yes
@@ -1506,6 +1526,8 @@ class ArbitrageBot:
                     stoikov_quote=stoikov_quote,
                     kelly_result=kelly_result,
                     q=q,
+                    gemini_confidence=gemini_conf,
+                    end_time=state.end_time,
                 )
                 opportunities.append(opp)
                 logger.info(
@@ -1566,12 +1588,42 @@ class ArbitrageBot:
         if opportunities:
             self._execute_opportunities(opportunities)
 
+    @staticmethod
+    def _urgency_bucket(end_time: float) -> int:
+        """
+        Returns a priority bucket based on time-to-expiry.
+        Higher = more urgent. Markets expiring soon trade first.
+          4 → expires within 1 hour
+          3 → expires within 6 hours
+          2 → expires within 24 hours
+          1 → expires within 7 days
+          0 → unknown expiry or far away
+        """
+        if end_time <= 0:
+            return 0
+        remaining = end_time - time.time()
+        if remaining <= 3_600:
+            return 4
+        if remaining <= 21_600:
+            return 3
+        if remaining <= 86_400:
+            return 2
+        if remaining <= 604_800:
+            return 1
+        return 0
+
     def _execute_opportunities(self, opportunities: list[TradeOpportunity]):
         """Execute the best opportunities. Dry-run logs only; live mode places orders."""
-        # Prioritize: rewarded markets first (extra LP income), then by EV
+        # Sort priority (all descending):
+        #   1. Urgency bucket (expiring soonest first)
+        #   2. Rewarded markets (extra LP income)
+        #   3. Gemini confidence (high-confidence signals trade before low-confidence)
+        #   4. EV (highest expected value last tie-breaker)
         opportunities.sort(
             key=lambda o: (
+                self._urgency_bucket(o.end_time),
                 int(is_rewarded(self._markets[o.market_id].condition_id)),
+                o.gemini_confidence,
                 o.edge_result.ev_net,
             ),
             reverse=True,
