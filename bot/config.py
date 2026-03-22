@@ -1,7 +1,11 @@
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+# Search for .env in bot/ dir first, then project root
+_bot_dir = Path(__file__).parent
+load_dotenv(_bot_dir / ".env")               # bot/.env
+load_dotenv(_bot_dir.parent / ".env")        # project root .env
 
 # Polymarket API
 POLYMARKET_HOST = os.getenv("POLYMARKET_HOST", "https://clob.polymarket.com")
