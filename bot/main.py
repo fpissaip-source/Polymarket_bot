@@ -26,12 +26,25 @@ Environment variables (.env):
 
 import argparse
 import logging
+import threading
 from utils.logger import setup_logger
 from trading.bot import ArbitrageBot
 from models.monte_carlo import MonteCarloSimulator
 from config import MIN_EDGE
 
 logger = setup_logger()
+
+
+def start_dashboard():
+    """Start the dashboard HTTP server in a background daemon thread."""
+    try:
+        from dashboard.server import DashboardHandler, PORT
+        from http.server import HTTPServer
+        server = HTTPServer(("0.0.0.0", PORT), DashboardHandler)
+        logger.info(f"Dashboard gestartet auf http://0.0.0.0:{PORT}")
+        server.serve_forever()
+    except Exception as e:
+        logger.warning(f"Dashboard konnte nicht gestartet werden: {e}")
 
 
 def run_validation_only():
@@ -67,6 +80,10 @@ def main():
     if args.validate:
         run_validation_only()
         return
+
+    # Start dashboard in background thread
+    t = threading.Thread(target=start_dashboard, daemon=True)
+    t.start()
 
     dry_run = not args.live  # dry-run is default, --live enables real orders
     logger.info("Initializing Polymarket Arbitrage Bot...")
