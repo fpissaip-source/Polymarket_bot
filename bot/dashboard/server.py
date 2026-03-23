@@ -27,7 +27,7 @@ POSITIONS_FILE = BOT_ROOT / "live_positions.json"
 GEMINI_FILE  = BOT_ROOT / "gemini_decisions.json"
 REGIME_FILE  = BOT_ROOT / "regime_state.json"
 
-PORT = 80
+PORT = 5002
 
 # ---------------------------------------------------------------------------
 # Live CLOB balance cache (updated every 30s in background thread)
