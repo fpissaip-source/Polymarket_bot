@@ -27,6 +27,7 @@ Environment variables (.env):
 import argparse
 import logging
 import threading
+import time
 from utils.logger import setup_logger
 from trading.bot import ArbitrageBot
 from models.monte_carlo import MonteCarloSimulator
@@ -34,17 +35,28 @@ from config import MIN_EDGE
 
 logger = setup_logger()
 
+_dashboard_server = None
+_dashboard_lock = threading.Lock()
+
 
 def start_dashboard():
-    """Start the dashboard HTTP server in a background daemon thread."""
-    try:
-        from dashboard.server import DashboardHandler, PORT
-        from http.server import HTTPServer
-        server = HTTPServer(("0.0.0.0", PORT), DashboardHandler)
-        logger.info(f"Dashboard gestartet auf http://0.0.0.0:{PORT}")
-        server.serve_forever()
-    except Exception as e:
-        logger.warning(f"Dashboard konnte nicht gestartet werden: {e}")
+    """Start the dashboard HTTP server in a background thread with auto-restart."""
+    global _dashboard_server
+    while True:
+        try:
+            from dashboard.server import DashboardHandler, PORT
+            from http.server import HTTPServer
+            server = HTTPServer(("0.0.0.0", PORT), DashboardHandler)
+            with _dashboard_lock:
+                _dashboard_server = server
+            logger.info(f"Dashboard gestartet auf http://0.0.0.0:{PORT}")
+            server.serve_forever()
+        except OSError as e:
+            logger.warning(f"Dashboard Port belegt, retry in 10s: {e}")
+            time.sleep(10)
+        except Exception as e:
+            logger.warning(f"Dashboard Fehler, retry in 5s: {e}")
+            time.sleep(5)
 
 
 def run_validation_only():
@@ -89,20 +101,36 @@ def main():
     logger.info("Initializing Polymarket Arbitrage Bot...")
     logger.info(f"Mode: {'DRY RUN' if dry_run else '*** LIVE TRADING ***'}")
 
-    bot = ArbitrageBot(dry_run=dry_run)
+    BOT_RESTART_DELAY = 30  # seconds between crash restarts
 
-    # Auto-discover active crypto markets on Polymarket
-    logger.info("Auto-discovering active markets...")
-    count = bot.auto_discover_markets()
+    while True:
+        try:
+            bot = ArbitrageBot(dry_run=dry_run)
 
-    if count == 0:
-        logger.warning(
-            "No markets found via auto-discovery. "
-            "Bot will start anyway and retry market discovery automatically."
-        )
-    else:
-        logger.info(f"Starting bot with {count} markets...")
-    bot.run()
+            # Auto-discover active crypto markets on Polymarket
+            logger.info("Auto-discovering active markets...")
+            count = bot.auto_discover_markets()
+
+            if count == 0:
+                logger.warning(
+                    "No markets found via auto-discovery. "
+                    "Bot will start anyway and retry market discovery automatically."
+                )
+            else:
+                logger.info(f"Starting bot with {count} markets...")
+            bot.run()
+            # bot.run() only returns on clean shutdown (KeyboardInterrupt)
+            logger.info("Bot stopped cleanly.")
+            break
+        except KeyboardInterrupt:
+            logger.info("Shutting down...")
+            break
+        except Exception as e:
+            logger.error(
+                f"Bot crashed: {e} — restarting in {BOT_RESTART_DELAY}s...",
+                exc_info=True,
+            )
+            time.sleep(BOT_RESTART_DELAY)
 
 
 if __name__ == "__main__":
