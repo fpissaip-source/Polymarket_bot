@@ -210,8 +210,8 @@ a{color:#58a6ff}
 ::-webkit-scrollbar-track{background:transparent}
 
 /* ══ HEADER ═════════════════════════════════════════════════════════════ */
-.hdr{background:rgba(8,10,18,0.96);backdrop-filter:blur(12px);
-  border-bottom:1px solid rgba(88,166,255,0.12);
+.hdr{background:#08090f;
+  border-bottom:1px solid rgba(88,166,255,0.18);
   padding:11px 16px;display:flex;align-items:center;justify-content:space-between;
   position:sticky;top:0;z-index:100}
 .hdr-left{display:flex;align-items:center;gap:10px}
@@ -227,8 +227,8 @@ a{color:#58a6ff}
 @keyframes livepulse{0%,100%{opacity:1;box-shadow:0 0 8px #3fb950}50%{opacity:.4;box-shadow:0 0 3px #3fb950}}
 
 /* ══ TABS ════════════════════════════════════════════════════════════════ */
-.tabs{display:flex;background:rgba(8,10,18,0.9);
-  border-bottom:1px solid rgba(88,166,255,0.08);
+.tabs{display:flex;background:#08090f;
+  border-bottom:1px solid rgba(88,166,255,0.12);
   overflow-x:auto;scrollbar-width:none;position:sticky;top:40px;z-index:99}
 .tabs::-webkit-scrollbar{display:none}
 .tab{padding:10px 16px;font-size:12px;color:#6e7681;cursor:pointer;
