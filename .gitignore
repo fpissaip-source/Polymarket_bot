@@ -49,6 +49,10 @@ Thumbs.db
 .local/
 __pycache__/
 
+# Runtime logs
+nohup.out
+*.log
+
 # Environment variables (contains private keys - NEVER commit!)
 .env
 *.env
