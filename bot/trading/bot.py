@@ -56,6 +56,7 @@ from config import (
     BANKROLL_STATE_FILE,
     TP_RATIO,
     SL_RATIO,
+    SL_RATIO_CATASTROPHIC,
     TP_RATIO_5MIN,
     SL_RATIO_5MIN,
     TP_RATIO_LOW,
@@ -990,13 +991,19 @@ class ArbitrageBot:
                     reason = f"PRE_EXPIRY({time_to_expiry:.0f}s left)"
 
             else:
-                # Phase 1: GROWTH — take profit at +30% if spread is OK
+                # Phase 1: GROWTH — take profit at +30% or stop-loss at -35%
                 if can_tp and _spread_ok():
                     reason = f"TAKE_PROFIT({pnl_ratio:+.1%})"
+                elif SL_RATIO > 0 and pnl_ratio <= -SL_RATIO:
+                    reason = f"STOP_LOSS({pnl_ratio:+.1%})"
 
             # Hard limits regardless of phase
             if not reason and hold_minutes >= MAX_POSITION_HOLD_MINUTES:
                 reason = f"MAX_HOLD({hold_minutes:.1f}min >= {MAX_POSITION_HOLD_MINUTES:.0f}min limit)"
+
+            # Catastrophic stop-loss — triggers in any phase to prevent total ruin
+            if not reason and SL_RATIO_CATASTROPHIC > 0 and pnl_ratio <= -SL_RATIO_CATASTROPHIC:
+                reason = f"CATASTROPHIC_SL({pnl_ratio:+.1%})"
 
             if reason:
                 logger.info(
