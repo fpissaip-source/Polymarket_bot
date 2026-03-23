@@ -151,10 +151,14 @@ class OrderExecutor:
             signature_type=sig_type,
             funder=proxy if proxy else None,
         )
+        _signer_addr = self.client.get_address() if hasattr(self.client, "get_address") else (
+            self.client.builder.signer.address() if hasattr(self.client, "builder") else "unknown"
+        )
+        _funder = self.client.builder.funder if hasattr(self.client, "builder") else proxy
         logger.info(
             f"OrderExecutor initialized (sig_type={sig_type}, "
-            f"signer={self.client.builder.signer.address()}, "
-            f"funder={self.client.builder.funder})"
+            f"signer={_signer_addr}, "
+            f"funder={_funder})"
         )
         self._tick_cache: dict[str, str] = {}
         self._neg_risk_cache: dict[str, bool] = {}
