@@ -98,11 +98,11 @@ def main():
     if count == 0:
         logger.warning(
             "No markets found via auto-discovery. "
-            "Markets may have different naming - check Polymarket manually."
+            "Bot will start anyway and retry market discovery automatically."
         )
     else:
         logger.info(f"Starting bot with {count} markets...")
-        bot.run()
+    bot.run()
 
 
 if __name__ == "__main__":

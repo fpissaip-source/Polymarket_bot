@@ -218,6 +218,8 @@ class ArbitrageBot:
         self._last_adaptive_update = 0.0
         self._last_tp_sl_check = 0.0
         self._last_allowance_refresh = 0.0
+        self._last_eth_refresh = 0.0
+        self._ETH_REFRESH_INTERVAL = 300  # refresh ETH 15m market every 5 min
         self._tick_count = 0
         # _live_positions already initialized and loaded earlier in __init__
         self.dry_run_tracker = DryRunTracker(virtual_bankroll=starting_bankroll)
