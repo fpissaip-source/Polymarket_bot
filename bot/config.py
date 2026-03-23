@@ -167,8 +167,8 @@ BANKROLL_STATE_FILE = "bankroll_state.json"
 # early stop-loss causes unnecessary losses and fees before resolution.
 # TP is only triggered when enough time remains to recycle capital.
 TP_RATIO = 0.30               # Take profit at +30% (when >2h left or market near resolved)
-SL_RATIO = 0.35               # Stop-loss at -35% loss (GROWTH phase only)
-SL_RATIO_CATASTROPHIC = 0.65  # Emergency SL at -65% loss regardless of phase
+SL_RATIO = 0.15               # Stop-loss at -15% loss (GROWTH phase) — 1 win covers 2 losses (TP=2×SL)
+SL_RATIO_CATASTROPHIC = 0.45  # Emergency SL at -45% loss regardless of phase (3×SL)
 
 # Minimum time remaining before a TP exit is allowed (seconds).
 # With <2h left, just hold to resolution — exiting costs fees without benefit.
