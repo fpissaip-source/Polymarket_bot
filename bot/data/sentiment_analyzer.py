@@ -211,14 +211,14 @@ class EventSentimentAnalyzer:
                 f"EDGE: BUY_YES / BUY_NO / NO_EDGE\n\n"
                 f"Scoring rules:\n"
                 f"- PROBABILITY: true probability that the question resolves YES (0.00–1.00)\n"
-                f"- CONFIDENCE: how certain you are (0.10=no reliable data found, "
-                f"0.90=multiple independent verified sources agree)\n"
-                f"  • ≥0.75 only if: ≥2 independent credible sources confirm the key fact\n"
-                f"  • 0.50–0.74: some evidence but conflicting signals or limited data\n"
-                f"  • <0.50: speculation, fast-moving situation, or no recent data found\n"
+                f"- CONFIDENCE: how certain you are (0.10=no data, 0.90=overwhelming consensus)\n"
+                f"  • ≥0.80: ≥2 independent credible sources clearly agree on the outcome\n"
+                f"  • 0.65–0.79: ≥1 strong credible source (official, major news) clearly supports\n"
+                f"  • 0.50–0.64: mixed signals or only soft evidence (social media, speculation)\n"
+                f"  • <0.50: no meaningful data found, fast-moving with no consensus\n"
                 f"- REASONING: include the key fact + source type (e.g. 'Reuters reports…', "
                 f"'Official govt. data shows…', 'Reddit/X consensus is…')\n"
-                f"- EDGE: BUY_YES if prob > market+5%, BUY_NO if prob < market-5%, else NO_EDGE"
+                f"- EDGE: BUY_YES if prob > market+3%, BUY_NO if prob < market-3%, else NO_EDGE"
             )
 
             # Build config with Google Search Grounding when available

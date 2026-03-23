@@ -102,7 +102,7 @@ SPORTS_EXCLUDE_KEYWORDS = [
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 # Only trade event markets when Gemini's confidence is at or above this threshold
-GEMINI_MIN_CONFIDENCE = float(os.getenv("GEMINI_MIN_CONFIDENCE", "0.75"))
+GEMINI_MIN_CONFIDENCE = float(os.getenv("GEMINI_MIN_CONFIDENCE", "0.60"))
 
 # Spread model
 SPREAD_ZSCORE_THRESHOLD = 2.0  # z-score threshold for arbitrage signal
