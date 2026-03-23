@@ -482,9 +482,24 @@ class ArbitrageBot:
             condition_id = (m.get("conditionId") or m.get("condition_id") or
                             m.get("id") or "unknown")
 
-            # Volume quality filter
+            # Volume quality filter — relaxed for near-term markets (≤14 days)
+            # A market expiring in 3 days with $100 volume is still worth trading.
             volume = float(m.get("volume", m.get("volumeNum", 0)) or 0)
-            if volume < EVENT_MARKET_MIN_VOLUME:
+            min_vol = EVENT_MARKET_MIN_VOLUME
+            for _key in ("endDate", "end_date_iso", "closeTime", "close_time",
+                         "expirationTime", "expiration"):
+                _v = m.get(_key)
+                if _v:
+                    try:
+                        _ts = datetime.datetime.fromisoformat(
+                            str(_v).replace("Z", "+00:00")
+                        ).timestamp()
+                        if _ts - time.time() <= 14 * 86400:
+                            min_vol = 100.0  # near-term: accept lower volume
+                        break
+                    except Exception:
+                        pass
+            if volume < min_vol:
                 continue
 
             yes_token, no_token = extract_clob_tokens(m)

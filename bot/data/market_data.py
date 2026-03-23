@@ -467,6 +467,7 @@ class GammaClient:
         tag: str = "",
         keyword: str = "",
         order: str = "",
+        ascending: str = "",
     ) -> list[dict]:
         """
         Fetch events from Gamma. Each event contains a 'markets' list.
@@ -484,6 +485,8 @@ class GammaClient:
             params["keyword"] = keyword
         if order:
             params["order"] = order
+        if ascending:
+            params["ascending"] = ascending
 
         data = _get_with_retry(self._session, f"{self.host}/events", params=params)
         if isinstance(data, list):
@@ -678,15 +681,38 @@ class GammaClient:
             matched.append(m)
             return None
 
-        # Strategy 1: Fetch via Events endpoint (events contain nested markets)
-        # Try without order param first (API default), then with ordering hints
+        import datetime as _dt
+
+        def _parse_end_ts(m: dict) -> float:
+            """Extract end timestamp from a market dict for sorting. Returns inf if unknown."""
+            for key in ("endDate", "end_date_iso", "closeTime", "close_time",
+                        "expirationTime", "expiration"):
+                v = m.get(key)
+                if v:
+                    try:
+                        return _dt.datetime.fromisoformat(
+                            str(v).replace("Z", "+00:00")
+                        ).timestamp()
+                    except Exception:
+                        pass
+            return float("inf")
+
+        # Strategy 1: Fetch via Events endpoint (events contain nested markets).
+        # Sweep 1a: soonest-expiring first (hours → days → weeks → months)
+        # Sweep 1b: default API order (volume/popularity) — catches long-term high-volume markets
         total_events = 0
         skip_counts: dict[str, int] = {}
         markets_in_events = 0
 
-        for order in ("", "volume", "liquidity"):
+        for order, ascending in (
+            ("endDate", "true"),   # soonest-expiry first — March/near-term markets
+            ("", ""),              # API default (volume/popularity)
+            ("volume", ""),        # explicit volume sort as fallback
+        ):
             try:
-                events = self.get_events(active=True, limit=limit, order=order)
+                events = self.get_events(
+                    active=True, limit=limit, order=order, ascending=ascending
+                )
             except Exception as e:
                 logger.warning(f"Gamma events fetch failed (order={order!r}): {e}")
                 continue
@@ -736,6 +762,11 @@ class GammaClient:
                 f"Gamma direct /markets: {direct_total} markets "
                 f"→ {len(matched)} passed | skipped: {direct_skip}"
             )
+
+        # Final sort: soonest-expiring markets first (hours → days → weeks → months).
+        # This ensures near-term March markets are processed before June/later markets,
+        # regardless of the API's own ordering.
+        matched.sort(key=_parse_end_ts)
 
         logger.info(
             f"Gamma: discovered {len(matched)} event markets "
