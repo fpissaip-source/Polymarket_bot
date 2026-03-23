@@ -241,8 +241,9 @@ class OrderExecutor:
         return ApiCreds(api_key="", api_secret="", api_passphrase="")
 
     def _check_balance_and_allowance(self):
-        funder = getattr(self.client.builder, "funder", "?")
-        sig = getattr(self.client.builder, "sig_type", "?")
+        _builder = getattr(self.client, "builder", None)
+        funder = getattr(_builder, "funder", "?") if _builder else "?"
+        sig = getattr(_builder, "sig_type", "?") if _builder else "?"
         logger.info(f"[ALLOWANCE] Approving exchange contracts for funder={funder} sig_type={sig}")
 
         # Approve USDC.e (collateral) → Exchange contract (required for BUY orders)
@@ -367,7 +368,7 @@ class OrderExecutor:
 
         logger.info(
             f"[{order_type}] Placing: {clob_side} {round(shares,2)} shares @ {rounded_price} "
-            f"| tick={tick_size} neg_risk={neg_risk} | maker={self.client.builder.funder}"
+            f"| tick={tick_size} neg_risk={neg_risk} | maker={getattr(getattr(self.client, 'builder', None), 'funder', '?')}"
         )
 
         try:
@@ -534,7 +535,7 @@ class OrderExecutor:
             options = PartialCreateOrderOptions(tick_size=real_tick, neg_risk=real_neg)
             logger.info(
                 f"[CLOSE] SELL {rounded_shares} shares @ {rounded_price} (worst-price) "
-                f"| tick={real_tick} neg_risk={real_neg} | maker={self.client.builder.funder}"
+                f"| tick={real_tick} neg_risk={real_neg} | maker={getattr(getattr(self.client, 'builder', None), 'funder', '?')}"
             )
 
             market_args = MarketOrderArgs(
