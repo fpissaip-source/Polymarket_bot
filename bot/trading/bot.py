@@ -32,6 +32,11 @@ from models.monte_carlo import MonteCarloSimulator
 from models.regime import RegimeDetector
 from models.ofi import OFIModel
 from models.gas_optimizer import GasOptimizer
+from models.alpha_cluster import AlphaClusterDetector
+from models.ai_gate import AIGate
+from models.sharpe_tracker import SharpeTracker
+from agents.portfolio_manager import PortfolioManager, TradeProposal
+from execution.stealth import StealthExecutor
 
 from data.price_feed import PriceFeed
 from data.market_data import PolymarketDataClient, GammaClient, DataApiClient, extract_clob_tokens, extract_gamma_prices
@@ -72,6 +77,7 @@ from config import (
     MAX_POSITION_HOLD_MINUTES,
     POLYMARKET_PROXY_ADDRESS,
     GEMINI_MIN_CONFIDENCE,
+    AI_GATE_CONFIDENCE_THRESHOLD,
 )
 
 TRADES_FILE = Path(__file__).parent.parent / "trades.json"
@@ -208,6 +214,17 @@ class ArbitrageBot:
         self.regime = RegimeDetector()
         self.ofi_model = OFIModel()
         self.gas_optimizer = GasOptimizer()
+
+        # ── New modules from document architecture ──
+        self.alpha_cluster = AlphaClusterDetector()
+        self.ai_gate = AIGate(confidence_threshold=AI_GATE_CONFIDENCE_THRESHOLD)
+        self.sharpe_tracker = SharpeTracker(initial_capital=starting_bankroll)
+        self.portfolio_manager = PortfolioManager()
+        self.stealth_executor = StealthExecutor()
+        logger.info(
+            f"[INIT] Multi-agent architecture: AI Gate (threshold={AI_GATE_CONFIDENCE_THRESHOLD}), "
+            f"Alpha Clusters, Sharpe Tracker, Portfolio Manager, Stealth Executor"
+        )
 
         self._markets: dict[str, MarketState] = {}
         self._running = False
@@ -1152,6 +1169,14 @@ class ArbitrageBot:
                     to_remove.append(order_id)
                     self.kelly.release(entry_size)
                     self._save_bankroll()
+                    # Track PnL in Sharpe tracker for live trades
+                    realized_value = sold_shares * current_price
+                    realized_pnl = realized_value - entry_size
+                    self.sharpe_tracker.record_trade(realized_pnl)
+                    logger.info(
+                        f"[SHARPE] Recorded live PnL: ${realized_pnl:+.4f} | "
+                        f"{self.sharpe_tracker.summary()}"
+                    )
                 else:
                     fraction_sold = sold_shares / actual_shares if actual_shares > 0 else 1.0
                     partial_usdc = entry_size * fraction_sold
@@ -1223,12 +1248,35 @@ class ArbitrageBot:
                 if winning_side:
                     self.dry_run_tracker.resolve(mid, winning_side)
                     self.kelly.bankroll = self.dry_run_tracker.virtual_bankroll
+
+                    # Track PnL in Sharpe tracker & Alpha Clusters
+                    resolved_entries = self.dry_run_tracker.get_resolved_entries(last_n=1)
+                    if resolved_entries:
+                        last_entry = resolved_entries[-1]
+                        self.sharpe_tracker.record_trade(last_entry.pnl)
+                        category = "event" if state.is_event else state.asset.lower()
+                        cluster_id = self.alpha_cluster.classify(
+                            category=category,
+                            timeframe=state.timeframe,
+                            price=state.last_price,
+                        )
+                        self.alpha_cluster.record_trade(
+                            cluster_id=cluster_id,
+                            pnl=last_entry.pnl,
+                            won=(last_entry.outcome == "WIN"),
+                        )
+
             logger.debug(f"Removing expired market: {mid}")
             del self._markets[mid]
 
         if self.dry_run and now - self._last_stats_log >= 120:
             self._last_stats_log = now
             self.dry_run_tracker.log_stats()
+            # Log alpha cluster and Sharpe stats
+            cluster_summary = self.alpha_cluster.summary()
+            if cluster_summary:
+                logger.info(f"[ALPHA_CLUSTERS] {cluster_summary}")
+            logger.info(f"[SHARPE] {self.sharpe_tracker.summary()}")
 
         if self.dry_run and now - self._last_adaptive_update >= 180:
             self._last_adaptive_update = now
@@ -1335,6 +1383,16 @@ class ArbitrageBot:
 
         logger.info(f"Starting bot main loop (mode: {'DRY RUN' if self.dry_run else 'LIVE'})...")
         logger.info(f"GROWTH GOAL: ${self.kelly.bankroll:.2f} → $100 → $1,000 → $10,000")
+        logger.info(
+            f"[ARCHITECTURE] Multi-Agent Trading System v2.0\n"
+            f"  ├─ AI Gate (KI-Gatter): confidence threshold={self.ai_gate.confidence_threshold}\n"
+            f"  ├─ Alpha Clusters: {len(self.alpha_cluster.get_all_clusters())} clusters loaded\n"
+            f"  ├─ Risk-Constrained Kelly: drawdown protection active\n"
+            f"  ├─ Sharpe Tracker: {self.sharpe_tracker.summary()}\n"
+            f"  ├─ Portfolio Manager: multi-agent consensus\n"
+            f"  ├─ Stealth Executor: size noise, TWAP, pattern masking\n"
+            f"  └─ Target: Sharpe Ratio > 2.0"
+        )
         self._running = True
 
         while self._running:
@@ -1587,6 +1645,49 @@ class ArbitrageBot:
                 state.last_price_no = p_no
                 continue
 
+            # --- 4b. Alpha Cluster evaluation ---
+            category = "event" if state.is_event else state.asset.lower()
+            cluster_id = self.alpha_cluster.classify(
+                category=category,
+                timeframe=state.timeframe,
+                price=p_yes,
+            )
+            cluster_decision = self.alpha_cluster.evaluate_cluster(cluster_id)
+            if not cluster_decision.is_tradeable:
+                logger.info(
+                    f"[ALPHA_CLUSTER] {market_id} blocked by cluster {cluster_id}: "
+                    f"{cluster_decision.reason}"
+                )
+                state.last_price = p_yes
+                state.last_price_no = p_no
+                continue
+
+            # --- 4c. AI Gate (KI-Gatter) — multi-layer confidence filter ---
+            regime_mult = self.regime.get_multiplier(state.asset)
+            gemini_prob_for_gate = self.event_sentiment.get_probability(market_id) if state.is_event else None
+            gate_decision = self.ai_gate.evaluate(
+                q_model=q,
+                q_gemini=gemini_prob_for_gate,
+                gemini_confidence=gemini_conf,
+                market_price=p_yes,
+                cluster_alpha=cluster_decision.alpha_score,
+                regime_multiplier=regime_mult,
+                edge_ev=edge_result.ev_net,
+            )
+            if not gate_decision.approved:
+                logger.debug(
+                    f"[AI_GATE] {market_id} blocked: {gate_decision.reasoning} | "
+                    f"failed={gate_decision.filters_failed}"
+                )
+                if state.is_event and gemini_conf > 0:
+                    self._log_gemini_decision(
+                        state, q, p_yes, gemini_conf, edge_result.ev_net,
+                        "GATE_BLOCKED", gemini_reasoning,
+                    )
+                state.last_price = p_yes
+                state.last_price_no = p_no
+                continue
+
             # --- 5. Spread check (cross-market) ---
             spread_signal = None
             for m1_id, m2_id in self.spread_map.all_pairs():
@@ -1609,7 +1710,7 @@ class ArbitrageBot:
                 remaining_time=remaining_time,
             )
 
-            # --- 7. Kelly position sizing + Regime multiplier ---
+            # --- 7. Kelly position sizing — Risk-Constrained with all multipliers ---
             is_passive = edge_result.is_passive
             exec_prob = 0.9 if is_passive else 0.7
             if edge_result.side == "NO":
@@ -1618,26 +1719,24 @@ class ArbitrageBot:
             else:
                 kelly_p = q
                 kelly_market = p_yes
+
+            # Drawdown protection from Sharpe tracker
+            _, dd_multiplier = self.sharpe_tracker.should_reduce_risk()
+
             kelly_result = self.kelly.compute(
                 p_success=kelly_p,
                 market_price=kelly_market,
                 exec_probability=exec_prob,
                 ob_depth_factor=ob_depth,
+                drawdown_multiplier=dd_multiplier,
+                cluster_multiplier=cluster_decision.kelly_multiplier,
+                gate_multiplier=gate_decision.position_multiplier,
             )
 
-            # Apply regime Kelly multiplier (1.0 / 0.75 / 0.50)
-            regime_mult = self.regime.get_multiplier(state.asset)
-            if regime_mult < 1.0:
-                original_size = kelly_result.position_size
-                kelly_result = dc_replace(
-                    kelly_result,
-                    position_size=kelly_result.position_size * regime_mult,
-                )
-                logger.debug(
-                    f"[REGIME:{state.asset}] "
-                    f"{self.regime.get_state(state.asset).regime} "
-                    f"→ size ${original_size:.3f} × {regime_mult:.2f} "
-                    f"= ${kelly_result.position_size:.3f}"
+            if kelly_result.drawdown_adjusted:
+                logger.info(
+                    f"[RISK_KELLY] {market_id}: drawdown protection active "
+                    f"(dd_mult={dd_multiplier:.2f}) → size=${kelly_result.position_size:.2f}"
                 )
 
             # Enforce Polymarket minimum order size ($1.00)
@@ -1647,11 +1746,48 @@ class ArbitrageBot:
                         kelly_result, position_size=MIN_BET_SIZE
                     )
                     logger.debug(f"[MIN_BET] size clamped to ${MIN_BET_SIZE:.2f}")
-            # Liquidity pre-check disabled: CLOB bids are often empty for these
-            # short-term markets even when the AMM has liquidity. Dead market guard
-            # during sell handles truly illiquid exits.
 
             if kelly_result.is_viable and kelly_result.position_size > 0:
+                # --- 7b. Portfolio Manager — final approval ---
+                sharpe_snap = self.sharpe_tracker.get_snapshot()
+                proposal = TradeProposal(
+                    market_id=market_id,
+                    side=edge_result.side,
+                    proposed_size=kelly_result.position_size,
+                    entry_price=p_yes if edge_result.side == "YES" else (p_no or 1.0 - p_yes),
+                    edge_ev=edge_result.ev_net,
+                    q_estimate=q,
+                    market_price=p_yes,
+                    gemini_probability=gemini_prob_for_gate,
+                    gemini_confidence=gemini_conf,
+                    gate_confidence=gate_decision.confidence,
+                    gate_approved=gate_decision.approved,
+                    cluster_alpha=cluster_decision.alpha_score,
+                    cluster_tradeable=cluster_decision.is_tradeable,
+                    regime_multiplier=regime_mult,
+                    drawdown_multiplier=dd_multiplier,
+                    sharpe_current=sharpe_snap.sharpe_ratio,
+                    current_exposure_pct=self.kelly.utilization,
+                    open_positions=len(self._live_positions),
+                    max_positions=MAX_OPEN_TRADES,
+                    bankroll=self.kelly.bankroll,
+                    end_time=state.end_time,
+                )
+                pm_decision = self.portfolio_manager.decide(proposal)
+
+                if not pm_decision.approved:
+                    logger.info(
+                        f"[PORTFOLIO] {market_id} rejected: {pm_decision.reasoning}"
+                    )
+                    state.last_price = p_yes
+                    state.last_price_no = p_no
+                    continue
+
+                # Apply Portfolio Manager's adjusted size
+                kelly_result = dc_replace(
+                    kelly_result, position_size=pm_decision.final_size
+                )
+
                 # Extract best ask for the side being traded (for competitive GTC limit orders)
                 if edge_result.side == "NO":
                     _ask_list = no_data.get("asks", [])
@@ -1682,6 +1818,9 @@ class ArbitrageBot:
                     f"q={q:.3f}, p={p_yes:.3f}, "
                     f"size=${kelly_result.position_size:.2f}, "
                     f"bankroll=${self.kelly.bankroll:.2f}, "
+                    f"gate_conf={gate_decision.confidence:.2f}, "
+                    f"cluster={cluster_id}({cluster_decision.alpha_score:.2f}), "
+                    f"sharpe={sharpe_snap.sharpe_ratio:.2f}, "
                     f"exec={'AGGRESSIVE' if stoikov_quote.is_aggressive else 'PASSIVE'}"
                 )
 
@@ -1718,11 +1857,25 @@ class ArbitrageBot:
             if _priority_log:
                 logger.info(f"[PRIORITY] Soonest markets: {' > '.join(_priority_log)} | Gemini slots: {_gemini_analyzed}/{_max_gemini_slots}")
 
+            # Performance & gate stats for heartbeat
+            sharpe_info = self.sharpe_tracker.summary()
+            gate_stats = self.ai_gate.get_stats()
+            pm_stats = self.portfolio_manager.get_stats()
+
             logger.info(
                 f"[HEARTBEAT] tick={self._tick_count} | markets={len(self._markets)} "
                 f"({no_data} no data, {len(active)} active) | "
                 f"bankroll=${self.kelly.bankroll:.2f}{adaptive_info} | "
                 f"{self.event_sentiment.summary()}"
+            )
+            logger.info(
+                f"[PERFORMANCE] {sharpe_info}"
+            )
+            logger.info(
+                f"[AGENTS] Gate: {gate_stats['approved']}/{gate_stats['total_evaluated']} approved "
+                f"({gate_stats['approval_rate']:.0%}) | "
+                f"PM: {pm_stats['approved']}/{pm_stats['total_proposals']} approved "
+                f"({pm_stats['approval_rate']:.0%})"
             )
             if regime_info:
                 logger.info(f"[HEARTBEAT] Regimes: {regime_info}")
@@ -2036,10 +2189,26 @@ class ArbitrageBot:
                 except Exception:
                     pass
 
-            logger.info(
-                f"[LIVE] Placing order: {opp.market_id} BUY {side} ${size:.2f} @ {price:.4f} "
-                f"({exec_type}) tick={market.tick_size} neg_risk={market.neg_risk}"
+            # Stealth execution: apply size noise to avoid round-lot detection
+            stealth_slices = self.stealth_executor.plan_execution(
+                total_size=size,
+                base_price=price,
+                urgency=self.stealth_executor.compute_execution_urgency(
+                    edge_size=opp.edge_result.ev_net,
+                    time_remaining=(market.end_time - time.time()) if market.end_time > 0 else 3600,
+                    book_depth=ob_depth if 'ob_depth' in dir() else 0.5,
+                ),
+                tick_size=float(market.tick_size),
             )
+            # Use first slice for the order (multi-slice TWAP deferred to future)
+            stealth_size = stealth_slices[0].slice_size if stealth_slices else size
+
+            logger.info(
+                f"[LIVE] Placing order: {opp.market_id} BUY {side} ${stealth_size:.2f} @ {price:.4f} "
+                f"({exec_type}) tick={market.tick_size} neg_risk={market.neg_risk} "
+                f"stealth_noise={stealth_slices[0].size_noise:+.1%}" if stealth_slices else ""
+            )
+            size = stealth_size  # use stealth-adjusted size
             if is_passive:
                 order_id = self.executor.place_limit_order(
                     token_id, "BUY", price, size,

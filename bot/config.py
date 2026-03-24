@@ -198,6 +198,24 @@ MC_MAX_DD_LIMIT = 0.30        # Stop if max drawdown exceeds 30%
 # Example: COPY_TRADE_WALLETS=0xabc...123,0xdef...456
 COPY_TRADE_WALLETS = os.getenv("COPY_TRADE_WALLETS", "")  # read by wallet_tracker.py
 
+# AI Gate (KI-Gatter) — confidence threshold filter
+AI_GATE_CONFIDENCE_THRESHOLD = float(os.getenv("AI_GATE_CONFIDENCE_THRESHOLD", "0.62"))
+AI_GATE_MIN_DIVERGENCE = float(os.getenv("AI_GATE_MIN_DIVERGENCE", "0.03"))  # 3% min divergence
+
+# Alpha Cluster — minimum trades before trusting cluster statistics
+ALPHA_CLUSTER_MIN_TRADES = int(os.getenv("ALPHA_CLUSTER_MIN_TRADES", "8"))
+
+# Sharpe Ratio — performance tracking & risk-constrained Kelly
+SHARPE_DRAWDOWN_HALT = float(os.getenv("SHARPE_DRAWDOWN_HALT", "0.35"))  # halt at 35% drawdown
+
+# Stealth Execution — order slicing threshold
+STEALTH_MIN_SLICE_SIZE = float(os.getenv("STEALTH_MIN_SLICE_SIZE", "3.00"))
+STEALTH_SIZE_NOISE_PCT = float(os.getenv("STEALTH_SIZE_NOISE_PCT", "0.08"))
+
+# Portfolio Manager — risk limits
+PM_MAX_SINGLE_POSITION_PCT = float(os.getenv("PM_MAX_SINGLE_POSITION_PCT", "0.15"))
+PM_MAX_CORRELATED_EXPOSURE = float(os.getenv("PM_MAX_CORRELATED_EXPOSURE", "0.30"))
+
 # Bot loop
 POLL_INTERVAL_SECONDS = 30    # Event markets move slowly — scan every 30s
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")

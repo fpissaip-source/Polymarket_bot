@@ -107,6 +107,18 @@ def load_regime() -> dict:
     return _safe_read(REGIME_FILE, {})
 
 
+SHARPE_FILE  = BOT_ROOT / "sharpe_state.json"
+CLUSTER_FILE = BOT_ROOT / "alpha_cluster_state.json"
+
+
+def load_sharpe() -> dict:
+    return _safe_read(SHARPE_FILE, {})
+
+
+def load_clusters() -> dict:
+    return _safe_read(CLUSTER_FILE, {})
+
+
 def load_recent_logs(n: int = 80) -> list:
     try:
         if not LOG_FILE.exists():
@@ -164,6 +176,44 @@ def get_dashboard_state() -> dict:
     gas_info = regime.get("gas", {})
     tick     = regime.get("tick", 0)
 
+    # Sharpe & performance data
+    sharpe_data = load_sharpe()
+    sharpe_ratio = 0.0
+    sharpe_class = "NO_DATA"
+    max_drawdown = 0.0
+    if sharpe_data:
+        pnl_history = sharpe_data.get("pnl_history", [])
+        if len(pnl_history) >= 2:
+            mean_pnl = sum(pnl_history) / len(pnl_history)
+            var_pnl = sum((p - mean_pnl) ** 2 for p in pnl_history) / len(pnl_history)
+            std_pnl = var_pnl ** 0.5
+            sharpe_ratio = round(mean_pnl / std_pnl, 3) if std_pnl > 1e-8 else 0.0
+        if sharpe_ratio >= 2.0:
+            sharpe_class = "EXCELLENT"
+        elif sharpe_ratio >= 1.0:
+            sharpe_class = "SOLID"
+        else:
+            sharpe_class = "UNSTABLE"
+        peak = sharpe_data.get("peak_capital", 0)
+        current = sharpe_data.get("current_capital", 0)
+        if peak > 0:
+            max_drawdown = round((peak - current) / peak * 100, 1)
+
+    # Alpha cluster summary
+    cluster_data = load_clusters()
+    cluster_summary = []
+    for cid, c in cluster_data.items():
+        n = c.get("total_trades", 0)
+        if n > 0:
+            wr = c.get("wins", 0) / n if n > 0 else 0
+            cluster_summary.append({
+                "cluster": cid,
+                "trades": n,
+                "win_rate": round(wr * 100, 1),
+                "pnl": round(c.get("total_pnl", 0), 4),
+            })
+    cluster_summary.sort(key=lambda x: x.get("pnl", 0), reverse=True)
+
     return {
         "bankroll":    round(bankroll, 2),
         "free_cash":   round(bankroll, 2),
@@ -186,6 +236,11 @@ def get_dashboard_state() -> dict:
         "tick":      tick,
         "logs":      logs,
         "timestamp": time.strftime("%H:%M:%S"),
+        # New v2 architecture metrics
+        "sharpe_ratio": sharpe_ratio,
+        "sharpe_class": sharpe_class,
+        "max_drawdown": max_drawdown,
+        "alpha_clusters": cluster_summary[:10],
     }
 
 

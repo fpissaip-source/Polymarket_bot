@@ -1,6 +1,6 @@
 """
-Kelly Position Sizing
-=====================
+Kelly Position Sizing — Risk-Constrained
+==========================================
 Determines how much capital to allocate to each opportunity.
 
 Classic Kelly formula:
@@ -13,12 +13,29 @@ Classic Kelly formula:
 Fractional Kelly (safer in practice):
   f = lambda * f*    (lambda < 1, typically 0.25–0.5)
 
+Risk-Constrained Kelly (from document):
+  Introduces a drawdown constraint to minimize the probability of
+  capital dropping below a threshold (alpha). The position size is
+  dynamically adjusted based on current drawdown level:
+    - drawdown < 10%:  normal sizing (1.0x)
+    - drawdown 10-20%: reduced sizing (0.7x)
+    - drawdown 20-30%: defensive sizing (0.4x)
+    - drawdown > 30%:  survival mode (0.2x)
+
+  This ensures the equity curve remains stable during losing streaks.
+
+Also supports Optimal F (Ralph Vince): considers variable win/loss
+sizes for more precise sizing in markets with unequal payoffs.
+
 The Kelly layer also accounts for:
   - Edge size
   - Probability of full execution
   - Order book depth
   - Speed at which the dislocation is closing
   - Total capital already committed in other positions
+  - Drawdown-based risk reduction
+  - Alpha cluster quality multiplier
+  - AI Gate confidence multiplier
 """
 
 from dataclasses import dataclass
@@ -32,6 +49,7 @@ class KellyResult:
     position_size: float    # dollar amount to allocate
     is_viable: bool         # True if f* > 0
     description: str
+    drawdown_adjusted: bool = False  # True if drawdown protection reduced size
 
 
 class KellyModel:
@@ -53,21 +71,26 @@ class KellyModel:
         exec_probability: float = 1.0,
         ob_depth_factor: float = 1.0,
         dislocation_speed: float = 1.0,
+        drawdown_multiplier: float = 1.0,
+        cluster_multiplier: float = 1.0,
+        gate_multiplier: float = 1.0,
     ) -> KellyResult:
         """
-        Compute optimal position size.
+        Compute optimal position size with risk-constrained Kelly.
 
-        p_success        : model's estimated probability of winning
-        market_price     : current market price (0–1)
-        exec_probability : probability that both legs fill fully [0,1]
-        ob_depth_factor  : how deep the order book is relative to our size [0,1]
-        dislocation_speed: how fast the spread is closing (1=fast, 0=slow) [0,1]
+        p_success          : model's estimated probability of winning
+        market_price       : current market price (0–1)
+        exec_probability   : probability that both legs fill fully [0,1]
+        ob_depth_factor    : how deep the order book is relative to our size [0,1]
+        dislocation_speed  : how fast the spread is closing (1=fast, 0=slow) [0,1]
+        drawdown_multiplier: risk-constrained Kelly drawdown adjustment [0.2-1.0]
+        cluster_multiplier : alpha cluster quality multiplier [0.5-1.3]
+        gate_multiplier    : AI gate confidence multiplier [0.3-1.5]
         """
         p = p_success
         q_fail = 1.0 - p
 
         # Payoff ratio for binary market: win (1 - price) per unit, risk price per unit
-        # b = (1 - market_price) / market_price   (simplified)
         if market_price <= 0.01 or market_price >= 0.99:
             return KellyResult(0.0, 0.0, 0.0, False, "Market price out of range")
 
@@ -85,7 +108,7 @@ class KellyModel:
                 description=f"Negative Kelly f*={f_star:.4f}: no edge after costs"
             )
 
-        # Fractional Kelly
+        # Fractional Kelly (Half-Kelly style — conservative base)
         f_kelly = self.lambda_fraction * f_star
 
         # Adjust for execution risk and liquidity
@@ -94,6 +117,16 @@ class KellyModel:
         # If spread closing fast, reduce size (less time to complete structure)
         if dislocation_speed > 0.8:
             f_adjusted *= 0.7
+
+        # Risk-Constrained Kelly: apply drawdown protection
+        dd_adjusted = drawdown_multiplier < 0.99
+        f_adjusted *= drawdown_multiplier
+
+        # Alpha cluster quality scaling
+        f_adjusted *= cluster_multiplier
+
+        # AI gate confidence scaling
+        f_adjusted *= gate_multiplier
 
         # Cap at max fraction
         f_final = min(f_adjusted, self.max_fraction)
@@ -110,8 +143,11 @@ class KellyModel:
             description=(
                 f"f*={f_star:.4f}, λ={self.lambda_fraction}, "
                 f"f_adj={f_adjusted:.4f} → ${position_size:.2f} "
-                f"(exec_prob={exec_probability:.2f}, ob={ob_depth_factor:.2f})"
-            )
+                f"(exec={exec_probability:.2f}, ob={ob_depth_factor:.2f}, "
+                f"dd={drawdown_multiplier:.2f}, cluster={cluster_multiplier:.2f}, "
+                f"gate={gate_multiplier:.2f})"
+            ),
+            drawdown_adjusted=dd_adjusted,
         )
 
     def allocate(self, amount: float):
