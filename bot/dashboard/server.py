@@ -253,15 +253,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
-<title>Polymarket · CORTEX</title>
+<title>CORTEX · Polymarket AI</title>
 <style>
-/* ══ RESET ══════════════════════════════════════════════════════════════ */
+/* ══ RESET & BASE ══════════════════════════════════════════════════════ */
 *{box-sizing:border-box;margin:0;padding:0}
-html,body{height:100%}
-body{background:#060912;color:#e6edf3;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:14px}
-a{color:#58a6ff}
-::-webkit-scrollbar{width:4px;height:4px}
-::-webkit-scrollbar-thumb{background:#30363d;border-radius:2px}
+html{scroll-behavior:smooth}
+body{background:#06080e;color:#e2e8f0;font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  font-size:14px;overflow-x:hidden;min-height:100vh}
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap');
+::-webkit-scrollbar{width:5px;height:5px}
+::-webkit-scrollbar-thumb{background:rgba(99,102,241,.3);border-radius:10px}
 ::-webkit-scrollbar-track{background:transparent}
 
 /* ══ HEADER ═════════════════════════════════════════════════════════════ */
